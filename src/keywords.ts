@@ -44,6 +44,7 @@ export const spamPhrases = [
   "good luck will come if you forward",
   "игнорируешь - к несчастью",
   "ignore at your own risk",
+  "24/7 Available"
 ];
 
 export const shortSpamPhrases = [

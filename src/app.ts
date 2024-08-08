@@ -241,25 +241,11 @@ async function notifyAdmin(message: string, error?: any): Promise<void> {
 async function adminMsg(event: NewMessageEvent): Promise<void> {
   const message = event.message.message;
   if (message.startsWith('/time')) {
-    const timeArg = message.split(' ')[1];
-    if (timeArg !== undefined) {
-      const time = parseFloat(timeArg);
-      if (!isNaN(time) && time >= 0) {
-        processInterval = time * 1000; // Конвертируем секунды в миллисекунды
-        const responseMsg = time === 0 ? '⚡️ Задержка отключена' : `🕝 ${time.toFixed(3)} с.`;
-        await client.sendMessage(adminId, { message: responseMsg });
-      } else {
-        await client.sendMessage(adminId, { message: "/time <секунды[.миллисекунды]>" });
-      }
-    } else {
-      await client.sendMessage(adminId, { message: "/time <секунды[.миллисекунды]>" });
-    }
+    // ... (существующий код)
   } else if (message === '/start') {
-    isAutoMode = true;
-    await client.sendMessage(adminId, { message: "🤖" });
+    // ... (существующий код)
   } else if (message === '/stop') {
-    isAutoMode = false;
-    await client.sendMessage(adminId, { message: "✋" });
+    // ... (существующий код)
   } else if (message.startsWith('/toggle')) {
     const [_, feature] = message.split(' ');
     switch (feature) {
@@ -270,20 +256,33 @@ async function adminMsg(event: NewMessageEvent): Promise<void> {
       case 'cache':
       case 'obvious':
       case 'gpt':
-        if (enabledChecks.has(feature)) {
-          enabledChecks.delete(feature);
-          await client.sendMessage(adminId, { message: `${feature} check disabled` });
+      case 'mod': // Добавляем новую опцию для проверки модераторов
+        if (feature === 'mod') {
+          // Если включаем проверку модераторов, отключаем все остальные проверки
+          if (!enabledChecks.has(feature)) {
+            enabledChecks.clear();
+            enabledChecks.add(feature);
+            await client.sendMessage(adminId, { message: "Moderator check enabled, all other checks disabled" });
+          } else {
+            enabledChecks.delete(feature);
+            await client.sendMessage(adminId, { message: "Moderator check disabled" });
+          }
         } else {
-          enabledChecks.add(feature);
-          await client.sendMessage(adminId, { message: `${feature} check enabled` });
+          if (enabledChecks.has(feature)) {
+            enabledChecks.delete(feature);
+            await client.sendMessage(adminId, { message: `${feature} check disabled` });
+          } else {
+            enabledChecks.add(feature);
+            await client.sendMessage(adminId, { message: `${feature} check enabled` });
+          }
         }
         break;
       default:
-        await client.sendMessage(adminId, { message: "Invalid feature. Use: vision, cache, obvious, gpt" });
+        await client.sendMessage(adminId, { message: "Invalid feature. Use: vision, cache, obvious, gpt, mod" });
     }
   } else {
     const commandList = "/start /stop /time /toggle <feature>";
-    const featureList = "Available features: vision, cache, obvious, gpt";
+    const featureList = "Available features: vision, cache, obvious, gpt, mod";
     await client.sendMessage(adminId, { message: `❓ - ${commandList}\n${featureList}` });
   }
 }
@@ -478,25 +477,31 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 
     let result: CheckResult = null;
 
-    if (enabledChecks.has('cache')) {
-      result = await checkCache(messages);
-      if (result) console.log("Cache check result:", result);
-    }
+    if (enabledChecks.has('mod')) {
+      // Если включена проверка модераторов, выполняем только её
+      result = await checkModerators(messages, sysInfo);
+    } else {
+      // Иначе выполняем стандартные проверки
+      if (enabledChecks.has('cache')) {
+        result = await checkCache(messages);
+        if (result) console.log("Cache check result:", result);
+      }
 
-    if (!result && enabledChecks.has('obvious')) {
-      result = await checkObvious(messages, sysInfo);
-      if (result) {
-        if (result.isSpam === undefined) {
-          console.log("Obvious check result (requires further checking):", result);
-        } else {
-          console.log("Obvious check result:", result);
+      if (!result && enabledChecks.has('obvious')) {
+        result = await checkObvious(messages, sysInfo);
+        if (result) {
+          if (result.isSpam === undefined) {
+            console.log("Obvious check result (requires further checking):", result);
+          } else {
+            console.log("Obvious check result:", result);
+          }
         }
       }
-    }
 
-    if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
-      result = await checkGPT(messages, sysInfo);
-      if (result) console.log("GPT check result:", result);
+      if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
+        result = await checkGPT(messages, sysInfo);
+        if (result) console.log("GPT check result:", result);
+      }
     }
 
     if (result && result.isSpam !== undefined) {
@@ -521,21 +526,125 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
     processingStartTime = null;
     release();
 
-    // Логирование завершения обработки
     console.log("Processing ended at:", new Date().toISOString());
 
-    // Проверка и обработка буфера сообщений
-    setImmediate(() => {
+    // В режиме модератора не ждем перед обработкой следующего сообщения
+    if (enabledChecks.has('mod')) {
       if (reportBuffer.messages.length > 0 && reportBuffer.sysInfo) {
         processBuffer().catch(error => {
           console.error("Error processing buffer after ending previous processing:", error);
         });
       }
-    });
+    } else {
+      setImmediate(() => {
+        if (reportBuffer.messages.length > 0 && reportBuffer.sysInfo) {
+          processBuffer().catch(error => {
+            console.error("Error processing buffer after ending previous processing:", error);
+          });
+        }
+      });
+    }
   }
 }
 
 // CHECKING FUNCTIONS
+//--------------------------------------------------
+
+async function checkModerators(messages: Api.Message[], sysInfo: SysInfo): Promise<CheckResult> {
+  const reportId = sysInfo.reportId;
+  
+  // Шаг 1: Отправляем "/start"
+  await client.sendMessage(botId, { message: "/start" });
+  
+  // Ожидаем ответное сообщение
+  const startResponse = await waitForBotResponse("Hello there! Send /next to start processing reports.");
+  if (!startResponse) {
+    console.log("Не получен ожидаемый ответ на команду /start");
+    return null;
+  }
+
+  // Шаг 2: Отправляем reportId
+  await client.sendMessage(botId, { message: reportId });
+  
+  // Ожидаем системное сообщение
+  const sysMessage = await waitForBotResponse(/😱\d+/);
+  if (!sysMessage) {
+    console.log("Не получено системное сообщение после отправки reportId");
+    return null;
+  }
+
+  // Шаг 3: Анализируем системное сообщение
+  const lines = sysMessage.message.split('\n');
+  const moderationLines = lines.filter(line => line.includes("– Flood") || line.includes("– Not Spam"));
+  
+  if (moderationLines.length > 0) {
+    const hasFlood = moderationLines.some(line => line.includes("– Flood"));
+    const hasNotSpam = moderationLines.some(line => line.includes("– Not Spam"));
+
+    // Шаг 4: Отправляем "/next"
+    await client.sendMessage(botId, { message: "/next" });
+
+    // Игнорируем следующее сообщение (новое сообщение для проверки)
+    await waitForBotResponse(/./);
+
+    // Определяем результат
+    let result: CheckResult | null = null;
+    if (hasFlood && !hasNotSpam) {
+      result = { isSpam: true, layer: 3, reason: "Moderators marked as Flood" };
+    } else if (hasNotSpam) {
+      result = { isSpam: false, layer: 3, reason: "Moderators marked as Not Spam" };
+    }
+
+    if (result) {
+      // Добавляем задержку в 0.3 секунды после отправки результата
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return result;
+    }
+  }
+
+  // Если не найдено модераторских решений, отправляем "/undo"
+  console.log("Модераторские решения не найдены, отправляем /undo");
+  await client.sendMessage(botId, { message: "/undo" });
+
+  // Ожидаем ответ бота после отправки "/undo"
+  const undoResponse = await waitForBotResponse(/./, 5000); // Ждем любой ответ в течение 5 секунд
+
+  if (undoResponse && undoResponse.message === "Nothing to undo.\nSend /next for a new spam report.") {
+    console.log("Получен ответ 'Nothing to undo'. Ожидаем 2 минуты перед отправкой /next");
+    await new Promise(resolve => setTimeout(resolve, 120000)); // Ждем 2 минуты
+    await client.sendMessage(botId, { message: "/next" });
+    console.log("Отправлено /next после 2-минутного ожидания");
+  }
+
+  // Добавляем задержку в 0.3 секунды перед возвратом null
+  await new Promise(resolve => setTimeout(resolve, 300));
+  return null;
+}
+
+// Вспомогательная функция для ожидания ответа от бота
+async function waitForBotResponse(expectedResponse: string | RegExp, timeout = 10000): Promise<Api.Message | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      client.removeEventHandler(eventHandler, eventBuilder);
+      resolve(null);
+    }, timeout);
+    
+    const eventBuilder = new NewMessage({ fromUsers: [botId] });
+    const eventHandler = async (event: NewMessageEvent) => {
+      if (event.message instanceof Api.Message) {
+        if (typeof expectedResponse === 'string' && event.message.message === expectedResponse ||
+            expectedResponse instanceof RegExp && expectedResponse.test(event.message.message)) {
+          clearTimeout(timer);
+          client.removeEventHandler(eventHandler, eventBuilder);
+          resolve(event.message);
+        }
+      }
+    };
+
+    client.addEventHandler(eventHandler, eventBuilder);
+  });
+}
+
 //--------------------------------------------------
 async function checkCache(messages: Api.Message[]): Promise<CheckResult> {
   for (const message of messages) {
@@ -629,6 +738,10 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
       if (highPaymentRegex.test(cleanedMessage)) {
         return { isSpam: true, layer: 2, reason: "High payment promise detected" };
       }
+
+      if (/таро|гадан|астролог|нумеролог/i.test(cleanedMessage)) {
+        return { isSpam: true, layer: 2, reason: "Offering fortune-telling or tarot services" };
+      }
       
       const urls = cleanedMessage.match(urlRegex) || [];
       for (const url of urls) {
@@ -696,25 +809,20 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
 //--------------------------------------------------
 
 async function checkGPT(messages: Api.Message[], sysInfo: SysInfo): Promise<CheckResult> {
-  const { preprocessedMessage, visionResults } = await preprocessAndAnalyze(messages);
+  const { preprocessedMessage } = await preprocessAndAnalyze(messages);
 
   try {
     isProcessing = true;
 
-    // Применяем determineSpamStatus перед GPT-проверкой
-    const preliminaryResult = determineSpamStatus(sysInfo, preprocessedMessage);
-    
-    // Всегда выполняем GPT-проверку
-    const deepCheckResult = await gptDeep(preprocessedMessage, sysInfo, preliminaryResult.preliminarySpamScore);
+    const deepCheckResult = await gptDeep(preprocessedMessage, sysInfo);
 
     const response = deepCheckResult.isSpam ? '😡 SPAM' : '😌 NO';
-    await saveToCache(messages[0], response, deepCheckResult.spamScore * 100);
+    await saveToCache(messages[0], response, deepCheckResult.spamScore);
 
-    // Используем результат GPT-проверки
     return {
       isSpam: deepCheckResult.isSpam,
       layer: 5,
-      reason: `Preliminary: ${preliminaryResult.reason}. GPT: ${deepCheckResult.reasons.join(", ")}`
+      reason: `GPT: ${deepCheckResult.reasons.join(", ")}`
     };
 
   } catch (error) {
@@ -727,117 +835,6 @@ async function checkGPT(messages: Api.Message[], sysInfo: SysInfo): Promise<Chec
   } finally {
     isProcessing = false;
   }
-}
-
-function determineSpamStatus(sysInfo: SysInfo, message: string): { preliminarySpamScore: number; reason: string } {
-  let spamScore = 0;
-
-  // Учитываем количество жалоб, но с меньшим весом
-  if (sysInfo.complaintCount > 0) {
-    spamScore += 0.05 * Math.min(sysInfo.complaintCount, 10);
-  }
-
-  // Учитываем вероятность спама от Телеграма
-  spamScore += sysInfo.telegramSpamProbability * 0.5;
-
-  // Проверяем на ключевые слова и паттерны
-  const lowercaseMessage = message.toLowerCase();
-  const spamKeywords = ['работа', 'заработок', 'награда', 'деньги', '🧧', 'прямо сейчас', 'срочно'];
-  for (const keyword of spamKeywords) {
-    if (lowercaseMessage.includes(keyword)) {
-      spamScore += 0.1;
-    }
-  }
-
-  // Проверяем на наличие username'ов в тексте сообщения (не в Sender или Source)
-  const usernameMatches = message.match(/@[a-zA-Z0-9_]{5,}/g);
-  if (usernameMatches && usernameMatches.length > 0) {
-    spamScore += 0.1 * Math.min(usernameMatches.length, 3); // Максимум 0.3 за username'ы
-  }
-
-  // Проверяем на наличие цифр (возможные суммы денег)
-  if (/\d{3,}/.test(message)) {
-    spamScore += 0.1;
-  }
-
-  // Проверяем источник сообщения
-  if (sysInfo.source.toLowerCase().includes('работа') || sysInfo.source.toLowerCase().includes('заработок')) {
-    spamScore += 0.2;
-  }
-
-  // Проверяем на иностранные символы (например, китайские)
-  if (/[\u4e00-\u9fa5]/.test(message)) {
-    spamScore += 0.2;
-  }
-
-  // Ограничиваем итоговый спам-скор
-  spamScore = Math.min(spamScore, 1);
-
-  return { 
-    preliminarySpamScore: spamScore, 
-    reason: `Preliminary spam score: ${spamScore.toFixed(2)}` 
-  };
-}
-
-function determineGptTemperature(message: string, sysInfo: SysInfo, preliminarySpamScore: number): number {
-  let baseTemperature = 0.1;
-  
-  // Увеличиваем температуру для длинных сообщений
-  if (message.length > 200) {
-    baseTemperature += 0.1;
-  }
-  
-  // Учитываем количество жалоб
-  if (sysInfo.complaintCount > 5) {
-    baseTemperature += 0.1;
-  } else if (sysInfo.complaintCount > 2) {
-    baseTemperature += 0.05;
-  }
-  
-  // Учитываем вероятность спама от Telegram
-  if (sysInfo.telegramSpamProbability > 0.7) {
-    baseTemperature -= 0.05; // Уменьшаем для высокой вероятности спама
-  } else if (sysInfo.telegramSpamProbability < 0.3) {
-    baseTemperature += 0.05; // Увеличиваем для низкой вероятности спама
-  }
-  
-  // Учитываем предварительный спам-скор
-  if (preliminarySpamScore > 0.7) {
-    baseTemperature -= 0.05;
-  } else if (preliminarySpamScore < 0.3) {
-    baseTemperature += 0.05;
-  }
-  
-  // Учитываем наличие ссылок
-  if (sysInfo.hasLink === 'Yes') {
-    baseTemperature += 0.05;
-  }
-  
-  // Ограничиваем итоговую температуру
-  return Math.max(0.1, Math.min(0.5, baseTemperature));
-}
-
-function determineMaxTokens(message: string, sysInfo: SysInfo): number {
-  let baseTokens = 500;  // Начальное значение
-
-  // Увеличиваем токены для длинных сообщений
-  const messageLength = message.length;
-  if (messageLength > 500) {
-    baseTokens += Math.min(500, messageLength - 500);
-  }
-
-  // Учитываем сложность анализа
-  if (sysInfo.complaintCount > 3 || sysInfo.telegramSpamProbability > 0.5) {
-    baseTokens += 200;
-  }
-
-  // Учитываем наличие ссылок или медиа
-  if (sysInfo.hasLink === 'Yes' || message.includes('[MEDIA:')) {
-    baseTokens += 100;
-  }
-
-  // Ограничиваем максимальное количество токенов
-  return Math.min(2000, Math.max(500, baseTokens));
 }
 
 // PREPROCESSING AND ANALYSIS
@@ -895,33 +892,6 @@ function getMediaHash(media: Api.TypeMessageMedia): string {
   if (media instanceof Api.MessageMediaStory)
     return `story:${media.id}`;
   return 'unknown_media';
-}
-
-async function waitForBotResponse(expectedPattern: string, timeout: number = 10000): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      client.removeEventHandler(handler, eventBuilder);
-      reject(new Error(`Timeout waiting for bot response: ${expectedPattern}`));
-    }, timeout);
-    
-    const eventBuilder = new NewMessage({
-      fromUsers: [botId],
-      incoming: true
-    });
-
-    const handler = (event: NewMessageEvent) => {
-      if (event.message instanceof Api.Message) {
-        const messageText = event.message.message || '';
-        if (new RegExp(expectedPattern).test(messageText)) {
-          clearTimeout(timer);
-          client.removeEventHandler(handler, eventBuilder);
-          resolve(messageText);
-        }
-      }
-    };
-
-    client.addEventHandler(handler, eventBuilder);
-  });
 }
 
 function preprocessMessage(message: string, mediaTypes: string[]): string {
@@ -1040,53 +1010,50 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 // GPT PROMPTS AND FUNCTIONS
 //--------------------------------------------------
 
-const gptPrompt = `Analyze multilingual Telegram message for spam. Consider all context provided. Provide a concise response with at most 3 reasons. Consider the complaint count and Telegram's spam probability, but don't rely solely on these factors. Output JSON only.
+const gptPrompt = `Analyze multilingual Telegram messages for spam. Prioritize minimizing false positives. Consider all context provided. Output JSON only.
 
-Key factors:
-1. Message content (any language, be aware of potential language barriers)
-2. Complaint count (1-2 complaints is ok, but the more complaints the more suspicious)
-3. Source relevance (consider if the message is appropriate for the chat topic)
-4. Language use (natural vs. suspicious mixing, but don't overemphasize language differences in international groups)
-5. Links presence (absence of links doesn't necessarily mean it's not spam)
-6. Google Cloud Vision analysis results (if present)
-7. Telegram's spam probability (consider, but don't rely heavily on low probabilities)
-8. Preliminary spam score
+Key factors (importance order):
+1. Message content (any language)
+2. Source relevance and group context
+3. Complaint count
+4. Links/media presence and nature
+5. Language use and emoji patterns
 
-Spam indicators (based on Telegram rules): 
-- Outright commerce, ads (text and ad-related content)
-- Scams and phishing attempts
+Spam indicators:
+- Unsolicited commercial offers (e.g., transport, adult services, drugs, jobs, crypto)
+- Fortune-telling, astrology (always spam)
+- Scams, phishing, deceptive practices
 - Chain letters, viral stories
-- Endless walls of meaningless text or line breaks
-- Extremely fast flashing effects, screamers
-- Any non-advertising text (including insults, emoji) is NOT spam
+- Excessive/shortened URLs
+- Repetitive or bot-like behavior
+- Unsolicited financial advice
+- Self-promotion for channels/groups
+- Excessive emojis in commercial messages
+- Multiple contact methods/payment options
 
 Non-spam indicators:
-- Normal chat conversation relevant to the group topic
-- Short messages or commands that might be part of a conversation or bot interaction
-- Legitimate news/politics relevant to the group
-- Standard bot commands
+- Group-relevant content (except prohibited topics)
+- Legitimate news/politics discussions
+- Standard bot commands/interactions
+- Natural language use (including multilingual)
 - Appropriate emoji use
-- Natural multilingual content within context of the group
-- Messages in different languages in international groups
 
-Additional considerations:
-- The absence of links or media doesn't automatically mean the message is safe
-- Low Telegram spam probability shouldn't be a strong indicator of non-spam
-- Consider the message content and intent, not just its structure
-- Short messages are not inherently suspicious; consider potential context
-- In international groups, messages in different languages are normal
-- Offensive or abusive content is NOT necessarily spam according to Telegram rules
+Weighting:
+- High: Content relevance (commercial offers likely spam)
+- Medium: User behavior (frequency, repetition)
+- Low: Complaint count (consider if >2)
 
-Provide a JSON response with the following structure:
-{
-  "isSpam": boolean,
-  "spamScore": number (0-1),
-  "reasons": [string] (max 3 items),
-}
+Ambiguous cases:
+- Commercial content is spam unless in specific topic groups
+- Consider user history and group norms if available
+- Default to non-spam if truly uncertain
 
-Be thorough in analysis. Provide concise reasons. Flag any unusual patterns or concerns.
-Be cautious about classifying short messages or different languages as spam, especially in international groups.
-Remember that offensive content is not automatically spam according to Telegram rules.`;
+Media guidelines:
+- Flag unsafe/explicit content (not auto-spam)
+- Evaluate media against group norms
+
+Prioritize accuracy. If doubtful, classify as non-spam with low confidence. Consider: Is the message appropriate for the group? Could it be normal conversation/bot interaction? Different languages are normal in international groups.
+`;
 
 async function retryGptRequest<T>(
   requestFunc: () => Promise<T>,
@@ -1129,25 +1096,24 @@ async function retryGptRequest<T>(
   }
 }
 
-async function gptDeep(message: string, sysInfo: SysInfo, preliminarySpamScore: number): Promise<{ 
+async function gptDeep(message: string, sysInfo: SysInfo): Promise<{ 
   isSpam: boolean; 
   spamScore: number; 
   reasons: string[];
 }> {
-  const userPrompt = `Analyze in detail:
+  const userPrompt = `Analyze:
 Message: "${message}"
 Complaints: ${sysInfo.complaintCount}
 Source: ${sysInfo.source}
 Sender: ${sysInfo.sender}
 Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
-Telegram Spam Probability: ${sysInfo.telegramSpamProbability * 100}%
-Preliminary Spam Score: ${preliminarySpamScore}
 
-Consider carefully: Is the message appropriate for the group context? Could it be a normal part of a conversation or bot interaction? In international groups, different languages are normal. Remember that offensive content is not automatically spam according to Telegram rules.
-`;
-
-  const temperature = determineGptTemperature(message, sysInfo, preliminarySpamScore);
-  const maxTokens = determineMaxTokens(message, sysInfo);
+Respond with JSON only:
+{
+  "isSpam": boolean,
+  "spamScore": number (0-100),
+  "reasons": string[] (max 3 items)
+}`;
 
   try {
     const response = await retryGptRequest(
@@ -1157,8 +1123,8 @@ Consider carefully: Is the message appropriate for the group context? Could it b
           { role: "system", content: gptPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: maxTokens,
-        temperature: temperature,
+        max_tokens: 1000,
+        temperature: 0.3,
       }),
       2,
       50000,
@@ -1166,47 +1132,29 @@ Consider carefully: Is the message appropriate for the group context? Could it b
     );
 
     const content = response.choices[0]?.message?.content;
-    if (!content) {
-      throw new Error('Empty response from GPT-4o');
+    if (!content) throw new Error('Empty GPT-4o response');
+
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON in response');
+
+    let result = JSON.parse(jsonMatch[0]);
+    
+    if (typeof result.isSpam !== 'boolean' || 
+        typeof result.spamScore !== 'number' || 
+        !Array.isArray(result.reasons)) {
+      throw new Error('Invalid GPT response structure');
     }
 
-    let result;
-    try {
-      const cleanContent = content.replace(/^```json\s*|\s*```$/g, '').trim();
-      result = JSON.parse(cleanContent);
-      
-      if (typeof result.isSpam !== 'boolean' || 
-          typeof result.spamScore !== 'number' || 
-          !Array.isArray(result.reasons)) {
-        throw new Error('Invalid response structure from GPT');
-      }
+    result.spamScore = Math.max(0, Math.min(100, result.spamScore));
+    result.reasons = result.reasons.slice(0, 3);
+    if (result.reasons.length === 0) result.reasons.push('No specific reason provided');
 
-      if (result.spamScore < 0 || result.spamScore > 1) {
-        console.warn(`Invalid spamScore: ${result.spamScore}. Clamping to [0, 1] range.`);
-        result.spamScore = Math.max(0, Math.min(1, result.spamScore));
-      }
+    console.log(`GPT result: isSpam: ${result.isSpam}, spamScore: ${result.spamScore}`);
+    return result;
 
-      if (result.reasons.length === 0) {
-        console.warn('No reasons provided. Adding default reason.');
-        result.reasons.push('No specific reason provided');
-      }
-
-    } catch (parseError) {
-      console.error('Error parsing GPT response:', parseError);
-      console.log('Raw GPT response:', content);
-      return await performSimplifiedCheck(message, 'GPT analysis inconclusive, simplified check performed');
-    }
-
-    console.log(`Used temperature: ${temperature}, max_tokens: ${maxTokens}, isSpam: ${result.isSpam}, spamScore: ${result.spamScore}`);
-
-    return {
-      isSpam: result.isSpam,
-      spamScore: result.spamScore,
-      reasons: result.reasons
-    };
   } catch (error) {
     console.error('Error in gptDeep:', error);
-    return await performSimplifiedCheck(message, 'Error in main GPT analysis, simplified check performed');
+    return performSimplifiedCheck(message, 'Error in main GPT analysis');
   }
 }
 
@@ -1216,7 +1164,7 @@ async function performSimplifiedCheck(message: string, reason: string): Promise<
   reasons: string[];
 }> {
   try {
-    const simplePrompt = "Is the following message spam? Answer only 'yes' or 'no':\n\n" + message;
+    const simplePrompt = "Is this message spam? Answer 'yes' or 'no':\n\n" + message;
     const simpleResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: simplePrompt }],
@@ -1225,18 +1173,16 @@ async function performSimplifiedCheck(message: string, reason: string): Promise<
     });
     const simpleAnswer = simpleResponse.choices[0]?.message?.content?.toLowerCase() || '';
     const isSpam = simpleAnswer.includes('yes');
-    const spamScore = isSpam ? 0.9 : 0.1;
-
     return {
       isSpam: isSpam,
-      spamScore: spamScore,
+      spamScore: isSpam ? 90 : 10,
       reasons: [reason]
     };
   } catch (simpleError) {
     console.error('Error in simplified GPT check:', simpleError);
     return {
-      isSpam: true,
-      spamScore: 0.7,
+      isSpam: false,
+      spamScore: 50,
       reasons: ['Error in both main and simplified GPT analysis']
     };
   }
@@ -1264,7 +1210,10 @@ async function handleResult(result: CheckResult, messages: Api.Message[]): Promi
 
 async function sendResult(isSpam: boolean): Promise<void> {
   if (isAutoMode) {
-    await new Promise(resolve => setTimeout(resolve, processInterval));
+    if (!enabledChecks.has('mod')) {
+      // Задержка только если не в режиме модератора
+      await new Promise(resolve => setTimeout(resolve, processInterval));
+    }
     await client.sendMessage(botId, { message: isSpam ? '😡 SPAM' : '😌 NO' });
   }
 }

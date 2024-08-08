@@ -38,6 +38,7 @@
   "prestart": "yarn build",
   "build": "rimraf dist && tsc",
   "dev": "ts-node-dev --respawn src/app.ts",
-  "heroku-postbuild": "yarn build"
+  "heroku-postbuild": "yarn build",
+  "deploy": "./deploy.sh"
 }
 }
