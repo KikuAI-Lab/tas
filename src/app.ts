@@ -241,11 +241,25 @@ async function notifyAdmin(message: string, error?: any): Promise<void> {
 async function adminMsg(event: NewMessageEvent): Promise<void> {
   const message = event.message.message;
   if (message.startsWith('/time')) {
-    // ... (существующий код)
+    const timeArg = message.split(' ')[1];
+    if (timeArg !== undefined) {
+      const time = parseFloat(timeArg);
+      if (!isNaN(time) && time >= 0) {
+        processInterval = time * 1000; // Конвертируем секунды в миллисекунды
+        const responseMsg = time === 0 ? '⚡️ Задержка отключена' : `🕝 ${time.toFixed(3)} с.`;
+        await client.sendMessage(adminId, { message: responseMsg });
+      } else {
+        await client.sendMessage(adminId, { message: "/time <секунды[.миллисекунды]>" });
+      }
+    } else {
+      await client.sendMessage(adminId, { message: "/time <секунды[.миллисекунды]>" });
+    }
   } else if (message === '/start') {
-    // ... (существующий код)
+    isAutoMode = true;
+    await client.sendMessage(adminId, { message: "🤖" });
   } else if (message === '/stop') {
-    // ... (существующий код)
+    isAutoMode = false;
+    await client.sendMessage(adminId, { message: "✋" });
   } else if (message.startsWith('/toggle')) {
     const [_, feature] = message.split(' ');
     switch (feature) {
@@ -256,16 +270,19 @@ async function adminMsg(event: NewMessageEvent): Promise<void> {
       case 'cache':
       case 'obvious':
       case 'gpt':
-      case 'mod': // Добавляем новую опцию для проверки модераторов
+      case 'mod':
         if (feature === 'mod') {
-          // Если включаем проверку модераторов, отключаем все остальные проверки
           if (!enabledChecks.has(feature)) {
             enabledChecks.clear();
             enabledChecks.add(feature);
             await client.sendMessage(adminId, { message: "Moderator check enabled, all other checks disabled" });
           } else {
             enabledChecks.delete(feature);
-            await client.sendMessage(adminId, { message: "Moderator check disabled" });
+            // Включаем другие проверки при выключении режима модератора
+            enabledChecks.add('cache');
+            enabledChecks.add('obvious');
+            enabledChecks.add('gpt');
+            await client.sendMessage(adminId, { message: "Moderator check disabled, other checks enabled" });
           }
         } else {
           if (enabledChecks.has(feature)) {
@@ -349,11 +366,11 @@ async function sysMsg(event: NewMessageEvent): Promise<void> {
 
     // Добавляем обработку вероятности спама от Telegram
     const spamProbabilityMatch = message.match(/🌚\s*(\d+)%/);
-if (spamProbabilityMatch) {
-  sysInfo.telegramSpamProbability = parseInt(spamProbabilityMatch[1], 10) / 100;
-} else {
-  sysInfo.telegramSpamProbability = 0;
-}
+    if (spamProbabilityMatch) {
+      sysInfo.telegramSpamProbability = parseInt(spamProbabilityMatch[1], 10) / 100;
+    } else {
+      sysInfo.telegramSpamProbability = 0;
+    }
 
     const lines = message.split('\n');
     for (const line of lines) {
@@ -528,22 +545,14 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 
     console.log("Processing ended at:", new Date().toISOString());
 
-    // В режиме модератора не ждем перед обработкой следующего сообщения
-    if (enabledChecks.has('mod')) {
+    // Обрабатываем следующее сообщение сразу после завершения текущего
+    setImmediate(() => {
       if (reportBuffer.messages.length > 0 && reportBuffer.sysInfo) {
         processBuffer().catch(error => {
           console.error("Error processing buffer after ending previous processing:", error);
         });
       }
-    } else {
-      setImmediate(() => {
-        if (reportBuffer.messages.length > 0 && reportBuffer.sysInfo) {
-          processBuffer().catch(error => {
-            console.error("Error processing buffer after ending previous processing:", error);
-          });
-        }
-      });
-    }
+    });
   }
 }
 
@@ -552,73 +561,95 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 
 async function checkModerators(messages: Api.Message[], sysInfo: SysInfo): Promise<CheckResult> {
   const reportId = sysInfo.reportId;
-  
-  // Шаг 1: Отправляем "/start"
-  await client.sendMessage(botId, { message: "/start" });
-  
-  // Ожидаем ответное сообщение
-  const startResponse = await waitForBotResponse("Hello there! Send /next to start processing reports.");
-  if (!startResponse) {
-    console.log("Не получен ожидаемый ответ на команду /start");
-    return null;
-  }
+  let originalCheckMsgHandler: ((event: NewMessageEvent) => Promise<void>) | null = checkMsg;
+  let originalSysMsgHandler: ((event: NewMessageEvent) => Promise<void>) | null = sysMsg;
 
-  // Шаг 2: Отправляем reportId
-  await client.sendMessage(botId, { message: reportId });
-  
-  // Ожидаем системное сообщение
-  const sysMessage = await waitForBotResponse(/😱\d+/);
-  if (!sysMessage) {
-    console.log("Не получено системное сообщение после отправки reportId");
-    return null;
-  }
+  const checkMsgEvent = new NewMessage({ fromUsers: [botId], incoming: true, forwards: true });
+  const sysMsgEvent = new NewMessage({ fromUsers: [botId], incoming: true, forwards: false, pattern: /😱\d+/ });
 
-  // Шаг 3: Анализируем системное сообщение
-  const lines = sysMessage.message.split('\n');
-  const moderationLines = lines.filter(line => line.includes("– Flood") || line.includes("– Not Spam"));
-  
-  if (moderationLines.length > 0) {
-    const hasFlood = moderationLines.some(line => line.includes("– Flood"));
-    const hasNotSpam = moderationLines.some(line => line.includes("– Not Spam"));
+  const disableHandlers = () => {
+    if (originalCheckMsgHandler) {
+      client.removeEventHandler(originalCheckMsgHandler, checkMsgEvent);
+    }
+    if (originalSysMsgHandler) {
+      client.removeEventHandler(originalSysMsgHandler, sysMsgEvent);
+    }
+  };
 
-    // Шаг 4: Отправляем "/next"
-    await client.sendMessage(botId, { message: "/next" });
+  const enableHandlers = () => {
+    if (originalCheckMsgHandler) {
+      client.addEventHandler(originalCheckMsgHandler, checkMsgEvent);
+    }
+    if (originalSysMsgHandler) {
+      client.addEventHandler(originalSysMsgHandler, sysMsgEvent);
+    }
+  };
 
-    // Игнорируем следующее сообщение (новое сообщение для проверки)
-    await waitForBotResponse(/./);
+  try {
+    // Отключаем обработчики перед началом проверки
+    disableHandlers();
 
-    // Определяем результат
+    // Шаг 1: Отправляем "/start" с задержкой
+    await new Promise(resolve => setTimeout(resolve, processInterval));
+    await client.sendMessage(botId, { message: "/start" });
+    
+    // Ожидаем ответное сообщение
+    const startResponse = await waitForBotResponse("Hello there! Send /next to start processing reports.", 10000);
+    if (!startResponse) {
+      console.log("Не получен ожидаемый ответ на команду /start");
+      enableHandlers();
+      return null;
+    }
+
+    // Шаг 2: Отправляем reportId с задержкой
+    await new Promise(resolve => setTimeout(resolve, processInterval));
+    await client.sendMessage(botId, { message: reportId });
+    
+    // Ожидаем системное сообщение
+    const sysMessage = await waitForBotResponse(/😱\d+/, 10000);
+    if (!sysMessage) {
+      console.log("Не получено системное сообщение после отправки reportId");
+      enableHandlers();
+      return null;
+    }
+
+    // Шаг 3: Анализируем системное сообщение
+    const lines = sysMessage.message.split('\n');
+    const moderationLines = lines.filter(line => line.includes("– Flood") || line.includes("– Not Spam"));
+    
     let result: CheckResult | null = null;
-    if (hasFlood && !hasNotSpam) {
-      result = { isSpam: true, layer: 3, reason: "Moderators marked as Flood" };
-    } else if (hasNotSpam) {
-      result = { isSpam: false, layer: 3, reason: "Moderators marked as Not Spam" };
+    if (moderationLines.length > 0) {
+      const hasFlood = moderationLines.some(line => line.includes("– Flood"));
+      const hasNotSpam = moderationLines.some(line => line.includes("– Not Spam"));
+
+      if (hasFlood && !hasNotSpam) {
+        result = { isSpam: true, layer: 3, reason: "Moderators marked as Flood" };
+      } else if (hasNotSpam) {
+        result = { isSpam: false, layer: 3, reason: "Moderators marked as Not Spam" };
+      }
     }
 
-    if (result) {
-      // Добавляем задержку в 0.3 секунды после отправки результата
-      await new Promise(resolve => setTimeout(resolve, 300));
-      return result;
-    }
-  }
-
-  // Если не найдено модераторских решений, отправляем "/undo"
-  console.log("Модераторские решения не найдены, отправляем /undo");
-  await client.sendMessage(botId, { message: "/undo" });
-
-  // Ожидаем ответ бота после отправки "/undo"
-  const undoResponse = await waitForBotResponse(/./, 5000); // Ждем любой ответ в течение 5 секунд
-
-  if (undoResponse && undoResponse.message === "Nothing to undo.\nSend /next for a new spam report.") {
-    console.log("Получен ответ 'Nothing to undo'. Ожидаем 2 минуты перед отправкой /next");
-    await new Promise(resolve => setTimeout(resolve, 120000)); // Ждем 2 минуты
+    // Шаг 4: Отправляем "/next" с задержкой
+    await new Promise(resolve => setTimeout(resolve, processInterval));
     await client.sendMessage(botId, { message: "/next" });
-    console.log("Отправлено /next после 2-минутного ожидания");
-  }
 
-  // Добавляем задержку в 0.3 секунды перед возвратом null
-  await new Promise(resolve => setTimeout(resolve, 300));
-  return null;
+    // Ожидаем ответ после /next
+    const nextResponse = await waitForBotResponse(/.*/, 10000);
+    if (nextResponse && nextResponse.message.includes("Please select 😡 BAN or 😌 NO.")) {
+      // Если получено сообщение о выборе, отправляем результат
+      await new Promise(resolve => setTimeout(resolve, processInterval));
+      await sendResult(result?.isSpam ?? false);
+    }
+
+    return result || { isSpam: false, layer: 3, reason: "No clear moderator decision" };
+
+  } catch (error) {
+    console.error("Error in checkModerators:", error);
+    return null;
+  } finally {
+    // Убедимся, что обработчики включены обратно в любом случае
+    enableHandlers();
+  }
 }
 
 // Вспомогательная функция для ожидания ответа от бота
@@ -632,8 +663,9 @@ async function waitForBotResponse(expectedResponse: string | RegExp, timeout = 1
     const eventBuilder = new NewMessage({ fromUsers: [botId] });
     const eventHandler = async (event: NewMessageEvent) => {
       if (event.message instanceof Api.Message) {
-        if (typeof expectedResponse === 'string' && event.message.message === expectedResponse ||
-            expectedResponse instanceof RegExp && expectedResponse.test(event.message.message)) {
+        const messageText = event.message.message;
+        if ((typeof expectedResponse === 'string' && messageText === expectedResponse) ||
+            (expectedResponse instanceof RegExp && expectedResponse.test(messageText))) {
           clearTimeout(timer);
           client.removeEventHandler(eventHandler, eventBuilder);
           resolve(event.message);
@@ -720,12 +752,12 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
       
       const emojiCounts = new Map<string, number>();
       for (const char of cleanedMessage) {
-        if (spamEmojis.includes(char) && emojiCounts.set(char, (emojiCounts.get(char) || 0) + 1).get(char)! > 4) {
+        if (spamEmojis.includes(char) && emojiCounts.set(char, (emojiCounts.get(char) || 0) + 1).get(char)! > 3) {
           return { isSpam: true, layer: 2, reason: "Excessive use of spam emoji" };
         }
       }
 
-      if (messages.length > 5 && new Set(messages.map(m => m.message)).size < messages.length * 0.5) {
+      if (messages.length > 3 && new Set(messages.map(m => m.message)).size < messages.length * 0.7) {
         return {
           isSpam: true,
           layer: 2,
@@ -733,10 +765,11 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
         };
       }
 
-      // Проверка на обещание высокого заработка
-      const highPaymentRegex = /(?:от|до|>|)\s*\d{4,}\s*(?:₽|руб|р\.|₴|грн|usd|\$|€|евро)/i;
-      if (highPaymentRegex.test(cleanedMessage)) {
-        return { isSpam: true, layer: 2, reason: "High payment promise detected" };
+      // Проверка на обещание высокого заработка или инвестиций
+      const highPaymentRegex = /(?:от|до|>|)\s*\d{3,}\s*(?:₽|руб|р\.|₴|грн|usd|\$|€|евро)/i;
+      const investmentRegex = /(?:инвест|invest|прибыль|profit|заработ|earn)/i;
+      if (highPaymentRegex.test(cleanedMessage) || investmentRegex.test(cleanedMessage)) {
+        return { isSpam: true, layer: 2, reason: "High payment promise or investment offer detected" };
       }
 
       if (/таро|гадан|астролог|нумеролог/i.test(cleanedMessage)) {
@@ -745,7 +778,7 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
       
       const urls = cleanedMessage.match(urlRegex) || [];
       for (const url of urls) {
-        if (linkCounts.set(url, (linkCounts.get(url) || 0) + 1).get(url)! > 2) {
+        if (linkCounts.set(url, (linkCounts.get(url) || 0) + 1).get(url)! > 1) {
           return { isSpam: true, layer: 2, reason: "Duplicate links detected" };
         }
         if (isAdLink(url)) {
@@ -753,7 +786,7 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
         }
       }
       
-      const repeatingCharRegex = /(.)\1{99,}/;
+      const repeatingCharRegex = /(.)\1{50,}/;
       const repeatingCharMatch = cleanedMessage.match(repeatingCharRegex);
       if (repeatingCharMatch) {
         const repeatingChar = repeatingCharMatch[1];
@@ -769,14 +802,14 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
       
       const contactInfoCount = (cleanedMessage.match(/\+?[0-9]{10,14}/g) || []).length + 
                                (cleanedMessage.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g) || []).length;
-      if (contactInfoCount > 2) return { isSpam: true, layer: 2, reason: "Excessive contact information" };
+      if (contactInfoCount > 1) return { isSpam: true, layer: 2, reason: "Excessive contact information" };
     }
     
     if (message.media) {
       const mediaType = getMediaType(message.media);
       const mediaHash = getMediaHash(message.media);
       
-      if (mediaHashCounts.set(mediaHash, (mediaHashCounts.get(mediaHash) || 0) + 1).get(mediaHash)! > 2) {
+      if (mediaHashCounts.set(mediaHash, (mediaHashCounts.get(mediaHash) || 0) + 1).get(mediaHash)! > 1) {
         return { isSpam: true, layer: 2, reason: `Duplicate ${mediaType} detected` };
       }
 
@@ -792,7 +825,7 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
           .find((attr): attr is Api.DocumentAttributeFilename => attr instanceof Api.DocumentAttributeFilename)?.fileName;
         
         if (fileName) {
-          if (fileNameCounts.set(fileName, (fileNameCounts.get(fileName) || 0) + 1).get(fileName)! > 2) {
+          if (fileNameCounts.set(fileName, (fileNameCounts.get(fileName) || 0) + 1).get(fileName)! > 1) {
             return { isSpam: true, layer: 2, reason: "Duplicate files detected" };
           }
           if (dangerousExtensions.includes(path.extname(fileName).toLowerCase())) {
@@ -801,6 +834,25 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
         }
       }
     }
+  }
+
+  // Проверка на наличие упоминаний конкретных пользователей для финансовых услуг
+  const financialUserMentions = messages.some(m => 
+    m.message && /@\w+/.test(m.message) && 
+    /(?:инвест|invest|прибыль|profit|заработ|earn|crypto|крипто)/i.test(m.message)
+  );
+  if (financialUserMentions) {
+    return { isSpam: true, layer: 2, reason: "Mention of specific users for financial services" };
+  }
+
+  // Проверка на срочность в финансовых решениях
+  const urgencyInFinancialDecisions = messages.some(m => 
+    m.message && 
+    /(?:спешите|hurry|срочно|urgent|limited time|ограниченное время)/i.test(m.message) &&
+    /(?:инвест|invest|прибыль|profit|заработ|earn|crypto|крипто)/i.test(m.message)
+  );
+  if (urgencyInFinancialDecisions) {
+    return { isSpam: true, layer: 2, reason: "Urgency in financial decisions" };
   }
 
   return null;
@@ -913,22 +965,28 @@ async function getFileSize(mediaMessage: Api.Message): Promise<number> {
   if (mediaMessage.media instanceof Api.MessageMediaPhoto) {
     const photo = mediaMessage.media.photo;
     if (photo instanceof Api.Photo) {
+      // Находим размер наименьшего доступного изображения
       const smallestSize = photo.sizes.reduce((prev, curr) => {
-        if ('size' in curr && 'size' in prev) {
-          return curr.size < prev.size ? curr : prev;
+        if (curr instanceof Api.PhotoSize && 'size' in curr) {
+          return curr.size < (prev instanceof Api.PhotoSize && 'size' in prev ? prev.size : Infinity) ? curr : prev;
         }
         return prev;
-      }, photo.sizes[0] as Api.PhotoSize);
+      });
       
-      return 'size' in smallestSize ? smallestSize.size : Infinity;
+      if (smallestSize instanceof Api.PhotoSize && 'size' in smallestSize) {
+        return smallestSize.size;
+      }
     }
+    // Если не удалось получить размер, возвращаем примерный размер для небольших изображений
+    return 100 * 1024; // 100 KB as a fallback for photos
   } else if (mediaMessage.media instanceof Api.MessageMediaDocument) {
     const document = mediaMessage.media.document;
     if (document instanceof Api.Document) {
       return document.size.toJSNumber();
     }
   }
-  return Infinity;
+  // Если не удалось определить размер, возвращаем значение по умолчанию
+  return 1 * 1024 * 1024; // 1 MB as a default fallback
 }
 
 async function analyzeImageWithVision(imageBuffer: Buffer): Promise<{ labels: string[], safeSearch: any, textAnnotations?: { description: string }[] }> {
@@ -954,6 +1012,8 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
   const fileSize = await getFileSize(mediaMessage);
   const mediaType = getMediaType(mediaMessage.media!);
   
+  console.log(`Analyzing media: ${mediaType}, size: ${fileSize} bytes`);
+
   if (fileSize > MAX_FILE_SIZE) {
     console.log(`Skipping Vision analysis for large file (${fileSize} bytes)`);
     return { type: mediaType, labels: [], safeSearch: {} };
@@ -961,47 +1021,33 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 
   let imageBuffer: Buffer | null = null;
 
-  if (mediaMessage.media instanceof Api.MessageMediaPhoto) {
-    imageBuffer = await client.downloadMedia(mediaMessage.media) as Buffer;
-  } else if (mediaMessage.media instanceof Api.MessageMediaDocument) {
-    const document = mediaMessage.media.document;
-    if (document instanceof Api.Document) {
-      const videoAttribute = document.attributes.find(attr => attr instanceof Api.DocumentAttributeVideo) as Api.DocumentAttributeVideo | undefined;
-      const stickerAttribute = document.attributes.find(attr => attr instanceof Api.DocumentAttributeSticker) as Api.DocumentAttributeSticker | undefined;
-      
-      if (videoAttribute) {
-        // Получаем миниатюру видео
-        const thumbnail = document.thumbs?.find(thumb => thumb instanceof Api.PhotoSize) as Api.PhotoSize | undefined;
-        if (thumbnail) {
-          try {
-            imageBuffer = await client.downloadMedia(mediaMessage.media, {
-              thumb: 0 // Загружаем первую доступную миниатюру
-            }) as Buffer;
-          } catch (error) {
-            console.error('Error downloading video thumbnail:', error);
-            return { type: mediaType, labels: [], safeSearch: {} };
+  try {
+    if (mediaMessage.media instanceof Api.MessageMediaPhoto) {
+      imageBuffer = await client.downloadMedia(mediaMessage.media) as Buffer;
+    } else if (mediaMessage.media instanceof Api.MessageMediaDocument) {
+      const document = mediaMessage.media.document;
+      if (document instanceof Api.Document) {
+        const mimeType = document.mimeType;
+        if (mimeType.startsWith('image/') || mimeType === 'application/x-tgsticker') {
+          imageBuffer = await client.downloadMedia(mediaMessage.media) as Buffer;
+        } else if (mimeType.startsWith('video/')) {
+          const thumbnail = document.thumbs?.find(thumb => thumb instanceof Api.PhotoSize) as Api.PhotoSize | undefined;
+          if (thumbnail) {
+            imageBuffer = await client.downloadMedia(mediaMessage.media, { thumb: 0 }) as Buffer;
           }
-        } else {
-          console.log(`No thumbnail available for video`);
-          return { type: mediaType, labels: [], safeSearch: {} };
         }
-      } else if (stickerAttribute || mediaType === 'GIF') {
-        imageBuffer = await client.downloadMedia(mediaMessage.media) as Buffer;
-      } else {
-        console.log(`Skipping analysis for ${mediaType}`);
-        return { type: mediaType, labels: [], safeSearch: {} };
       }
+    } else if (mediaMessage.media instanceof Api.MessageMediaStory) {
+      imageBuffer = await client.downloadMedia(mediaMessage.media) as Buffer;
     }
-  } else if (mediaMessage.media instanceof Api.MessageMediaStory) {
-    const storyMedia = await client.downloadMedia(mediaMessage.media);
-    if (storyMedia instanceof Buffer) {
-      imageBuffer = storyMedia;
-    }
-  }
 
-  if (imageBuffer) {
-    const { labels, safeSearch, textAnnotations } = await analyzeImageWithVision(imageBuffer);
-    return { type: mediaType, labels, safeSearch, textAnnotations };
+    if (imageBuffer) {
+      console.log(`Successfully downloaded media, size: ${imageBuffer.length} bytes`);
+      const { labels, safeSearch, textAnnotations } = await analyzeImageWithVision(imageBuffer);
+      return { type: mediaType, labels, safeSearch, textAnnotations };
+    }
+  } catch (error) {
+    console.error(`Error analyzing media: ${error}`);
   }
 
   return { type: mediaType, labels: [], safeSearch: {} };
@@ -1010,50 +1056,187 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 // GPT PROMPTS AND FUNCTIONS
 //--------------------------------------------------
 
-const gptPrompt = `Analyze multilingual Telegram messages for spam. Prioritize minimizing false positives. Consider all context provided. Output JSON only.
+async function gptDeep(message: string, sysInfo: SysInfo): Promise<{ 
+  isSpam: boolean; 
+  spamScore: number; 
+  reasons: string[];
+}> {
+  const gptPrompt = `Analyze multilingual Telegram messages for spam. Prioritize protecting users from scams, unsolicited commercial offers, and genuinely harmful content while allowing normal social interactions. Consider all context provided, but prioritize the actual content of the message. Output JSON only.
 
 Key factors (importance order):
-1. Message content (any language)
-2. Source relevance and group context
-3. Complaint count
+1. Message content and intent (any language)
+2. User behavior and message pattern
+3. Source relevance and group context
 4. Links/media presence and nature
-5. Language use and emoji patterns
+5. Complaint count and Telegram's spam probability (consider context)
 
-Spam indicators:
-- Unsolicited commercial offers (e.g., transport, adult services, drugs, jobs, crypto)
-- Fortune-telling, astrology (always spam)
-- Scams, phishing, deceptive practices
-- Chain letters, viral stories
-- Excessive/shortened URLs
-- Repetitive or bot-like behavior
-- Unsolicited financial advice
-- Self-promotion for channels/groups
-- Excessive emojis in commercial messages
-- Multiple contact methods/payment options
+Spam indicators (treat these more strictly):
+- Unsolicited commercial offers (e.g., crypto, investments, jobs, adult services)
+- Scams, phishing, deceptive practices, get-rich-quick schemes
+- Attempts to move conversations to private channels or external links for commercial purposes
+- Excessive/shortened URLs unrelated to ongoing discussions
+- Repetitive or bot-like behavior across multiple messages
+- Unsolicited financial advice or investment opportunities
+- Self-promotion for unrelated channels/groups
+- Promises of unrealistic profits or returns
+- Urgency in financial decisions or investments
+- Mentioning specific usernames for financial services
+- Explicit sexual content or services
+- Invitations for private meetings or services without clear context
+- Use of excessive emojis or symbols to bypass text filters
+- Messages encouraging users to search for specific terms or usernames
 
 Non-spam indicators:
-- Group-relevant content (except prohibited topics)
-- Legitimate news/politics discussions
+- Simple greetings or introductions (e.g., "Hi", "Hello", "Good morning")
+- Short, neutral messages without suspicious content
+- Political discussions or opinions, even if controversial
+- Use of strong language or profanity within context of discussion
+- Group-relevant content (unless clearly violating community standards)
+- Legitimate discussions on current events or social issues
 - Standard bot commands/interactions
-- Natural language use (including multilingual)
-- Appropriate emoji use
 
 Weighting:
-- High: Content relevance (commercial offers likely spam)
-- Medium: User behavior (frequency, repetition)
-- Low: Complaint count (consider if >2)
+- Very High: Actual content of the message
+- High: User behavior pattern (if known)
+- Medium: Group context and complaint count
+- Low: Telegram's spam probability for isolated messages
 
 Ambiguous cases:
-- Commercial content is spam unless in specific topic groups
-- Consider user history and group norms if available
-- Default to non-spam if truly uncertain
+- For short messages or greetings, prioritize the actual content over group context
+- Consider if the message could be a normal social interaction, even in groups with suspicious names
+- For political or controversial content, prioritize free speech unless clearly harmful
+- Err on the side of caution for explicit invitations or offers, but allow implicit or ambiguous content if not clearly spam
 
-Media guidelines:
-- Flag unsafe/explicit content (not auto-spam)
-- Evaluate media against group norms
+IMPORTANT: Simple greetings or short, neutral messages should not be classified as spam solely based on the group's name or context. Even in groups with suspicious names, allow for the possibility of normal social interactions unless there's clear evidence of spam behavior.`;
 
-Prioritize accuracy. If doubtful, classify as non-spam with low confidence. Consider: Is the message appropriate for the group? Could it be normal conversation/bot interaction? Different languages are normal in international groups.
-`;
+  const userPrompt = `Analyze:
+Message: "${message}"
+Complaints: ${sysInfo.complaintCount}
+Source: ${sysInfo.source}
+Sender: ${sysInfo.sender}
+Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
+Telegram Spam Probability: ${sysInfo.telegramSpamProbability}
+
+Consider the message content first, then the group context "${sysInfo.source}". Be cautious of commercial spam and explicit content, but allow for normal greetings and short social interactions, even in groups with suspicious names. A simple "Hi" is very likely not spam unless part of a clear pattern of suspicious behavior.
+
+Respond with JSON only:
+{
+  "isSpam": boolean,
+  "spamScore": number (0-100),
+  "reasons": string[] (max 3 items)
+}`;
+
+  try {
+    const response = await retryGptRequest(
+      () => openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          { role: "system", content: gptPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        max_tokens: 1000,
+        temperature: 0.2,
+      }),
+      2,
+      50000,
+      55000
+    );
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) throw new Error('Empty GPT-4o response');
+
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON in response');
+
+    let result = JSON.parse(jsonMatch[0]);
+    
+    if (typeof result.isSpam !== 'boolean' || 
+        typeof result.spamScore !== 'number' || 
+        !Array.isArray(result.reasons)) {
+      throw new Error('Invalid GPT response structure');
+    }
+
+    result.spamScore = Math.max(0, Math.min(100, result.spamScore));
+    result.reasons = result.reasons.slice(0, 3);
+    if (result.reasons.length === 0) result.reasons.push('No specific reason provided');
+
+    // Adjust the spam score based on message content and other factors
+    const messageContentWeight = 0.6;  // Increased from 0.5
+    const telegramWeight = 0.15;  // Decreased from 0.2
+    const complaintWeight = 0.15;  // Increased from 0.1
+    const groupContextWeight = 0.1;  // Decreased from 0.2
+
+    const messageContentScore = result.spamScore;
+    const complaintScore = Math.min(100, sysInfo.complaintCount * 15);  // Increased multiplier
+    const groupContextScore = sysInfo.source.toLowerCase().includes('hookup') ? 70 : 0;
+
+    let adjustedScore = (messageContentWeight * messageContentScore) + 
+                        (telegramWeight * (sysInfo.telegramSpamProbability * 100)) +
+                        (complaintWeight * complaintScore) +
+                        (groupContextWeight * groupContextScore);
+
+    // Additional checks
+    if (/🔞|xxx|porn|sex/i.test(message)) adjustedScore += 20;
+    if (/\b(crypto|bitcoin|ethereum|invest|earn)\b/i.test(message)) adjustedScore += 15;
+    if (/(\p{Emoji_Presentation}|\p{Extended_Pictographic}){5,}/u.test(message)) adjustedScore += 10;
+    if (/\b(vip|premium|exclusive)\b/i.test(message)) adjustedScore += 10;
+    if (/\b(urgent|hurry|limited time)\b/i.test(message)) adjustedScore += 10;
+    if (/\b(dm|pm|private message)\b/i.test(message)) adjustedScore += 10;
+    if (/\b(guarantee|proven|tested)\b/i.test(message)) adjustedScore += 10;
+    if (/\b(search for|find me at)\b/i.test(message)) adjustedScore += 15;
+
+    result.spamScore = Math.round(Math.min(100, adjustedScore));
+
+    // Adjust the final decision based on the new score, with a higher threshold for short messages
+    const isShortMessage = message.length <= 10;
+    const spamThreshold = isShortMessage ? 70 : 55;  // Lowered thresholds
+    result.isSpam = result.spamScore > spamThreshold;
+
+    // Override for very short, neutral greetings
+    if (isShortMessage && /^(hi|hello|hey)$/i.test(message.trim())) {
+      result.isSpam = false;
+      result.spamScore = Math.min(result.spamScore, 30);
+      result.reasons = ['Short neutral greeting'];
+    }
+
+    console.log(`GPT result: isSpam: ${result.isSpam}, spamScore: ${result.spamScore}`);
+    return result;
+
+  } catch (error) {
+    console.error('Error in gptDeep:', error);
+    return performSimplifiedCheck(message, 'Error in main GPT analysis');
+  }
+}
+
+async function performSimplifiedCheck(message: string, reason: string): Promise<{
+  isSpam: boolean;
+  spamScore: number;
+  reasons: string[];
+}> {
+  try {
+    const simplePrompt = "Is this message spam? Answer 'yes' or 'no':\n\n" + message;
+    const simpleResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: simplePrompt }],
+      max_tokens: 100,
+      temperature: 0.0,
+    });
+    const simpleAnswer = simpleResponse.choices[0]?.message?.content?.toLowerCase() || '';
+    const isSpam = simpleAnswer.includes('yes');
+    return {
+      isSpam: isSpam,
+      spamScore: isSpam ? 90 : 10,
+      reasons: [reason]
+    };
+  } catch (simpleError) {
+    console.error('Error in simplified GPT check:', simpleError);
+    return {
+      isSpam: false,
+      spamScore: 50,
+      reasons: ['Error in both main and simplified GPT analysis']
+    };
+  }
+}
 
 async function retryGptRequest<T>(
   requestFunc: () => Promise<T>,
@@ -1096,98 +1279,6 @@ async function retryGptRequest<T>(
   }
 }
 
-async function gptDeep(message: string, sysInfo: SysInfo): Promise<{ 
-  isSpam: boolean; 
-  spamScore: number; 
-  reasons: string[];
-}> {
-  const userPrompt = `Analyze:
-Message: "${message}"
-Complaints: ${sysInfo.complaintCount}
-Source: ${sysInfo.source}
-Sender: ${sysInfo.sender}
-Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
-
-Respond with JSON only:
-{
-  "isSpam": boolean,
-  "spamScore": number (0-100),
-  "reasons": string[] (max 3 items)
-}`;
-
-  try {
-    const response = await retryGptRequest(
-      () => openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: gptPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        max_tokens: 1000,
-        temperature: 0.3,
-      }),
-      2,
-      50000,
-      55000
-    );
-
-    const content = response.choices[0]?.message?.content;
-    if (!content) throw new Error('Empty GPT-4o response');
-
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in response');
-
-    let result = JSON.parse(jsonMatch[0]);
-    
-    if (typeof result.isSpam !== 'boolean' || 
-        typeof result.spamScore !== 'number' || 
-        !Array.isArray(result.reasons)) {
-      throw new Error('Invalid GPT response structure');
-    }
-
-    result.spamScore = Math.max(0, Math.min(100, result.spamScore));
-    result.reasons = result.reasons.slice(0, 3);
-    if (result.reasons.length === 0) result.reasons.push('No specific reason provided');
-
-    console.log(`GPT result: isSpam: ${result.isSpam}, spamScore: ${result.spamScore}`);
-    return result;
-
-  } catch (error) {
-    console.error('Error in gptDeep:', error);
-    return performSimplifiedCheck(message, 'Error in main GPT analysis');
-  }
-}
-
-async function performSimplifiedCheck(message: string, reason: string): Promise<{
-  isSpam: boolean;
-  spamScore: number;
-  reasons: string[];
-}> {
-  try {
-    const simplePrompt = "Is this message spam? Answer 'yes' or 'no':\n\n" + message;
-    const simpleResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: simplePrompt }],
-      max_tokens: 100,
-      temperature: 0.0,
-    });
-    const simpleAnswer = simpleResponse.choices[0]?.message?.content?.toLowerCase() || '';
-    const isSpam = simpleAnswer.includes('yes');
-    return {
-      isSpam: isSpam,
-      spamScore: isSpam ? 90 : 10,
-      reasons: [reason]
-    };
-  } catch (simpleError) {
-    console.error('Error in simplified GPT check:', simpleError);
-    return {
-      isSpam: false,
-      spamScore: 50,
-      reasons: ['Error in both main and simplified GPT analysis']
-    };
-  }
-}
-
 // RESULT HANDLING
 //--------------------------------------------------
 async function handleResult(result: CheckResult, messages: Api.Message[]): Promise<void> {
@@ -1210,10 +1301,8 @@ async function handleResult(result: CheckResult, messages: Api.Message[]): Promi
 
 async function sendResult(isSpam: boolean): Promise<void> {
   if (isAutoMode) {
-    if (!enabledChecks.has('mod')) {
-      // Задержка только если не в режиме модератора
-      await new Promise(resolve => setTimeout(resolve, processInterval));
-    }
+    // Применяем задержку перед отправкой результата
+    await new Promise(resolve => setTimeout(resolve, processInterval));
     await client.sendMessage(botId, { message: isSpam ? '😡 SPAM' : '😌 NO' });
   }
 }
