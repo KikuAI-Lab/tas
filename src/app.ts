@@ -1083,6 +1083,7 @@ Key factors (importance order):
 5. Complaint count and Telegram's spam probability (consider context)
 
 Spam indicators (treat these more strictly):
+- Any job offers
 - Unsolicited commercial offers (e.g., crypto, investments, jobs, adult services)
 - Scams, phishing, deceptive practices, get-rich-quick schemes
 - Attempts to move conversations to private channels or external links for commercial purposes
