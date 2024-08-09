@@ -1146,7 +1146,7 @@ Respond with JSON only:
   try {
     const response = await retryGptRequest(
       () => openai.chat.completions.create({
-        model: "gpt-4o-2024-08-06",
+        model: "gpt-4o",
         messages: [
           { role: "system", content: gptPrompt },
           { role: "user", content: userPrompt }
