@@ -346,7 +346,7 @@ async function sysMsg(event: NewMessageEvent): Promise<void> {
     }
 
     // Обработка специфических системных сообщений
-    if (message === "Sorry, this action can no longer be undone.\nSend /next for a new spam report.") {
+    if (message.includes("Send /next for a new spam report.")) {
       console.log("Action can no longer be undone. Sending /next...");
       await client.sendMessage(botId, { message: "/next" });
       resetRecoveryTimers();
