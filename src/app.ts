@@ -759,14 +759,17 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
     if (message.message) {
       const cleanedMessage = message.message.toLowerCase();
       
-      if (spamPhrases.some(phrase => phrase.toLowerCase().split(/\s+/).every(word => cleanedMessage.includes(word)))) {
-        return { isSpam: true, layer: 2, reason: "Spam phrase detected" };
+      // Проверка на наличие спам-фраз в тексте
+      if (spamPhrases.some(phrase => cleanedMessage.includes(phrase.toLowerCase()))) {
+        return { isSpam: true, layer: 2, reason: "Spam phrase detected in text" };
       }
       
+      // Проверка на короткие спам-фразы
       if (shortSpamPhrases.some(phrase => new RegExp(`\\b${phrase}\\b`, 'i').test(cleanedMessage))) {
-        return { isSpam: true, layer: 2, reason: "Short spam phrase detected" };
+        return { isSpam: true, layer: 2, reason: "Short spam phrase detected in text" };
       }
       
+      // Проверка на чрезмерное использование эмодзи
       const emojiCounts = new Map<string, number>();
       for (const char of cleanedMessage) {
         if (spamEmojis.includes(char) && emojiCounts.set(char, (emojiCounts.get(char) || 0) + 1).get(char)! > 3) {
@@ -774,12 +777,9 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
         }
       }
 
+      // Проверка на дублирование сообщений
       if (messages.length > 3 && new Set(messages.map(m => m.message)).size < messages.length * 0.7) {
-        return {
-          isSpam: true,
-          layer: 2,
-          reason: "Multiple similar messages in a short time"
-        };
+        return { isSpam: true, layer: 2, reason: "Multiple similar messages in a short time" };
       }
 
       // Проверка на обещание высокого заработка или инвестиций
@@ -789,8 +789,24 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
         return { isSpam: true, layer: 2, reason: "High payment promise or investment offer detected" };
       }
 
-      if (/таро|гадан|астролог|нумеролог/i.test(cleanedMessage)) {
-        return { isSpam: true, layer: 2, reason: "Offering fortune-telling or tarot services" };
+      // Проверка на предложение услуг
+      if (/предостав(?:ля|им|ить)|помо(?:щь|жем)|услуг[иа]/i.test(cleanedMessage)) {
+        return { isSpam: true, layer: 2, reason: "Offering services in suspicious context" };
+      }
+
+      // Проверка на упоминание документов в подозрительном контексте
+      if (/(?:водительск|прав[а|о]|удостоверени[е|я])/i.test(cleanedMessage) && 
+          /(?:помо(?:щь|жем)|услуг[иа]|предостав)/i.test(cleanedMessage)) {
+        return { isSpam: true, layer: 2, reason: "Suspicious mention of documents or licenses" };
+      }
+
+      // Проверка на подозрительные ключевые слова
+      const suspiciousKeywords = [
+        'оплата после', 'широкий спектр услуг', 'работаем по всей', 
+        'участникам скидки', 'помощь лишённым', 'замена иностранцам'
+      ];
+      if (suspiciousKeywords.some(keyword => cleanedMessage.includes(keyword.toLowerCase()))) {
+        return { isSpam: true, layer: 2, reason: "Suspicious keywords detected" };
       }
       
       const urls = cleanedMessage.match(urlRegex) || [];
@@ -853,7 +869,7 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
     }
   }
 
-  // Проверка на наличие упоминаний конкретных пользователей для финансовых услуг
+  // Проверка на упоминания конкретных пользователей для финансовых услуг
   const financialUserMentions = messages.some(m => 
     m.message && /@\w+/.test(m.message) && 
     /(?:инвест|invest|прибыль|profit|заработ|earn|crypto|крипто)/i.test(m.message)
@@ -878,12 +894,12 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
 //--------------------------------------------------
 
 async function checkGPT(messages: Api.Message[], sysInfo: SysInfo): Promise<CheckResult> {
-  const { preprocessedMessage } = await preprocessAndAnalyze(messages);
+  const { preprocessedMessage, visionResults } = await preprocessAndAnalyze(messages);
 
   try {
     isProcessing = true;
 
-    const deepCheckResult = await gptDeep(preprocessedMessage, sysInfo);
+    const deepCheckResult = await gptDeep(preprocessedMessage, sysInfo, visionResults);
 
     const response = deepCheckResult.isSpam ? '😡 SPAM' : '😌 NO';
     await saveToCache(messages[0], response, deepCheckResult.spamScore);
@@ -913,9 +929,8 @@ async function checkGPT(messages: Api.Message[], sysInfo: SysInfo): Promise<Chec
 async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preprocessedMessage: string, visionResults: VisionResult[] }> {
   const message = messages[0];
   const mediaTypes = messages.filter(m => m.media).map(m => getMediaType(m.media!));
-  let preprocessedMessage = preprocessMessage(message.message || '', mediaTypes);
-
   let visionResults: VisionResult[] = [];
+
   if (isVisionEnabled && mediaTypes.length > 0) {
     const visionPromises = messages
       .filter(m => m.media)
@@ -923,16 +938,33 @@ async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preproce
     visionResults = await Promise.all(visionPromises);
     
     const visionSummary = visionResults
-      .map(result => `${result.type}: ${result.labels.slice(0, 3).join(', ')}`)
+      .map(result => {
+        let summary = `${result.type}: ${result.labels.slice(0, 3).join(', ')}`;
+        if (result.safeSearch) {
+          const safeSearchFlags = Object.entries(result.safeSearch)
+            .filter(([_, value]) => ['LIKELY', 'VERY_LIKELY'].includes(value as string))
+            .map(([key, _]) => key);
+          if (safeSearchFlags.length > 0) {
+            summary += ` [SafeSearch: ${safeSearchFlags.join(', ')}]`;
+          }
+        }
+        return summary;
+      })
       .join('. ');
     
+    let preprocessedMessage = preprocessMessage(message.message || '', mediaTypes, visionResults);
     preprocessedMessage += ` Vision: ${visionSummary}`;
+
+    // Ограничиваем длину preprocessedMessage
+    preprocessedMessage = preprocessedMessage.slice(0, 1500);
+
+    return { preprocessedMessage, visionResults };
   }
 
-  // Ограничиваем длину preprocessedMessage
-  preprocessedMessage = preprocessedMessage.slice(0, 1000);
-
-  return { preprocessedMessage, visionResults };
+  return { 
+    preprocessedMessage: preprocessMessage(message.message || '', mediaTypes), 
+    visionResults 
+  };
 }
 
 // HELPER FUNCTIONS
@@ -969,7 +1001,7 @@ function getMediaHash(media: Api.TypeMessageMedia): string {
   return 'unknown_media';
 }
 
-function preprocessMessage(message: string, mediaTypes: string[]): string {
+function preprocessMessage(message: string, mediaTypes: string[], visionResults?: VisionResult[]): string {
   let processed = message
     .replace(/\n+/g, ' ')
     .replace(/\s+/g, ' ')
@@ -985,6 +1017,19 @@ function preprocessMessage(message: string, mediaTypes: string[]): string {
   if (mediaTypes.length > 0) {
     processed += ` [MEDIA: ${mediaTypes.join(', ')}]`;
   }
+
+  // Добавляем обработку текста из результатов Vision API
+  if (visionResults && visionResults.length > 0) {
+    const textFromImages = visionResults
+      .filter(result => result.textAnnotations && result.textAnnotations.length > 0)
+      .map(result => result.textAnnotations![0].description)
+      .join(' ');
+    
+    if (textFromImages) {
+      processed += ` [TEXT_FROM_IMAGE: ${textFromImages.slice(0, 200)}]`; // Ограничиваем длину текста из изображения
+    }
+  }
+
   return processed;
 }
 
@@ -1083,14 +1128,14 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 // GPT PROMPTS AND FUNCTIONS
 //--------------------------------------------------
 
-async function gptDeep(message: string, sysInfo: SysInfo): Promise<{ 
+async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionResult[]): Promise<{ 
   isSpam: boolean; 
   spamScore: number; 
   category: string;
 }> {
   const gptPrompt = `# Telegram Spam Detection
 
-Analyze the given message and classify it as spam (1) or not spam (0). Provide a detailed category and confidence score. Consider the Telegram context, where users can send text, media, and links in group chats or private messages. Be very cautious about classifying messages as spam, especially short or emoji-only messages.
+Analyze the given message and classify it as spam (1) or not spam (0). Provide a detailed category and confidence score. Consider the Telegram context, where users can send text, media, and links in group chats or private messages in any language. Be very cautious about classifying messages as spam, especially short or emoji-only messages.
 
 ## 1 - Spam (only if very clear and obvious):
 1.1. Commercial: Unsolicited ads, aggressive promotions
@@ -1100,8 +1145,9 @@ Analyze the given message and classify it as spam (1) or not spam (0). Provide a
 1.5. Crypto/Financial: Unrealistic investment promises, obvious quick money schemes
 1.6. Deceptive: Obvious impersonation, very misleading information
 1.7. Unwanted: Excessive invites, clear chain messages
-1.8 Asks to subrscribe/follow/donate
-1.9 Any message with clear spam indicators
+1.8. Any message with clear spam indicators
+1.9 Asks to subscribe/follow/donate
+1.10 Illegal Services: Offering fake documents, licenses, or other illegal services
 
 ## 0 - Not Spam (default for most messages):
 0.1. Normal conversations: Any casual chat, greetings, emoji usage
@@ -1114,9 +1160,9 @@ Analyze the given message and classify it as spam (1) or not spam (0). Provide a
 0.8. Insults, arguments, or disagreements: Unless very offensive or aggressive
 0.9. Any message without clear spam indicators
 
-Consider: Message intent, group context. A single complaint or the presence of emojis/short text does NOT automatically indicate spam. Err on the side of caution - if in doubt, classify as not spam.
+Consider: Message intent, group context, and media content. A single complaint or the presence of emojis/short text does NOT automatically indicate spam. Err on the side of caution - if in doubt, classify as not spam.
 
-Output: JSON with classification, category, and confidence score. Do not use markdown formatting or JSON code blocks in your response.`;
+Output: JSON with classification, category, confidence score, and reasoning. Do not use markdown formatting or JSON code blocks in your response.`;
 
   const userPrompt = `Analyze:
 Message: "${message}"
@@ -1125,12 +1171,14 @@ Source: ${sysInfo.source}
 Sender: ${sysInfo.sender}
 Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 Telegram Spam Probability: ${sysInfo.telegramSpamProbability}
+Vision Analysis: ${visionResults.map(vr => `${vr.type} - Labels: ${vr.labels.join(', ')}, SafeSearch: ${JSON.stringify(vr.safeSearch)}`).join(' | ')}
 
 Respond with JSON:
 {
   "classification": number (0 or 1),
   "category": string (e.g., "1.2" or "0.3"),
-  "confidence": number (0-100)
+  "confidence": number (0-100),
+  "reasoning": string (brief explanation)
 }`;
 
   try {
@@ -1141,7 +1189,7 @@ Respond with JSON:
           { role: "system", content: gptPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: 150,
+        max_tokens: 250,
         temperature: 0.1,
       }),
       2,
@@ -1166,18 +1214,37 @@ Respond with JSON:
     
     if (typeof result.classification !== 'number' || 
         typeof result.category !== 'string' ||
-        typeof result.confidence !== 'number') {
+        typeof result.confidence !== 'number' ||
+        typeof result.reasoning !== 'string') {
       throw new Error('Invalid GPT response structure');
     }
 
     const isSpam = result.classification === 1;
     let spamScore = isSpam ? result.confidence : 100 - result.confidence;
 
+    // Adjust score based on system info
     spamScore += Math.min(5, sysInfo.complaintCount);
     spamScore += sysInfo.telegramSpamProbability * 10;
     if (sysInfo.hasLink) spamScore += 2;
     
+    // Adjust score based on vision analysis
+    const adultContent = visionResults.some(vr => vr.safeSearch && (vr.safeSearch.adult === 'LIKELY' || vr.safeSearch.adult === 'VERY_LIKELY'));
+    if (adultContent) spamScore += 10;
+
+    const violenceContent = visionResults.some(vr => vr.safeSearch && (vr.safeSearch.violence === 'LIKELY' || vr.safeSearch.violence === 'VERY_LIKELY'));
+    if (violenceContent) spamScore += 5;
+
+    // Check for text in images that might indicate spam
+    const textInImages = visionResults.flatMap(vr => vr.textAnnotations || []).map(ta => ta.description.toLowerCase());
+    const spamKeywordsInImages = textInImages.some(text => 
+      spamPhrases.some(phrase => text.includes(phrase.toLowerCase())) ||
+      shortSpamPhrases.some(phrase => new RegExp(`\\b${phrase}\\b`, 'i').test(text))
+    );
+    if (spamKeywordsInImages) spamScore += 15;
+
     spamScore = Math.min(100, spamScore);
+
+    console.log(`GPT Deep Analysis - Category: ${result.category}, Confidence: ${result.confidence}, Reasoning: ${result.reasoning}`);
 
     return {
       isSpam: spamScore > 85,
