@@ -1135,32 +1135,29 @@ async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionR
 }> {
   const gptPrompt = `# Telegram Spam Detection
 
-Analyze the given message and classify it as spam (1) or not spam (0). Provide a detailed category and confidence score. Consider the Telegram context, where users can send text, media, and links in group chats or private messages in any language. Be very cautious about classifying messages as spam, especially short or emoji-only messages.
+Analyze the given message and classify it as spam (1) or not spam (0). Provide a detailed category and confidence score. Consider the Telegram context, where users can send text, media, and links in group chats or private messages in any language. Be cautious about classifying messages as spam, especially short or emoji-only messages, or messages that could be jokes or casual conversation.
 
 ## 1 - Spam (only if very clear and obvious):
 1.1. Commercial: Unsolicited ads, aggressive promotions
 1.2. Scams: Clear phishing attempts, obvious fake giveaways
 1.3. Malicious: Explicit mentions of malware or viruses
-1.4. Adult: Explicit pornography, unsolicited adult services, private meetings/calls
+1.4. Adult: Explicit pornography, unsolicited adult services
 1.5. Crypto/Financial: Unrealistic investment promises, obvious quick money schemes
 1.6. Deceptive: Obvious impersonation, very misleading information
 1.7. Unwanted: Excessive invites, clear chain messages
-1.8. Any message with clear spam indicators
-1.9 Asks to subscribe/follow/donate
-1.10 Illegal Services: Offering fake documents, licenses, or other illegal services
+1.8. Illegal: Offering fake documents, licenses, or other illegal services
 
 ## 0 - Not Spam (default for most messages):
 0.1. Normal conversations: Any casual chat, greetings, emoji usage
 0.2. Short messages: Single words, numbers, or emojis
 0.3. Group-related content: Any message that could be relevant to a group
-0.4. Opinions or reactions: Personal views, emotional responses
+0.4. Opinions or reactions: Personal views, emotional responses, jokes
 0.5. Questions or responses: Any form of inquiry or reply
 0.6. Sharing of information: Links, news, or any shared content
 0.7. Business or financial discussions: Unless clearly a scam
 0.8. Insults, arguments, or disagreements: Unless very offensive or aggressive
-0.9. Any message without clear spam indicators
 
-Consider: Message intent, group context, and media content. A single complaint or the presence of emojis/short text does NOT automatically indicate spam. Err on the side of caution - if in doubt, classify as not spam.
+Consider: Message intent, group context, and media content. A single complaint or the presence of emojis/short text does NOT automatically indicate spam. Err on the side of caution - if in doubt, classify as not spam. Pay attention to the actual content of the message rather than relying heavily on usernames or channel names.
 
 Output: JSON with classification, category, confidence score, and reasoning. Do not use markdown formatting or JSON code blocks in your response.`;
 
@@ -1200,7 +1197,6 @@ Respond with JSON:
     const content = response.choices[0]?.message?.content;
     if (!content) throw new Error('Empty GPT-4o response');
 
-    // Удаляем возможные markdown-теги JSON
     const cleanedContent = content.replace(/```json\n?|\n?```/g, '').trim();
     
     let result;
