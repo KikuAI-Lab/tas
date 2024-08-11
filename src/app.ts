@@ -1100,8 +1100,8 @@ Analyze the given message and classify it as spam (1) or not spam (0). Provide a
 1.5. Crypto/Financial: Unrealistic investment promises, obvious quick money schemes
 1.6. Deceptive: Obvious impersonation, very misleading information
 1.7. Unwanted: Excessive invites, clear chain messages
-1.8. Any message with clear spam indicators
-1.9 Asks to subrscribe/follow/donate
+1.8 Asks to subrscribe/follow/donate
+1.9 Any message with clear spam indicators
 
 ## 0 - Not Spam (default for most messages):
 0.1. Normal conversations: Any casual chat, greetings, emoji usage
@@ -1111,7 +1111,8 @@ Analyze the given message and classify it as spam (1) or not spam (0). Provide a
 0.5. Questions or responses: Any form of inquiry or reply
 0.6. Sharing of information: Links, news, or any shared content
 0.7. Business or financial discussions: Unless clearly a scam
-0.8. Any message without clear spam indicators
+0.8. Insults, arguments, or disagreements: Unless very offensive or aggressive
+0.9. Any message without clear spam indicators
 
 Consider: Message intent, group context. A single complaint or the presence of emojis/short text does NOT automatically indicate spam. Err on the side of caution - if in doubt, classify as not spam.
 
