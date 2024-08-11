@@ -917,15 +917,20 @@ async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preproce
 
   let visionResults: VisionResult[] = [];
   if (isVisionEnabled && mediaTypes.length > 0) {
-    const visionPromises = messages.filter(m => m.media).map(analyzeMediaMessage);
+    const visionPromises = messages
+      .filter(m => m.media)
+      .map(analyzeMediaMessage);
     visionResults = await Promise.all(visionPromises);
     
-    const visionSummary = visionResults.map(result => 
-      `Vision(${result.type}): ${result.labels.slice(0, 3).join(', ')}. SafeSearch: ${JSON.stringify(result.safeSearch)}`
-    ).join(' ');
+    const visionSummary = visionResults
+      .map(result => `${result.type}: ${result.labels.slice(0, 3).join(', ')}`)
+      .join('. ');
     
-    preprocessedMessage += ' ' + visionSummary;
+    preprocessedMessage += ` Vision: ${visionSummary}`;
   }
+
+  // Ограничиваем длину preprocessedMessage
+  preprocessedMessage = preprocessedMessage.slice(0, 1000);
 
   return { preprocessedMessage, visionResults };
 }
@@ -965,18 +970,22 @@ function getMediaHash(media: Api.TypeMessageMedia): string {
 }
 
 function preprocessMessage(message: string, mediaTypes: string[]): string {
-  let processed = message.split('\n').slice(1).join('\n').trim();
-  processed = processed.slice(0, 1000).replace(/[^\S\s]/g, '')
-      .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '[EMAIL]')
-      .replace(/\+?[0-9]{10,14}/g, '[PHONE]')
-      .replace(/@(\w+)(?!bot\b)/g, '@[USERNAME]')
-      .replace(/\s+/g, ' ')
-      .replace(/https?:\/\/\S+/g, '[URL]');
+  let processed = message
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);  // Ограничиваем длину сообщения
+
+  processed = processed
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '[EMAIL]')
+    .replace(/\+?[0-9]{10,14}/g, '[PHONE]')
+    .replace(/@(\w+)(?!bot\b)/g, '@[USERNAME]')
+    .replace(/https?:\/\/\S+/g, '[URL]');
   
   if (mediaTypes.length > 0) {
-      processed += ` [MEDIA: ${mediaTypes.join(', ')}]`;
+    processed += ` [MEDIA: ${mediaTypes.join(', ')}]`;
   }
-  return processed.trim();
+  return processed;
 }
 
 async function getFileSize(mediaMessage: Api.Message): Promise<number> {
