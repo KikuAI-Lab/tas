@@ -888,15 +888,16 @@ async function checkGPT(messages: Api.Message[], sysInfo: SysInfo): Promise<Chec
     const response = deepCheckResult.isSpam ? '😡 SPAM' : '😌 NO';
     await saveToCache(messages[0], response, deepCheckResult.spamScore);
 
+    console.log(`GPT Check Result - Category: ${deepCheckResult.category}, Spam Score: ${deepCheckResult.spamScore}`);
+
     return {
       isSpam: deepCheckResult.isSpam,
       layer: 5,
-      reason: `GPT: ${deepCheckResult.reasons.join(", ")}`
+      reason: `GPT Category: ${deepCheckResult.category}`
     };
 
   } catch (error) {
     console.error('Error in GPT check:', error);
-    // Вместо возврата false, возвращаем специальный результат
     return { 
       isSpam: undefined,
       layer: 5, 
@@ -915,13 +916,12 @@ async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preproce
   let preprocessedMessage = preprocessMessage(message.message || '', mediaTypes);
 
   let visionResults: VisionResult[] = [];
-  if (isVisionEnabled) {
-    visionResults = await Promise.all(messages.filter(m => m.media).map(async (mediaMessage) => {
-      return analyzeMediaMessage(mediaMessage);
-    }));
+  if (isVisionEnabled && mediaTypes.length > 0) {
+    const visionPromises = messages.filter(m => m.media).map(analyzeMediaMessage);
+    visionResults = await Promise.all(visionPromises);
     
     const visionSummary = visionResults.map(result => 
-      `Vision analysis (${result.type}): ${result.labels.join(', ')}. SafeSearch: ${JSON.stringify(result.safeSearch)}`
+      `Vision(${result.type}): ${result.labels.slice(0, 3).join(', ')}. SafeSearch: ${JSON.stringify(result.safeSearch)}`
     ).join(' ');
     
     preprocessedMessage += ' ' + visionSummary;
@@ -1078,7 +1078,6 @@ async function gptDeep(message: string, sysInfo: SysInfo): Promise<{
   isSpam: boolean; 
   spamScore: number; 
   category: string;
-  reasons: string[];
 }> {
   const gptPrompt = `# Telegram Spam Detection
 
@@ -1088,7 +1087,7 @@ Analyze the given message and classify it as spam (1) or not spam (0). Provide a
 1.1. Commercial: Unsolicited ads, aggressive promotions
 1.2. Scams: Clear phishing attempts, obvious fake giveaways
 1.3. Malicious: Explicit mentions of malware or viruses
-1.4. Adult: Explicit pornography, unsolicited adult services, priveate meetings/calls
+1.4. Adult: Explicit pornography, unsolicited adult services, private meetings/calls
 1.5. Crypto/Financial: Unrealistic investment promises, obvious quick money schemes
 1.6. Deceptive: Obvious impersonation, very misleading information
 1.7. Unwanted: Excessive invites, clear chain messages
@@ -1108,7 +1107,7 @@ Consider: Message intent, group context. A single complaint or the presence of e
 
 Output: JSON with classification, category, and confidence score.`;
 
-const userPrompt = `Analyze:
+  const userPrompt = `Analyze:
 Message: "${message}"
 Complaints: ${sysInfo.complaintCount}
 Source: ${sysInfo.source}
@@ -1120,8 +1119,7 @@ Respond with JSON:
 {
   "classification": number (0 or 1),
   "category": string (e.g., "1.2" or "0.3"),
-  "confidence": number (0-100),
-  "reason": string (brief explanation)
+  "confidence": number (0-100)
 }`;
 
   try {
@@ -1132,83 +1130,72 @@ Respond with JSON:
           { role: "system", content: gptPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: 250,
+        max_tokens: 150,
         temperature: 0.1,
       }),
       2,
-      50000,
-      55000
+      30000,
+      35000
     );
 
     const content = response.choices[0]?.message?.content;
     if (!content) throw new Error('Empty GPT-4o response');
 
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in response');
-
-    let result = JSON.parse(jsonMatch[0]);
+    const result = JSON.parse(content);
     
     if (typeof result.classification !== 'number' || 
         typeof result.category !== 'string' ||
-        typeof result.confidence !== 'number' ||
-        typeof result.reason !== 'string') {
+        typeof result.confidence !== 'number') {
       throw new Error('Invalid GPT response structure');
     }
 
     const isSpam = result.classification === 1;
     let spamScore = isSpam ? result.confidence : 100 - result.confidence;
 
-    // Более мягкая корректировка спам-оценки
     spamScore += Math.min(5, sysInfo.complaintCount);
     spamScore += sysInfo.telegramSpamProbability * 10;
     if (sysInfo.hasLink) spamScore += 2;
     
     spamScore = Math.min(100, spamScore);
 
-    // Значительно повышенный порог для определения спама
     return {
-      isSpam: spamScore > 85,  // Очень высокий порог
+      isSpam: spamScore > 85,
       spamScore: spamScore,
-      category: result.category,
-      reasons: [result.reason]
+      category: result.category
     };
 
   } catch (error) {
     console.error('Error in gptDeep:', error);
-    return performSimplifiedCheck(message, 'Error in main GPT analysis');
+    return performSimplifiedCheck(message);
   }
 }
 
-async function performSimplifiedCheck(message: string, reason: string): Promise<{
+async function performSimplifiedCheck(message: string): Promise<{
   isSpam: boolean;
   spamScore: number;
   category: string;
-  reasons: string[];
 }> {
   try {
-    const simplePrompt = "Is this message spam? Answer 'yes' or 'no' and provide a brief reason:\n\n" + message;
+    const simplePrompt = "Is this message spam? Answer with JSON: {\"isSpam\": boolean, \"category\": string}\n\n" + message;
     const simpleResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: simplePrompt }],
-      max_tokens: 50,
+      max_tokens: 30,
       temperature: 0.0,
     });
-    const simpleAnswer = simpleResponse.choices[0]?.message?.content?.toLowerCase() || '';
-    const isSpam = simpleAnswer.includes('yes');
-    const simplifiedReason = simpleAnswer.split('.')[1]?.trim() || 'No specific reason provided';
+    const simpleAnswer = simpleResponse.choices[0]?.message?.content || '{}';
+    const result = JSON.parse(simpleAnswer);
     return {
-      isSpam: isSpam,
-      spamScore: isSpam ? 80 : 20,
-      category: isSpam ? '1.0' : '0.0', // Generic spam or not spam category
-      reasons: [reason, simplifiedReason]
+      isSpam: result.isSpam || false,
+      spamScore: result.isSpam ? 80 : 20,
+      category: result.category || (result.isSpam ? '1.0' : '0.0')
     };
   } catch (simpleError) {
     console.error('Error in simplified GPT check:', simpleError);
     return {
       isSpam: false,
       spamScore: 50,
-      category: '0.0',
-      reasons: ['Error in both main and simplified GPT analysis', 'Defaulting to not spam']
+      category: '0.0'
     };
   }
 }
