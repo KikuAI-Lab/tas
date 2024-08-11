@@ -528,7 +528,7 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
       if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
         try {
           const { preprocessedMessage, visionResults } = await preprocessAndAnalyze(messages);
-          result = await checkGPT(messages, sysInfo, visionResults);
+          result = await checkGPT(messages, sysInfo);
           if (result) console.log("GPT check result:", result);
         } catch (error) {
           if (error instanceof Error && error.message === 'Vision API analysis failed') {
