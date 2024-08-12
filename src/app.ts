@@ -579,10 +579,11 @@ async function processReport(messages: Api.Message[], sysInfo: SysInfo): Promise
     processingStartTime = Date.now();
     isProcessing = true;
 
-    const mediaTypes = messages.filter(m => m.media).map(m => getMediaType(m.media!));
+    const mediaTypes = messages.map(m => m.media ? getMediaType(m.media) : 'None');
     console.log(`
 Processing Report: ${sysInfo.reportId}
-Media Types: ${mediaTypes.join(', ') || 'None'}
+Number of Messages: ${messages.length}
+Media Types: ${mediaTypes.join(', ')}
 Complaint Count: ${sysInfo.complaintCount}
 Source: ${sysInfo.source}
 Sender: ${sysInfo.sender}
@@ -612,7 +613,8 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 
       if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
         try {
-          result = await gptChecker.check(messages, sysInfo);
+          const { preprocessedMessage, visionResults, isSpam } = await preprocessAndAnalyze(messages);
+          result = await checkGPT(messages, sysInfo, preprocessedMessage, visionResults, isSpam);
           if (result) console.log("GPT check result:", result);
         } catch (error) {
           console.error("Error in GPT check:", error);
@@ -1071,29 +1073,42 @@ async function checkGPT(
 
 // Функция для предобработки и анализа сообщений
 async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preprocessedMessage: string, visionResults: VisionResult[], isSpam: boolean | undefined }> {
-  const message = messages[0];
-  const mediaTypes = messages.filter(m => m.media).map(m => getMediaType(m.media!));
+  let preprocessedMessage = '';
   let visionResults: VisionResult[] = [];
   let isSpam: boolean | undefined = undefined;
 
-  // Проверка на одиночный GIF-файл
-  if (messages.length === 1 && mediaTypes.length === 1 && mediaTypes[0] === 'GIF') {
-    console.log("Single GIF message detected, marking as not spam");
-    return {
-      preprocessedMessage: "[MEDIA: GIF]",
-      visionResults: [],
-      isSpam: false
-    };
+  for (const message of messages) {
+    const mediaType = message.media ? getMediaType(message.media) : 'None';
+    
+    // Обработка текста сообщения
+    if (message.message) {
+      preprocessedMessage += preprocessMessage(message.message, [mediaType]) + ' ';
+    }
+
+    // Обработка медиа-контента
+    if (message.media) {
+      if (mediaType === 'Sticker') {
+        preprocessedMessage += '[MEDIA: Sticker] ';
+        // Здесь можно добавить дополнительную логику для обработки стикеров, если необходимо
+      } else if (isVisionEnabled && !message.message) {
+        try {
+          const result = await analyzeMediaMessage(message);
+          visionResults.push(result);
+          preprocessedMessage += `[MEDIA: ${mediaType}] `;
+        } catch (error) {
+          console.error(`Error analyzing media in message ${message.id}:`, error);
+          preprocessedMessage += `[MEDIA: ${mediaType} (analysis failed)] `;
+        }
+      } else {
+        preprocessedMessage += `[MEDIA: ${mediaType}] `;
+      }
+    }
   }
 
-  // Если анализ изображений включен и есть медиа-контент без текста, выполняем анализ
-  if (isVisionEnabled && mediaTypes.length > 0 && !message.message) {
-    const visionPromises = messages
-      .filter(m => m.media && !m.message)
-      .map(analyzeMediaMessage);
-    visionResults = await Promise.all(visionPromises);
-    
-    // Формируем краткое описание результатов анализа изображений
+  preprocessedMessage = preprocessedMessage.trim().slice(0, 1500);
+
+  // Формируем краткое описание результатов анализа изображений
+  if (visionResults.length > 0) {
     const visionSummary = visionResults
       .map(result => {
         let summary = `${result.type}: ${result.labels.slice(0, 3).join(', ')}`;
@@ -1109,22 +1124,10 @@ async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preproce
       })
       .join('. ');
     
-    // Предобрабатываем сообщение и добавляем результаты анализа изображений
-    let preprocessedMessage = preprocessMessage(message.message || '', mediaTypes, visionResults);
     preprocessedMessage += ` Vision: ${visionSummary}`;
-
-    // Ограничиваем длину preprocessedMessage
-    preprocessedMessage = preprocessedMessage.slice(0, 1500);
-
-    return { preprocessedMessage, visionResults, isSpam };
   }
 
-  // Если анализ изображений отключен или нет подходящего медиа, просто предобрабатываем текст сообщения
-  return { 
-    preprocessedMessage: preprocessMessage(message.message || '', mediaTypes), 
-    visionResults,
-    isSpam
-  };
+  return { preprocessedMessage, visionResults, isSpam };
 }
 
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -1257,15 +1260,9 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 
   let partialResult: Partial<VisionResult> = { type: mediaType, labels: [], safeSearch: {} };
 
-  // Проверяем, есть ли текст в сообщении
-  if (mediaMessage.message) {
-    console.log('Skipping Vision analysis for message with text');
-    return partialResult as VisionResult;
-  }
-
-  // Пропускаем анализ видео
-  if (mediaType === 'Video') {
-    console.log('Skipping Vision analysis for video');
+  // Пропускаем анализ видео и стикеров
+  if (mediaType === 'Video' || mediaType === 'Sticker') {
+    console.log(`Skipping Vision analysis for ${mediaType}`);
     return partialResult as VisionResult;
   }
 
