@@ -65,9 +65,6 @@ const CACHE_TTL = parseInt(process.env.CACHE_TTL || '86400', 10);
 // Инициализация клиента Google Cloud Vision API
 const visionClient = new ImageAnnotatorClient({projectId: process.env.GOOGLE_CLOUD_PROJECT,});
 
-// Максимальный размер файла для анализа (5 МБ)
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
-
 // Размер пула соединений Redis
 const REDIS_POOL_SIZE = 5;
 
@@ -121,6 +118,7 @@ interface ResultInfo {
   visionResults?: VisionResult[];
   illegalContentDetected?: boolean;
   combinedMessage?: string;  
+  gptScore?: number;
 }
 
 // Интерфейс для записи в кэше
@@ -641,6 +639,17 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
       }
     }
 
+    // Отложенное кеширование результата
+    if (result && result.isSpam !== undefined) {
+      setImmediate(() => {
+        messages.forEach(message => {
+          saveToCache(message, result.isSpam ? '😡 SPAM' : '😌 NO', result.gptScore).catch(error => {
+            console.error('Error in delayed caching:', error);
+          });
+        });
+      });
+    }
+
   } catch (error: unknown) {
     console.error("Error processing report:", error);
     if (error instanceof Error) {
@@ -791,19 +800,32 @@ async function waitForBotResponse(expectedResponse: string | RegExp, timeout = 1
 
 // Функция для проверки кэша
 async function checkCache(messages: Api.Message[]): Promise<CheckResult> {
-  for (const message of messages) {
-    const cachedEntry = await getFromCache(message);
-    if (cachedEntry && message.message === cachedEntry.message && 
-        (message.media ? getMediaHash(message.media) : '') === cachedEntry.mediaHash) {
-      const isSpam = cachedEntry.response === '😡 SPAM';
-      return {
-        isSpam: isSpam,
-        layer: 1,
-        reason: `Cached result: ${cachedEntry.response}`
-      };
+  const redis = getRedisConnection();
+  
+  // Создаем массив промисов для каждого сообщения
+  const cachePromises = messages.map(async (message) => {
+    const key = `msg:${message.id}`;
+    const cachedData = await redis.get(key);
+    if (cachedData) {
+      const cachedEntry: CacheEntry = JSON.parse(cachedData);
+      if (message.message === cachedEntry.message && 
+          (message.media ? getMediaHash(message.media) : '') === cachedEntry.mediaHash) {
+        const isSpam = cachedEntry.response === '😡 SPAM';
+        return {
+          isSpam: isSpam,
+          layer: 1,
+          reason: `Cached result: ${cachedEntry.response}`
+        };
+      }
     }
-  }
-  return null;
+    return null;
+  });
+
+  // Ожидаем завершения всех проверок кэша
+  const results = await Promise.all(cachePromises);
+  
+  // Возвращаем первый ненулевой результат или null
+  return results.find(result => result !== null) || null;
 }
 
 // Функция для проверки очевидного спама
@@ -1360,7 +1382,7 @@ Classification (0/1) and brief reason:`;
           { role: "system", content: gptPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: 30,
+        max_tokens: 50,
         temperature: 0.1,
       }),
       2,
@@ -1543,34 +1565,39 @@ if (timeSinceLastCheckMsg >= CHECK_MSG_TIMEOUT) {
 
 // Функция для сохранения результата в кэш
 async function saveToCache(message: Api.Message, response: string, gptScore?: number): Promise<void> {
-const redis = getRedisConnection();
-const key = `msg:${message.id}`;
-const mediaType = message.media ? getMediaType(message.media) : 'None';
-const mediaHash = message.media ? getMediaHash(message.media) : '';
-const entry: CacheEntry = {
-  message: message.message?.slice(0, 100) || '', // Ограничиваем длину сохраняемого сообщения
-  mediaType,
-  mediaHash,
-  response,
-  timestamp: Date.now(),
-  gptScore
-};
+  const redis = getRedisConnection();
+  const key = `msg:${message.id}`;
+  const mediaType = message.media ? getMediaType(message.media) : 'None';
+  const mediaHash = message.media ? getMediaHash(message.media) : '';
+  const entry: CacheEntry = {
+    message: message.message?.slice(0, 100) || '',
+    mediaType,
+    mediaHash,
+    response,
+    timestamp: Date.now(),
+    gptScore
+  };
 
-await redis.set(key, JSON.stringify(entry), 'EX', CACHE_TTL);
+  // Асинхронная запись в кеш
+  redis.set(key, JSON.stringify(entry), 'EX', CACHE_TTL).catch(error => {
+    console.error('Error saving to cache:', error);
+  });
 
-if (gptScore !== undefined) {
-  const contentKey = `gpt:${crypto.createHash('md5').update(message.message || '').digest('hex')}`;
-  await redis.set(contentKey, JSON.stringify({ response, gptScore }), 'EX', CACHE_TTL);
-}
-
-// Асинхронная проверка использования кэша
-setImmediate(async () => {
-  try {
-    await checkCacheUsage();
-  } catch (error) {
-    console.error('Error in checkCacheUsage:', error);
+  if (gptScore !== undefined) {
+    const contentKey = `gpt:${crypto.createHash('md5').update(message.message || '').digest('hex')}`;
+    redis.set(contentKey, JSON.stringify({ response, gptScore }), 'EX', CACHE_TTL).catch(error => {
+      console.error('Error saving GPT score to cache:', error);
+    });
   }
-});
+
+  // Асинхронная проверка использования кэша
+  setImmediate(async () => {
+    try {
+      await checkCacheUsage();
+    } catch (error) {
+      console.error('Error in checkCacheUsage:', error);
+    }
+  });
 }
 
 // Функция для получения результата из кэша
