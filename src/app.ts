@@ -258,8 +258,8 @@ class ObviousChecker extends SpamChecker {
 // Класс для проверки с использованием GPT
 class GPTChecker extends SpamChecker {
   check: CheckFunction = async (messages, sysInfo) => {
-    const { preprocessedMessage, visionResults, isSpam } = await preprocessAndAnalyze(messages);
-    return checkGPT(messages, sysInfo, preprocessedMessage, visionResults, isSpam);
+    const { preprocessedMessage, visionResults } = await preprocessAndAnalyze(messages);
+    return checkGPT(messages, sysInfo, preprocessedMessage, visionResults);
   }
 }
 
@@ -667,7 +667,6 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
         result = await checkCache(messages);
         if (result) {
           console.log("Cache check result:", result);
-          // Очищаем результаты препроцессинга, так как они не нужны
           clearPreprocessingResults(messages);
         }
       }
@@ -675,17 +674,12 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
       if (!result && enabledChecks.has('obvious')) {
         result = await checkObvious(messages, sysInfo);
         if (result) {
-          if (result.isSpam === undefined) {
-            console.log("Obvious check result (requires further checking):", result);
-          } else {
-            console.log("Obvious check result:", result);
-            // Очищаем результаты препроцессинга, если получен определенный результат
-            clearPreprocessingResults(messages);
-          }
+          console.log("Obvious check result:", result);
+          clearPreprocessingResults(messages);
         }
       }
 
-      if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
+      if (!result && enabledChecks.has('gpt')) {
         try {
           const preprocessingPromises = messages.map(msg => reportBuffer.preprocessingPromises.get(msg.id));
           const preprocessingResults = await Promise.all(preprocessingPromises);
@@ -695,10 +689,8 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
             .join(' ');
           const combinedVisionResults = preprocessingResults
             .flatMap(r => r?.visionResults || []);
-          const isSpam = preprocessingResults
-            .some(r => r?.isSpam === true);
 
-          result = await checkGPT(messages, sysInfo, combinedPreprocessedMessage, combinedVisionResults, isSpam);
+          result = await checkGPT(messages, sysInfo, combinedPreprocessedMessage, combinedVisionResults);
           if (result) console.log("GPT check result:", result);
         } catch (error) {
           console.error("Error in GPT check:", error);
@@ -708,7 +700,6 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
             reason: "Error in GPT check, undo required",
           };
         } finally {
-          // Очищаем результаты препроцессинга после использования
           clearPreprocessingResults(messages);
         }
       }
@@ -923,6 +914,8 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
   const linkCounts = new Map<string, number>();
   const fileNameCounts = new Map<string, number>();
 
+  const gamblingKeywords = ['казино', 'выигрыш', 'ставки', 'бонус', 'jackpot', 'slots', 'рулетка', 'toncoin'];
+
   // Проверка количества жалоб для медиа, файлов, ссылок, контактов и @юзернеймов
   if ((messages.some(m => m.media) || 
        messages.some(m => m.message && (m.message.includes('http') || m.message.includes('@') || m.message.match(/\+?[0-9]{10,14}/))) 
@@ -965,6 +958,11 @@ async function checkObvious(messages: Api.Message[], sysInfo: SysInfo): Promise<
     
     if (message.message) {
       const cleanedMessage = message.message.toLowerCase();
+      
+      // Проверка на ключевые слова, связанные с азартными играми
+      if (gamblingKeywords.some(keyword => cleanedMessage.includes(keyword))) {
+        return { isSpam: true, layer: 2, reason: "Gambling-related keywords detected" };
+      }
       
       // Проверка на наличие спам-фраз в тексте
       if (spamPhrases.some(phrase => cleanedMessage.includes(phrase.toLowerCase()))) {
@@ -1111,21 +1109,10 @@ async function checkGPT(
   messages: Api.Message[], 
   sysInfo: SysInfo, 
   preprocessedMessage: string, 
-  visionResults: VisionResult[],
-  isSpam: boolean | undefined
+  visionResults: VisionResult[]
 ): Promise<CheckResult> {
   try {
     isProcessing = true;
-
-    // Если isSpam уже определен (например, для одиночного GIF), возвращаем результат немедленно
-    if (isSpam !== undefined) {
-      console.log(`GPT Check skipped. Predefined result: ${isSpam ? 'SPAM' : 'NOT SPAM'}`);
-      return {
-        isSpam: isSpam,
-        layer: 5,
-        reason: `Predefined result for special case`
-      };
-    }
 
     const deepCheckResult = await gptDeep(preprocessedMessage, sysInfo, visionResults);
 
@@ -1139,7 +1126,8 @@ async function checkGPT(
     return {
       isSpam: isSpamResult,
       layer: 5,
-      reason: `GPT Spam Score: ${deepCheckResult.spamScore.toFixed(2)}`
+      reason: `GPT Spam Score: ${deepCheckResult.spamScore.toFixed(2)}`,
+      gptScore: deepCheckResult.spamScore
     };
 
   } catch (error) {
@@ -1180,7 +1168,11 @@ async function startPreprocessing(messages: Api.Message[]): Promise<{
 }
 
 // Функция для предобработки и анализа сообщений
-async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preprocessedMessage: string, visionResults: VisionResult[], isSpam: boolean | undefined }> {
+async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ 
+  preprocessedMessage: string, 
+  visionResults: VisionResult[], 
+  isSpam: boolean | undefined 
+}> {
   let preprocessedMessage = '';
   let visionResults: VisionResult[] = [];
   let isSpam: boolean | undefined = undefined;
