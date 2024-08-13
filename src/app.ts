@@ -1423,10 +1423,12 @@ Spam (1) if clear:
    - Unsolicited ads, subtle marketing
    - Self-promotion of unrelated channels/groups
    - Disguised promotions (e.g., informative messages with channel links)
+   - Job offers with unrealistically high income (e.g., "90k per week")
 2. Scams/Financial:
    - Phishing, fake giveaways, get-rich-quick schemes
    - Unrealistic financial promises, urgent decisions
    - Suspicious cryptocurrency/airdrop mentions
+   - Messages combining job offers and high income promises
 3. Deceptive/Adult:
    - Impersonation, false promises
    - Explicit content, unsolicited services
@@ -1441,8 +1443,9 @@ Spam (1) if clear:
 5. Suspicious Behavior:
    - Bot-like messages, repetitive content
    - Attempts to move conversations to private channels
-   - Excessive emojis, especially at line starts
-   - Bypass attempts (e.g., unusual symbols)
+   - Excessive emojis, especially at line starts or to mask spam content
+   - Bypass attempts (e.g., unusual symbols, emojis replacing text)
+   - Short messages with Telegram channel/group links
 6. Harmful:
    - Incitement to violence/illegal activities
    - Hate speech, extreme discrimination
@@ -1470,19 +1473,21 @@ Not Spam (0) for:
 
 Key Factors:
 1. Message content and intent in any language
-2. Presence/nature of links or media
+2. Presence/nature of links or media, especially Telegram channel/group links
 3. Language tone and message structure
 4. Relevance to typical group conversations
 5. Provided context (complaints, source, spam probability)
+6. Combination of job offers, high income promises, and external links
 
 For Ambiguous Cases:
 - Analyze overall message intent
 - Check for subtle solicitations or hidden promotions
-- Assess relevance of links/mentions
+- Assess relevance of links/mentions, especially short links to Telegram channels
 - Consider cultural/linguistic context
 - Evaluate if message provides value or is promotional
 - Distinguish between spam discussions and actual spam
 - Pay extra attention to messages with seemingly innocent content but potential hidden meanings
+- Be cautious of short messages combining emojis, high income promises, and external links
 
 Examples of subtle spam:
 - "Let me help you relax ❤️‍🔥" (likely offering adult services)
@@ -1490,6 +1495,7 @@ Examples of subtle spam:
 - "Looking for a good time? DM me 🍑" (soliciting private interaction)
 - "Need some company tonight? 💋" (suggestive invitation)
 - "I know how to make your evening special 💆‍♀️" (implied services)
+- "Работа 90к в неделю https://t.me/example" (job offer with unrealistic pay and suspicious link)
 
 Consider these examples as highly likely to be spam.
 
