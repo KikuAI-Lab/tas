@@ -1291,11 +1291,24 @@ async function analyzeMediaMessage(mediaMessage: Api.Message): Promise<VisionRes
 // GPT ПРОМПТЫ И ФУНКЦИИ
 //--------------------------------------------------
 
+async function selectGptModel(message: string): Promise<string> {
+  const tokenEstimate = message.split(/\s+/).length; // Грубая оценка количества токенов
+
+  if (tokenEstimate <= 100) {
+    return "gpt-4o-mini";
+  } else if (tokenEstimate <= 500) {
+    return "gpt-4o";
+  } else {
+    return "gpt-4";
+  }
+}
+
 // Функция для глубокого анализа с помощью GPT
 async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionResult[]): Promise<{ 
   isSpam: boolean; 
   spamScore: number; 
 }> {
+  const model = await selectGptModel(message);
   // Оптимизированный промпт для GPT
   const gptPrompt = `Analyze multilingual Telegram messages for spam. Use provided context (complaints, source, sender, links, spam probability). Classify as spam (1) or not spam (0).
 
@@ -1362,11 +1375,7 @@ async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionR
   - Evaluate if message provides value or is promotional
   - Distinguish between spam discussions and actual spam
   
-  Output: Single digit (0 or 1) followed by brief reasoning (max 10 words).
-  
-  Example:
-  Input: "Внимание! Новая схема мошенничества в сети. Будьте осторожны."
-  Output: 0 Legitimate warning about scams in Russian, educational context.`;
+  Output: Single digit (0 or 1) without any explanation.`;
 
   // Формирование строки с результатами анализа изображений
   const visionAnalysis = visionResults.length > 0
@@ -1389,17 +1398,17 @@ Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
 Spam Prob: ${sysInfo.telegramSpamProbability}
 Vision: ${visionAnalysis}
 
-Classification (0/1) and brief reason:`;
+Classification (0/1):`;
 
 try {
   const response = await retryGptRequest(
     () => openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: model, // Используем динамически выбранную модель
       messages: [
         { role: "system", content: gptPrompt },
         { role: "user", content: userPrompt }
       ],
-      max_tokens: 50,
+      max_tokens: 1,
       temperature: 0.1,
     }),
     2,
@@ -1407,57 +1416,50 @@ try {
     35000
   );
 
-  const content = response.choices[0]?.message?.content;
-  if (!content) throw new Error('Empty GPT-4o response');
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) throw new Error('Empty GPT-4o response');
 
-  const [classification, ...reasonParts] = content.trim().split(' ');
-  const reason = reasonParts.join(' ');
+    // Проверка на корректность ответа
+    if (content !== '0' && content !== '1') {
+      throw new Error(`Unexpected GPT classification: ${content}`);
+    }
 
-  // Улучшенная проверка классификации
-  let isSpam: boolean;
-  if (classification === '1') {
-    isSpam = true;
-  } else if (classification === '0') {
-    isSpam = false;
-  } else {
-    console.warn(`Unexpected GPT classification: ${classification}. Defaulting to not spam.`);
-    isSpam = false;
+    const isSpam = content === '1';
+
+    // Базовый спам-скор на основе классификации
+    let spamScore = isSpam ? 70 : 30;
+
+    // Дополнительные факторы для корректировки спам-скора
+    spamScore += Math.min(3, sysInfo.complaintCount);
+    spamScore += sysInfo.telegramSpamProbability * 10;
+    if (sysInfo.hasLink) spamScore += 2;
+    
+    const adultContent = visionResults.some(vr => vr.safeSearch?.adult === 'LIKELY' || vr.safeSearch?.adult === 'VERY_LIKELY');
+    if (adultContent) spamScore += 10;
+
+    const violenceContent = visionResults.some(vr => vr.safeSearch?.violence === 'LIKELY' || vr.safeSearch?.violence === 'VERY_LIKELY');
+    if (violenceContent) spamScore += 5;
+
+    const textInImages = visionResults.flatMap(vr => vr.textAnnotations || []).map(ta => ta.description.toLowerCase());
+    const spamKeywordsInImages = textInImages.some(text => 
+      spamPhrases.some(phrase => text.includes(phrase.toLowerCase())) ||
+      shortSpamPhrases.some(phrase => new RegExp(`\\b${phrase}\\b`, 'i').test(text))
+    );
+    if (spamKeywordsInImages) spamScore += 15;
+
+    spamScore = Math.min(100, spamScore);
+
+    console.log(`GPT Analysis: ${isSpam ? 'SPAM' : 'NOT SPAM'}, Score: ${spamScore}`);
+
+    return {
+      isSpam: spamScore > 70,
+      spamScore: spamScore
+    };
+
+  } catch (error) {
+    console.error('Error in gptDeep:', error);
+    return performSimplifiedCheck(message);
   }
-
-  // Базовый спам-скор на основе классификации
-  let spamScore = isSpam ? 70 : 30;
-
-  // Дополнительные факторы для корректировки спам-скора
-  spamScore += Math.min(3, sysInfo.complaintCount);
-  spamScore += sysInfo.telegramSpamProbability * 10;
-  if (sysInfo.hasLink) spamScore += 2;
-  
-  const adultContent = visionResults.some(vr => vr.safeSearch?.adult === 'LIKELY' || vr.safeSearch?.adult === 'VERY_LIKELY');
-  if (adultContent) spamScore += 10;
-
-  const violenceContent = visionResults.some(vr => vr.safeSearch?.violence === 'LIKELY' || vr.safeSearch?.violence === 'VERY_LIKELY');
-  if (violenceContent) spamScore += 5;
-
-  const textInImages = visionResults.flatMap(vr => vr.textAnnotations || []).map(ta => ta.description.toLowerCase());
-  const spamKeywordsInImages = textInImages.some(text => 
-    spamPhrases.some(phrase => text.includes(phrase.toLowerCase())) ||
-    shortSpamPhrases.some(phrase => new RegExp(`\\b${phrase}\\b`, 'i').test(text))
-  );
-  if (spamKeywordsInImages) spamScore += 15;
-
-  spamScore = Math.min(100, spamScore);
-
-  console.log(`GPT Analysis: ${isSpam ? 'SPAM' : 'NOT SPAM'}, Score: ${spamScore}, Reason: ${reason}`);
-
-  return {
-    isSpam: spamScore > 70, // Изменили порог на более низкий
-    spamScore: spamScore
-  };
-
-} catch (error) {
-  console.error('Error in gptDeep:', error);
-  return performSimplifiedCheck(message);
-}
 }
 
 // Функция для упрощенной проверки в случае ошибки основного анализа
