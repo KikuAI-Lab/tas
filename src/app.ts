@@ -32,6 +32,57 @@ dotenv.config();
 // КОНФИГУРАЦИЯ
 //--------------------------------------------------
 
+// const config = {
+//   // Основные параметры
+//   PORT: process.env.PORT || 3000,
+//   API_HASH: process.env.API_HASH!,
+//   PHONE_NUMBER: process.env.PHONE_NUMBER!,
+//   API_ID: parseInt(process.env.API_ID!),
+//   BOT_ID: parseInt(process.env.BOT_ID!),
+//   ADMIN_ID: parseInt(process.env.ADMIN_ID!),
+//   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+//   GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT,
+//   REDIS_URL: process.env.REDIS_URL || '',
+
+//   // Параметры кэширования
+//   CACHE_TTL: parseInt(process.env.CACHE_TTL || '86400', 10),
+//   REDIS_POOL_SIZE: 5,
+//   MAX_CACHE_USAGE: 0.9,
+
+//   // Параметры обработки
+//   MAX_PROCESSING_TIME: 59 * 1000, // 59 секунд
+//   CHECK_MSG_TIMEOUT: 30000, // 30 секунд
+//   INITIAL_PROCESS_INTERVAL: 100, // начальный интервал обработки
+
+//   // Параметры для определения спама
+//   HIGH_COMPLAINT_THRESHOLD: 2,
+//   SPAM_SCORE_THRESHOLD: 70,
+//   MAX_EMOJI_REPEAT: 3,
+//   MIN_MESSAGE_SIMILARITY: 0.7,
+
+//   // Параметры для анализа медиа
+//   MAX_MEDIA_SIZE: 1024 * 1024, // 1 MB
+//   VISION_ENABLED: true,
+
+//   // Параметры для GPT
+//   GPT_MODELS: {
+//     SMALL: "gpt-4o-mini",
+//     MEDIUM: "gpt-4o",
+//     LARGE: "gpt-4"
+//   },
+//   GPT_TOKEN_THRESHOLDS: {
+//     SMALL: 100,
+//     MEDIUM: 500
+//   },
+
+//   // Параметры восстановления
+//   RECOVERY_INITIAL_DELAY: 20000,
+//   RECOVERY_NEXT_DELAY: 6000,
+//   RECOVERY_SEND_NO_DELAY: 2000,
+//   RECOVERY_LONG_INTERVAL: 30 * 60 * 1000,
+//   RECOVERY_TOTAL_TIME: 5 * 60 * 60 * 1000
+// };
+
 // Инициализация Express приложения
 const app = express();
 
@@ -138,6 +189,11 @@ interface ReportBuffer {
   messages: Api.Message[];
   sysInfo: SysInfo | null;
   lastUpdateTime: number;
+  preprocessingPromises: Map<number, Promise<{
+    preprocessedMessage: string;
+    visionResults: VisionResult[];
+    isSpam: boolean | undefined;
+  }>>;
 }
 
 // Интерфейс для результата анализа изображения
@@ -384,7 +440,12 @@ async function checkMsg(event: NewMessageEvent): Promise<void> {
     if (event.message instanceof Api.Message) {
       const message = event.message;
       const checkInfo: CheckInfo = { messages: [message] };
-      addToBuffer(checkInfo);
+      
+      // Запускаем препроцессинг параллельно
+      const preprocessingPromise = startPreprocessing([message]);
+      
+      addToBuffer(checkInfo, preprocessingPromise);
+      
       console.log(`
 Received Message for Check
 ID: ${message.id}
@@ -392,10 +453,8 @@ Text: ${message.message?.substring(0, 100) || '[No text content]'}${message.mess
 Media: ${message.media ? getMediaType(message.media) : 'No'}
 `);
 
-      // Обновляем время последнего полученного checkMsg
       lastCheckMsgTime = Date.now();
 
-      // Сбрасываем существующий таймер и устанавливаем новый
       if (checkMsgTimeoutTimer) {
         clearTimeout(checkMsgTimeoutTimer);
       }
@@ -522,23 +581,30 @@ function getMediaType(media: Api.TypeMessageMedia): string {
 let reportBuffer: ReportBuffer = {
   messages: [],
   sysInfo: null,
-  lastUpdateTime: Date.now()
-}
+  lastUpdateTime: Date.now(),
+  preprocessingPromises: new Map()
+};
 
 // Функция для добавления сообщения в буфер
-function addToBuffer(checkInfo: CheckInfo): void {
+function addToBuffer(checkInfo: CheckInfo, preprocessingPromise: Promise<{
+  preprocessedMessage: string;
+  visionResults: VisionResult[];
+  isSpam: boolean | undefined;
+}>): void {
   const newMessageIds = new Set(checkInfo.messages.map(m => m.id));
   
-  // Проверяем, есть ли уже такие сообщения в буфере
   const isNewMessage = checkInfo.messages.some(newMsg => 
     !reportBuffer.messages.some(existingMsg => existingMsg.id === newMsg.id)
   );
 
   if (isNewMessage) {
-    // Удаляем дубликаты из существующего буфера
     reportBuffer.messages = reportBuffer.messages.filter(m => !newMessageIds.has(m.id));
-    // Добавляем новые сообщения
     reportBuffer.messages.push(...checkInfo.messages);
+    checkInfo.messages.forEach(msg => {
+      if (!reportBuffer.preprocessingPromises.has(msg.id)) {
+        reportBuffer.preprocessingPromises.set(msg.id, preprocessingPromise);
+      }
+    });
     reportBuffer.lastUpdateTime = Date.now();
     console.log(`Added ${checkInfo.messages.length} new message(s) to buffer. Total messages in buffer: ${reportBuffer.messages.length}`);
   } else {
@@ -599,7 +665,11 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
     } else {
       if (enabledChecks.has('cache')) {
         result = await checkCache(messages);
-        if (result) console.log("Cache check result:", result);
+        if (result) {
+          console.log("Cache check result:", result);
+          // Очищаем результаты препроцессинга, так как они не нужны
+          clearPreprocessingResults(messages);
+        }
       }
 
       if (!result && enabledChecks.has('obvious')) {
@@ -609,14 +679,26 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
             console.log("Obvious check result (requires further checking):", result);
           } else {
             console.log("Obvious check result:", result);
+            // Очищаем результаты препроцессинга, если получен определенный результат
+            clearPreprocessingResults(messages);
           }
         }
       }
 
       if ((!result || result.isSpam === undefined) && enabledChecks.has('gpt')) {
         try {
-          const { preprocessedMessage, visionResults, isSpam } = await preprocessAndAnalyze(messages);
-          result = await checkGPT(messages, sysInfo, preprocessedMessage, visionResults, isSpam);
+          const preprocessingPromises = messages.map(msg => reportBuffer.preprocessingPromises.get(msg.id));
+          const preprocessingResults = await Promise.all(preprocessingPromises);
+          
+          const combinedPreprocessedMessage = preprocessingResults
+            .map(r => r?.preprocessedMessage || '')
+            .join(' ');
+          const combinedVisionResults = preprocessingResults
+            .flatMap(r => r?.visionResults || []);
+          const isSpam = preprocessingResults
+            .some(r => r?.isSpam === true);
+
+          result = await checkGPT(messages, sysInfo, combinedPreprocessedMessage, combinedVisionResults, isSpam);
           if (result) console.log("GPT check result:", result);
         } catch (error) {
           console.error("Error in GPT check:", error);
@@ -625,6 +707,9 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
             layer: 5, 
             reason: "Error in GPT check, undo required",
           };
+        } finally {
+          // Очищаем результаты препроцессинга после использования
+          clearPreprocessingResults(messages);
         }
       }
     }
@@ -643,7 +728,6 @@ Has Link: ${sysInfo.hasLink ? 'Yes' : 'No'}
       }
     }
 
-    // Отложенное кеширование результата
     if (result && result.isSpam !== undefined) {
       setImmediate(() => {
         messages.forEach(message => {
@@ -1073,6 +1157,28 @@ async function checkGPT(
 // ПРЕДОБРАБОТКА И АНАЛИЗ
 //--------------------------------------------------
 
+async function startPreprocessing(messages: Api.Message[]): Promise<{
+  preprocessedMessage: string;
+  visionResults: VisionResult[];
+  isSpam: boolean | undefined;
+}> {
+  return new Promise((resolve) => {
+    setImmediate(async () => {
+      try {
+        const result = await preprocessAndAnalyze(messages);
+        resolve(result);
+      } catch (error) {
+        console.error("Error in preprocessing:", error);
+        resolve({
+          preprocessedMessage: "",
+          visionResults: [],
+          isSpam: undefined
+        });
+      }
+    });
+  });
+}
+
 // Функция для предобработки и анализа сообщений
 async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preprocessedMessage: string, visionResults: VisionResult[], isSpam: boolean | undefined }> {
   let preprocessedMessage = '';
@@ -1130,6 +1236,12 @@ async function preprocessAndAnalyze(messages: Api.Message[]): Promise<{ preproce
   }
 
   return { preprocessedMessage, visionResults, isSpam };
+}
+
+function clearPreprocessingResults(messages: Api.Message[]): void {
+  messages.forEach(msg => {
+    reportBuffer.preprocessingPromises.delete(msg.id);
+  });
 }
 
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -1823,54 +1935,77 @@ try {
 // Запуск основной функции
 main().catch(console.error);
 
-// Дополнительные комментарии к структуре и логике работы приложения:
-
-// 1. Инициализация и настройка:
-//    - Загрузка конфигурации из переменных окружения
-//    - Инициализация клиента Telegram
-//    - Настройка подключения к Redis для кэширования
-//    - Инициализация Google Cloud Vision для анализа изображений
-
-// 2. Обработка входящих сообщений:
-//    - Сообщения от бота добавляются в буфер для проверки
-//    - Системные сообщения с информацией о жалобах обрабатываются отдельно
-
-// 3. Процесс проверки (функция processReport):
-//    - Проверки выполняются в следующем порядке:
-//      a. Проверка кэша (checkCache)
-//      b. Проверка очевидного спама (checkObvious)
-//      c. Проверка GPT (checkGPT)
-//    - Используется паттерн "Цепочка обязанностей" для гибкости и расширяемости
-
-// 4. Препроцессинг и анализ медиа:
-//    - Перед проверками выполняется препроцессинг сообщения
-//    - Для медиаконтента выполняется анализ с помощью Google Vision API (если включено)
-//    - Результаты анализа добавляются к preprocessedMessage для дальнейшей обработки
-
-// 5. Условия определения спама:
-//    - Высокое количество жалоб
-//    - Наличие URL или подозрительных фраз в имени отправителя
-//    - Наличие спам-фраз в тексте сообщения
-//    - Чрезмерное использование определенных эмодзи
-//    - Наличие дублирующихся или рекламных ссылок
-//    - Подозрительные шаблоны сообщений
-//    - Избыточная контактная информация
-//    - Дублирующиеся медиафайлы или файлы с потенциально вредоносными расширениями
-//    - Высокая оценка вероятности спама от GPT (с динамическим порогом)
-
-// 6. Обработка результатов:
-//    - Если сообщение определено как спам, отправляется соответствующий ответ боту
-//    - Результат сохраняется в кэш для будущих проверок
-//    - В случае неоднозначных результатов, сообщение считается не спамом
-
-// 7. Дополнительные функции:
-//    - Механизм восстановления для обработки ошибок и зависаний
-//    - Управление сессией бота для оптимизации взаимодействия
-//    - Система кэширования для ускорения повторных проверок
-//    - Возможность включения/отключения отдельных проверок через команды администратора
-//    - Настройка задержки между обработкой сообщений
-//    - Автоматический и ручной режимы работы
-
-// Этот код представляет собой комплексную систему проверки спама для Telegram,
-// использующую различные методы и API для достижения высокой точности определения спама
-// при сохранении возможности нормального общения пользователей.
+/**
+ * Telegram Anti-Spam System (TAS)
+ * ===============================
+ * 
+ * Overview:
+ * ---------
+ * This system is designed to detect and filter spam messages in Telegram groups.
+ * It uses a multi-layered approach to analyze messages, including cache checking,
+ * obvious spam detection, GPT-based content analysis, and image analysis using
+ * Google Cloud Vision API.
+ * 
+ * Key Components:
+ * ---------------
+ * 1. Telegram Client: Interacts with Telegram API using GramJS.
+ * 2. Express Server: Handles web requests and provides an API interface.
+ * 3. Redis Cache: Stores previous check results for quick retrieval.
+ * 4. OpenAI GPT: Performs deep content analysis for spam detection.
+ * 5. Google Cloud Vision API: Analyzes image content for potential spam.
+ * 
+ * Main Functions:
+ * ---------------
+ * - initClient(): Initializes and connects the Telegram client.
+ * - checkMsg(): Handles incoming messages for spam checking.
+ * - processReport(): Main function for processing spam reports.
+ * - checkCache(): Checks if a message has been previously classified.
+ * - checkObvious(): Performs quick checks for obvious spam indicators.
+ * - checkGPT(): Uses GPT for deep content analysis.
+ * - preprocessAndAnalyze(): Prepares messages for analysis, including media content.
+ * - analyzeMediaMessage(): Analyzes media content using Google Cloud Vision API.
+ * - gptDeep(): Performs detailed GPT analysis on message content.
+ * - handleResult(): Processes the final spam classification result.
+ * - startRecovery(): Initiates recovery process in case of errors or hangs.
+ * 
+ * Configuration:
+ * --------------
+ * The system uses various configuration parameters defined at the top of the file.
+ * These include API keys, Telegram IDs, and operational parameters like cache TTL
+ * and processing intervals.
+ * 
+ * Spam Detection Process:
+ * -----------------------
+ * 1. Message Reception: Incoming messages are added to a buffer.
+ * 2. Preprocessing: Messages are preprocessed, including media analysis if enabled.
+ * 3. Check Sequence:
+ *    a. Cache Check: Quick lookup for previously classified messages.
+ *    b. Obvious Check: Rapid analysis for clear spam indicators.
+ *    c. GPT Check: Deep content analysis using OpenAI's GPT models.
+ * 4. Result Handling: Classification results are sent back to Telegram and cached.
+ * 
+ * Error Handling and Recovery:
+ * ----------------------------
+ * The system includes mechanisms for handling errors, timeouts, and unexpected
+ * states. The recovery process attempts to reset the system state and continue
+ * operations.
+ * 
+ * Admin Controls:
+ * ---------------
+ * Administrators can control various aspects of the system through Telegram
+ * commands, including toggling features, adjusting processing intervals, and
+ * switching between automatic and manual modes.
+ * 
+ * Performance Considerations:
+ * ---------------------------
+ * - Parallel preprocessing of messages for improved efficiency.
+ * - Caching of results to reduce redundant processing.
+ * - Dynamic selection of GPT models based on message complexity.
+ * 
+ * Future Improvements:
+ * --------------------
+ * - Enhanced logging and metrics collection for performance monitoring.
+ * - More granular error handling for different scenarios.
+ * - Implementation of unit and integration tests.
+ * - Further optimization of resource usage, especially for media processing.
+ */
