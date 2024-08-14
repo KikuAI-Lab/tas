@@ -1407,7 +1407,7 @@ async function selectGptModel(message: string): Promise<string> {
   if (tokenEstimate <= 100) {
     return "gpt-4o-mini";
   } else if (tokenEstimate <= 500) {
-    return "gpt-4o";
+    return "gpt-4o-2024-08-06";
   } else {
     return "gpt-4";
   }
@@ -1431,6 +1431,7 @@ async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionR
      - Phishing, fake giveaways, get-rich-quick schemes
      - Unrealistic financial promises, urgent decisions
      - Suspicious cryptocurrency/airdrop mentions
+     - Offers of quick money or short-term "jobs"
   3. Deceptive/Adult:
      - Impersonation, false promises
      - Explicit content, unsolicited services
@@ -1498,6 +1499,7 @@ async function gptDeep(message: string, sysInfo: SysInfo, visionResults: VisionR
   - Bot commands ("/") with 3 or more complaints should be carefully evaluated for spam potential
   - Sharing of links or information is not automatically spam, but context is crucial
   - Extremely offensive or aggressive language is not spam, but may violate other community guidelines
+  - Be extra cautious with messages offering quick money or short-term "jobs", especially if they mention specific amounts
   
   Output: Two numbers separated by a comma. First number is classification (0 for not spam, 1 for spam), second is confidence score (0-100).`;
 
@@ -1598,6 +1600,12 @@ Classification (0/1) and Confidence (0-100):`;
       adjustedConfidence = Math.max(adjustedConfidence - 40, 0);
     }
 
+    // Повышаем уверенность для сообщений с подозрительными предложениями
+    const suspiciousOffers = /(\d+[.,]?\d*\s*(?:руб|₽|р\.|usd|\$).*(?:час|ч\.|day|день|смен|week|неделю))|(?:быстр\w+\s+заработ\w+)/i;
+    if (suspiciousOffers.test(message)) {
+      adjustedConfidence = Math.min(adjustedConfidence + 20, 100);
+    }
+
     console.log(`GPT Analysis: ${isSpam ? 'SPAM' : 'NOT SPAM'}, Original Confidence: ${gptConfidence}, Adjusted Confidence: ${adjustedConfidence}`);
 
     return {
@@ -1619,7 +1627,7 @@ async function performSimplifiedCheck(message: string): Promise<{
   try {
     const simplePrompt = "Is this message spam? Respond with two numbers separated by a comma. First number is classification (0 for not spam, 1 for spam), second is confidence score (0-100).\n\n" + message;
     const simpleResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-3.5-turbo",
       messages: [{ role: "user", content: simplePrompt }],
       max_tokens: 5,
       temperature: 0.0,
