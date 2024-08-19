@@ -12,6 +12,7 @@ import { Parser } from 'json2csv';
 
 dotenv.config();
 
+const ENABLE_DEEP_LOGGING = true;
 const app = express();
 const port = process.env.PORT || 3000;
 const adminId = parseInt(process.env.ADMIN_ID!, 10);
@@ -19,7 +20,7 @@ const databaseUrl = process.env.DATABASE_URL!;
 const { Pool } = pkg;
 
 let client: TelegramClient;
-const pool: pkg.Pool = new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false }});
+const pool = new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false }});
 
 let botEntity: Api.InputPeerUser | null = null;
 
@@ -47,7 +48,7 @@ async function initClient(): Promise<TelegramClient> {
   if (!apiId || !apiHash || !sessionString) {
     throw new Error('API_ID, API_HASH, and SESSION_STRING must be set in .env file');
   }
-  console.log('Initializing Telegram client...');
+  ENABLE_DEEP_LOGGING && console.log('Initializing Telegram client...');
   const stringSession = new StringSession(sessionString);
   const client = new TelegramClient(stringSession, apiId, apiHash, {
     connectionRetries: 5,
@@ -57,21 +58,15 @@ async function initClient(): Promise<TelegramClient> {
   });
 
   try {
-    console.log('Connecting to Telegram servers...');
     await client.connect();
-    console.log('Connected to Telegram servers');
-
-    console.log('Checking authorization...');
     const isAuthorized = await client.checkAuthorization();
     if (!isAuthorized) {
       throw new Error('Client is not authorized. Please check your session string.');
     }
-    console.log('Client is authorized');
-
-    console.log('Client connected successfully');
+    ENABLE_DEEP_LOGGING && console.log('Client connected and authorized successfully');
     return client;
   } catch (error) {
-    console.error('Error connecting to Telegram:', error);
+    await logError('initClient', error);
     throw error;
   }
 }
@@ -96,10 +91,9 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('Database initialized successfully');
+    ENABLE_DEEP_LOGGING && console.log('Database initialized successfully');
   } catch (error) {
-    console.error('Error initializing database:', error);
-    await notifyAdmin('Error initializing database. Check logs.');
+    await logError('initDatabase', error);
     throw error;
   } finally {
     client.release();
@@ -107,81 +101,77 @@ async function initDatabase() {
 }
 
 async function initBotEntity() {
-  const botUsername = process.env.BOT_USERNAME;
   const botId = process.env.BOT_ID;
   const botAccessHash = process.env.BOT_ACCESS_HASH;
 
-  if (!botUsername || !botId || !botAccessHash) {
-    throw new Error('BOT_USERNAME, BOT_ID, and BOT_ACCESS_HASH must be set in .env file');
+  if (!botId || !botAccessHash) {
+    throw new Error('BOT_ID and BOT_ACCESS_HASH must be set in .env file');
   }
 
   try {
-    console.log('Using stored bot credentials');
+    ENABLE_DEEP_LOGGING && console.log('BOT_ID:', botId, 'BOT_ACCESS_HASH:', botAccessHash);
     botEntity = new Api.InputPeerUser({
       userId: bigInt(botId),
       accessHash: bigInt(botAccessHash)
     });
-    console.log('Bot entity initialized successfully');
+    ENABLE_DEEP_LOGGING && console.log('Bot entity initialized successfully', botEntity);
   } catch (error) {
-    console.error('Error initializing bot entity:', error);
+    await logError('initBotEntity', error);
     throw error;
   }
 }
 
 async function handleCheckMsg(event: NewMessageEvent) {
   const message = event.message;
-  if (message instanceof Api.Message && event.isPrivate && botEntity && message.senderId && message.senderId.toString() === botEntity.userId.toString()) {
-    console.log('Received message for check:', message.message);
-    if (!currentReport.messageContent) {
-      currentReport.messageContent = [];
-    }
-    if (!currentReport.mediaHashes) {
-      currentReport.mediaHashes = [];
-    }
+  if (message instanceof Api.Message && event.isPrivate && botEntity && message.senderId?.toString() === botEntity.userId.toString()) {
+    ENABLE_DEEP_LOGGING && console.log('Received message for check:', message.message);
+    
+    if (!currentReport.messageContent) currentReport.messageContent = [];
+    if (!currentReport.mediaHashes) currentReport.mediaHashes = [];
     
     let processedMessage = preprocessMessage(message.message || '');
     
     if (message.media instanceof Api.MessageMediaStory) {
       const caption = (message.media as any).caption;
-      if (caption) {
-        processedMessage += ` [Story Caption: ${caption}]`;
-      }
+      if (caption) processedMessage += ` [Story Caption: ${caption}]`;
     }
     
     if (message.replyTo) {
       try {
         const repliedMessage = await message.getReplyMessage();
-        if (repliedMessage && repliedMessage.message) {
-          processedMessage += ` [Quoted: ${repliedMessage.message}]`;
-        }
+        if (repliedMessage?.message) processedMessage += ` [Quoted: ${repliedMessage.message}]`;
       } catch (error) {
-        console.error('Error getting replied message:', error);
+        await logError('handleCheckMsg - getting replied message', error);
       }
     }
     
-    if (processedMessage) {
-      currentReport.messageContent.push(processedMessage);
-    }
+    if (processedMessage) currentReport.messageContent.push(processedMessage);
     
     if (message.media) {
-      const mediaHash = await getMediaHash(message.media);
-      currentReport.mediaHashes.push(mediaHash);
+      try {
+        const mediaHash = await getMediaHash(message.media);
+        currentReport.mediaHashes.push(mediaHash);
+      } catch (error) {
+        await logError('handleCheckMsg - getting media hash', error);
+      }
     }
+    
+    ENABLE_DEEP_LOGGING && console.log('Current report:', JSON.stringify(currentReport, null, 2));
   }
 }
 
 function preprocessMessage(message: string): string {
-  const lines = message.split('\n');
-  return lines.slice(1).join('\n');
+  return message.split('\n').slice(1).join('\n');
 }
 
 async function handleSysMsg(event: NewMessageEvent) {
   const message = event.message;
-  if (message instanceof Api.Message && event.isPrivate && botEntity && message.senderId && message.senderId.toString() === botEntity.userId.toString()) {
-    console.log('Received system message:', message.message);
+  if (message instanceof Api.Message && event.isPrivate && botEntity && message.senderId?.toString() === botEntity.userId.toString()) {
+    ENABLE_DEEP_LOGGING && console.log('Received system message:', message.message);
     const sysInfo = parseSysMsg(message.message || '');
     currentReport = { ...currentReport, ...sysInfo };
-    if (currentReport.manualClassification) {
+    ENABLE_DEEP_LOGGING && console.log('Current report:', JSON.stringify(currentReport, null, 2));
+    if (isValidReport(currentReport as Report)) {
       await saveReport(currentReport as Report);
       currentReport = {};
     }
@@ -190,10 +180,10 @@ async function handleSysMsg(event: NewMessageEvent) {
 
 async function handleManualMsg(event: NewMessageEvent) {
   const message = event.message;
-  if (message instanceof Api.Message && event.isPrivate && botEntity && message.peerId && message.peerId.toString() === botEntity.userId.toString()) {
-    console.log('Sent manual classification:', message.message);
+  if (message instanceof Api.Message && event.isPrivate && botEntity && message.peerId?.toString() === botEntity.userId.toString()) {
+    ENABLE_DEEP_LOGGING && console.log('Sent manual classification:', message.message);
     currentReport.manualClassification = message.message || '';
-    if (isValidReport(currentReport)) {
+    if (isValidReport(currentReport as Report)) {
       await saveReport(currentReport as Report);
       currentReport = {};
     }
@@ -206,15 +196,17 @@ function parseSysMsg(message: string): Partial<Report> {
   
   for (const line of lines) {
     if (line.startsWith('#r')) {
-      const parts = line.split(',');
-      sysInfo.reportId = parts[0].trim();
-      const complaintMatch = parts[1]?.match(/😱(\d+)/);
-      if (complaintMatch) { sysInfo.complaintCount = parseInt(complaintMatch[1]); } }
-    if (line.startsWith('Source:') || line.startsWith('🗣 Source:')) {
-      sysInfo.source = line.replace(/^🗣?\s*Source:/, '').trim(); }
-    if (line.startsWith('Sender:')) { sysInfo.sender = line.replace('Sender:', '').trim(); } 
-      const spamProbMatch = line.match(/(?:🌕|🌔|🌓|🌒|🌚)\s*(\d+)%/);
-    if (spamProbMatch) { sysInfo.spamProbability = parseInt(spamProbMatch[1]) / 100; }
+      const [reportId, complaintCount] = line.split(',');
+      sysInfo.reportId = reportId.trim();
+      const match = complaintCount?.match(/😱(\d+)/);
+      if (match) sysInfo.complaintCount = parseInt(match[1]);
+    }
+    if (line.startsWith('Source:') || line.startsWith('🗣 Source:'))
+      sysInfo.source = line.replace(/^🗣?\s*Source:/, '').trim();
+    if (line.startsWith('Sender:'))
+      sysInfo.sender = line.replace('Sender:', '').trim();
+    const spamProbMatch = line.match(/(?:🌕|🌔|🌓|🌒|🌚)\s*(\d+)%/);
+    if (spamProbMatch) sysInfo.spamProbability = parseInt(spamProbMatch[1]) / 100;
     if (line.includes('🔴')) sysInfo.hasExternalLink = true;
     if (line.includes('🔶')) sysInfo.hasInternalLink = true;
     if (line.includes('– Flood') || line.includes('– Not Spam')) {
@@ -226,29 +218,28 @@ function parseSysMsg(message: string): Partial<Report> {
 }
 
 async function getMediaHash(media: Api.TypeMessageMedia): Promise<string> {
-  if (media instanceof Api.MessageMediaPhoto && media.photo) {
+  if (media instanceof Api.MessageMediaPhoto && media.photo)
     return `photo:${media.photo.id.toString()}`;
-  } else if (media instanceof Api.MessageMediaDocument && media.document) {
+  if (media instanceof Api.MessageMediaDocument && media.document)
     return `doc:${media.document.id.toString()}`;
-  } else if (media instanceof Api.MessageMediaWebPage && media.webpage && 'id' in media.webpage) {
+  if (media instanceof Api.MessageMediaWebPage && media.webpage && 'id' in media.webpage)
     return `webpage:${media.webpage.id.toString()}`;
-  } else if (media instanceof Api.MessageMediaPoll && media.poll) {
+  if (media instanceof Api.MessageMediaPoll && media.poll)
     return `poll:${media.poll.id}`;
-  } else if (media instanceof Api.MessageMediaGeo && media.geo && 'long' in media.geo && 'lat' in media.geo) {
+  if (media instanceof Api.MessageMediaGeo && media.geo && 'long' in media.geo && 'lat' in media.geo)
     return `geo:${media.geo.long},${media.geo.lat}`;
-  } else if (media instanceof Api.MessageMediaContact) {
+  if (media instanceof Api.MessageMediaContact)
     return `contact:${media.phoneNumber}`;
-  } else if (media instanceof Api.MessageMediaGame && media.game) {
+  if (media instanceof Api.MessageMediaGame && media.game)
     return `game:${media.game.id}`;
-  } else if (media instanceof Api.MessageMediaInvoice) {
+  if (media instanceof Api.MessageMediaInvoice)
     return `invoice:${media.title}`;
-  } else if (media instanceof Api.MessageMediaGeoLive && media.geo && 'long' in media.geo && 'lat' in media.geo) {
+  if (media instanceof Api.MessageMediaGeoLive && media.geo && 'long' in media.geo && 'lat' in media.geo)
     return `geolive:${media.geo.long},${media.geo.lat}`;
-  } else if (media instanceof Api.MessageMediaDice) {
+  if (media instanceof Api.MessageMediaDice)
     return `dice:${media.value}`;
-  } else if (media instanceof Api.MessageMediaStory) {
+  if (media instanceof Api.MessageMediaStory)
     return `story:${media.id}`;
-  }
   
   return `unknown:${crypto.createHash('md5').update(JSON.stringify(media)).digest('hex')}`;
 }
@@ -256,10 +247,16 @@ async function getMediaHash(media: Api.TypeMessageMedia): Promise<string> {
 function isValidReport(report: Partial<Report>): boolean {
   return !!(report.reportId && report.complaintCount !== undefined && 
             report.source && report.sender && 
-            report.spamProbability !== undefined && report.manualClassification);
+            report.spamProbability !== undefined);
 }
 
 async function saveReport(report: Report) {
+  if (!report || !report.reportId) {
+    console.error('Invalid report object:', JSON.stringify(report, null, 2));
+    return;
+  }
+  
+  ENABLE_DEEP_LOGGING && console.log('Saving report:', JSON.stringify(report, null, 2));
   const client = await pool.connect();
   try {
     const query = `
@@ -271,26 +268,26 @@ async function saveReport(report: Report) {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       ON CONFLICT (report_id) 
       DO UPDATE SET
-        manual_classification = EXCLUDED.manual_classification
+        manual_classification = EXCLUDED.manual_classification,
+        message_content = EXCLUDED.message_content,
+        media_hashes = EXCLUDED.media_hashes,
+        complaint_count = EXCLUDED.complaint_count,
+        source = EXCLUDED.source,
+        sender = EXCLUDED.sender,
+        spam_probability = EXCLUDED.spam_probability,
+        has_external_link = EXCLUDED.has_external_link,
+        has_internal_link = EXCLUDED.has_internal_link,
+        moderator_decisions = EXCLUDED.moderator_decisions
     `;
     const values = [
-      report.reportId,
-      report.messageContent,
-      report.mediaHashes,
-      report.complaintCount,
-      report.source,
-      report.sender,
-      report.spamProbability,
-      report.hasExternalLink,
-      report.hasInternalLink,
-      report.moderatorDecisions,
-      report.manualClassification
+      report.reportId, report.messageContent, report.mediaHashes, report.complaintCount,
+      report.source, report.sender, report.spamProbability, report.hasExternalLink,
+      report.hasInternalLink, report.moderatorDecisions, report.manualClassification
     ];
-    await client.query(query, values);
-    console.log('Report saved in database');
+    const result = await client.query(query, values);
+    ENABLE_DEEP_LOGGING && console.log('Report saved:', report.reportId, 'Result:', result.rowCount);
   } catch (error) {
-    console.error('Error saving report in database:', error);
-    await notifyAdmin('Error saving report in database. Check logs.');
+    await logError('saveReport', error);
   } finally {
     client.release();
   }
@@ -299,7 +296,7 @@ async function saveReport(report: Report) {
 async function notifyAdmin(message: string) {
   try {
     await client.sendMessage(adminId, { message });
-    console.log('Admin notified:', message);
+    ENABLE_DEEP_LOGGING && console.log('Admin notified:', message);
   } catch (error) {
     console.error('Error notifying admin:', error);
   }
@@ -307,9 +304,9 @@ async function notifyAdmin(message: string) {
 
 async function handleAdminMsg(event: NewMessageEvent) {
   const message = event.message;
-  if (message instanceof Api.Message && message.senderId && message.senderId.toString() === adminId.toString()) {
+  if (message instanceof Api.Message && message.senderId?.toString() === adminId.toString()) {
     if (message.message === '/db') {
-      console.log('Admin requested database export');
+      ENABLE_DEEP_LOGGING && console.log('Admin requested database export');
       try {
         const filename = await exportDataToCSV();
         const fileStats = fs.statSync(filename);
@@ -318,31 +315,31 @@ async function handleAdminMsg(event: NewMessageEvent) {
           caption: `Database export: ${filename}\nSize: ${fileStats.size} bytes`,
         });
         fs.unlinkSync(filename);
-        console.log('Database export sent to admin');
+        ENABLE_DEEP_LOGGING && console.log('Database export sent to admin');
       } catch (error) {
-        console.error('Error processing database export:', error);
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        await notifyAdmin(`Error exporting database: ${errorMessage}`);
+        await logError('handleAdminMsg - database export', error);
       }
     }
   }
 }
 
 async function setupEventHandlers() {
-  if (!botEntity) {
-    throw new Error('Bot entity not initialized');
-  }
+  if (!botEntity) throw new Error('Bot entity not initialized');
   const botUserId = botEntity.userId.toJSNumber();
   client.addEventHandler(handleCheckMsg, new NewMessage({ fromUsers: [botUserId], incoming: true, forwards: true }));
   client.addEventHandler(handleSysMsg, new NewMessage({ fromUsers: [botUserId], incoming: true, pattern: /😱\d+/ }));
   client.addEventHandler(handleManualMsg, new NewMessage({ outgoing: true, chats: [botUserId] }));
   client.addEventHandler(handleAdminMsg, new NewMessage({ fromUsers: [adminId], incoming: true }));
+  ENABLE_DEEP_LOGGING && console.log('Event handlers set up successfully');
 }
 
 async function exportDataToCSV(): Promise<string> {
   const client = await pool.connect();
   try {
+    ENABLE_DEEP_LOGGING && console.log('Executing database query for export...');
     const result = await client.query('SELECT * FROM reports');
+    ENABLE_DEEP_LOGGING && console.log(`Query executed. Found ${result.rows.length} rows.`);
+
     const fields = [
       'id', 'report_id', 'message_content', 'media_hashes', 'complaint_count',
       'source', 'sender', 'spam_probability', 'has_external_link',
@@ -350,70 +347,152 @@ async function exportDataToCSV(): Promise<string> {
       'created_at'
     ];
     const parser = new Parser({ fields });
-    const csv = result.rows.length > 0 ? parser.parse(result.rows) : parser.parse([{}]);
+    
+    let csv = result.rows.length > 0 ? parser.parse(result.rows) : 'No data found in the database.';
+    ENABLE_DEEP_LOGGING && console.log(result.rows.length > 0 ? 'Data parsed to CSV format' : 'No data found in the database');
+
     const filename = `reports_export_${Date.now()}.csv`;
     fs.writeFileSync(filename, csv);
-    console.log(`CSV file created: ${filename}`);
+    ENABLE_DEEP_LOGGING && console.log(`CSV file created: ${filename}`);
     return filename;
   } catch (error) {
-    console.error('Error exporting data to CSV:', error);
+    await logError('exportDataToCSV', error);
     throw error;
   } finally {
     client.release();
   }
 }
 
+async function checkDatabaseConnection() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query('SELECT NOW()');
+    ENABLE_DEEP_LOGGING && console.log('Database connection successful. Current time:', result.rows[0].now);
+    return true;
+  } catch (error) {
+    await logError('checkDatabaseConnection', error);
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+async function checkDatabaseSettings() {
+  const client = await pool.connect();
+  try {
+    ENABLE_DEEP_LOGGING && console.log('Checking database settings...');
+    const result = await client.query('SHOW ALL');
+    const settings = result.rows.reduce((acc: Record<string, string>, row: { name: string; setting: string }) => {
+      acc[row.name] = row.setting;
+      return acc;
+    }, {});
+    ENABLE_DEEP_LOGGING && console.log('Database settings:', JSON.stringify(settings, null, 2));
+    return settings;
+  } catch (error) {
+    await logError('checkDatabaseSettings', error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function checkDatabaseContent() {
+  const client = await pool.connect();
+  try {
+    ENABLE_DEEP_LOGGING && console.log('Checking database content...');
+    const result = await client.query('SELECT COUNT(*) FROM reports');
+    const count = parseInt(result.rows[0].count);
+    ENABLE_DEEP_LOGGING && console.log(`Database contains ${count} reports`);
+    if (count > 0) {
+      const sampleResult = await client.query('SELECT * FROM reports LIMIT 1');
+      ENABLE_DEEP_LOGGING && console.log('Sample report:', JSON.stringify(sampleResult.rows[0], null, 2));
+    }
+    return count;
+  } catch (error) {
+    await logError('checkDatabaseContent', error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function logError(context: string, error: unknown) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  console.error(`Error in ${context}:`, errorMessage);
+  await notifyAdmin(`Error in ${context}: ${errorMessage}`);
+}
+
 async function main() {
   try {
     await initDatabase();
+    const isConnected = await checkDatabaseConnection();
+    if (!isConnected) throw new Error('Failed to connect to the database');
+
+    const dbSettings = await checkDatabaseSettings();
+    if (dbSettings) {
+      ENABLE_DEEP_LOGGING && console.log('Database settings checked successfully');
+    } else {
+      console.error('Failed to check database settings');
+    }
+
     client = await initClient();
     await initBotEntity();
     await setupEventHandlers();
     console.log('Telegram client initialized successfully');
 
-    app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
-    });
+    app.listen(port, () => console.log(`Server running on port ${port}`));
 
     if (botEntity) {
       try {
         await client.sendMessage(botEntity, { message: "/next" });
         console.log('Initial message sent to bot');
       } catch (error) {
-        console.error('Error sending initial message to bot:', error);
-        await notifyAdmin(`Error sending initial message to bot: ${error instanceof Error ? error.message : String(error)}`);
+        await logError('main - sending initial message to bot', error);
       }
     } else {
       throw new Error('Bot entity not initialized');
     }
 
+    setInterval(async () => {
+      const isStillConnected = await checkDatabaseConnection();
+      if (!isStillConnected) {
+        console.error('Lost connection to the database. Attempting to reconnect...');
+        await initDatabase();
+      }
+    }, 60000);
+
+    setInterval(async () => {
+      ENABLE_DEEP_LOGGING && console.log('Performing periodic health check...');
+      await checkDatabaseConnection();
+      const reportCount = await checkDatabaseContent();
+      ENABLE_DEEP_LOGGING && console.log(`Current number of reports in database: ${reportCount}`);
+    }, 300000);
+
     await notifyAdmin('Application initialized successfully');
+
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+      notifyAdmin(`Unhandled Rejection: ${reason}`).catch(console.error);
+    });
+
+    process.on('uncaughtException', (error) => {
+      console.error('Uncaught Exception:', error);
+      notifyAdmin(`Uncaught Exception: ${error instanceof Error ? error.message : String(error)}`).catch(console.error);
+      setTimeout(() => process.exit(1), 1000);
+    });
+
+    process.on('SIGINT', async () => {
+      console.log('Shutting down gracefully');
+      await pool.end();
+      await client.disconnect();
+      process.exit(0);
+    });
+
   } catch (error) {
-    console.error('Error initializing application:', error);
-    if (client) {
-      await notifyAdmin(`Error initializing application: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    await logError('main', error);
     process.exit(1);
   }
 }
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  notifyAdmin(`Unhandled Rejection: ${reason}`).catch(console.error);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  notifyAdmin(`Uncaught Exception: ${error instanceof Error ? error.message : String(error)}`).catch(console.error);
-  setTimeout(() => process.exit(1), 1000);
-});
-
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully');
-  await pool.end();
-  await client.disconnect();
-  process.exit(0);
-});
 
 main().catch(error => {
   console.error('Error in main function:', error);
