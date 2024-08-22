@@ -1,38 +1,59 @@
 import { NewMessage, NewMessageEvent } from 'telegram/events/NewMessage.js';
 import { StringSession } from 'telegram/sessions/index.js';
+import { createObjectCsvWriter } from 'csv-writer';
 import { TelegramClient } from 'telegram/index.js';
 import { Api } from 'telegram/tl/index.js';
+import schedule from 'node-schedule';
 import bigInt from "big-integer";
+import winston from 'winston';
 import express from 'express';
 import dotenv from 'dotenv';
-import pkg from 'pg';
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { createObjectCsvWriter } from 'csv-writer';
-import winston from 'winston';
+import OpenAI from 'openai';
 import Redis from 'ioredis';
-import schedule from 'node-schedule';
+import path from 'path';
+import pkg from 'pg';
+import fs from 'fs';
 
 // Загрузка переменных окружения и инициализация
 dotenv.config();
 
-const DEEP_LOG = process.env.DEEP_LOG === 'true';
+const { Pool } = pkg;
+const app = express();
+
+const BOT_ID = process.env.BOT_ID!;
 const PORT = process.env.PORT || 3000;
-const ADMIN_ID = parseInt(process.env.ADMIN_ID!, 10);
+const API_HASH = process.env.API_HASH!;
 const DB_URL = process.env.DATABASE_URL!;
 const REDIS_URL = process.env.REDIS_URL!;
+const DEEP_LOG = process.env.DEEP_LOG === 'true';
 const API_ID = parseInt(process.env.API_ID!, 10);
-const API_HASH = process.env.API_HASH!;
 const SESSION_STRING = process.env.SESSION_STRING!;
-const BOT_ID = process.env.BOT_ID!;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
+const ADMIN_ID = parseInt(process.env.ADMIN_ID!, 10);
 const BOT_ACCESS_HASH = process.env.BOT_ACCESS_HASH!;
 const DB_CHECK_INTERVAL = parseInt(process.env.DB_CHECK_INTERVAL || '60000', 10);
 const HEALTH_CHECK_INTERVAL = parseInt(process.env.HEALTH_CHECK_INTERVAL || '300000', 10);
 
-const app = express();
-const { Pool } = pkg;
-const redis = new Redis.Redis(REDIS_URL);
+// Настройка Redis с персистентностью
+const redis = new Redis.Redis(REDIS_URL, {
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+  reconnectOnError: (err) => {
+    const targetError = 'READONLY';
+    if (err.message.includes(targetError)) {
+      return true;
+    }
+    return false;
+  },
+  enableOfflineQueue: true,
+  maxRetriesPerRequest: 3,
+  connectTimeout: 10000,
+  keepAlive: 10000,
+  family: 4,
+  db: 0
+});
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // Настройка логгера
 const logger = winston.createLogger({
@@ -74,6 +95,7 @@ interface Report {
   modNotSpam: number;
   isSpam: boolean;
   reason?: string;
+  confidence?: number;
 }
 
 interface ValidationResult {
@@ -84,6 +106,15 @@ interface ValidationResult {
 interface SpamDecision {
   isSpam: boolean;
   reason?: string;
+  confidence?: number;
+}
+
+interface SysInfo {
+  complaintCount: number;
+  source: string;
+  sender: string;
+  hasLink: boolean;
+  telegramSpamProbability: number;
 }
 
 enum ReportProcessingState {
@@ -91,6 +122,14 @@ enum ReportProcessingState {
   WAITING_FOR_MODERATOR_OPINION,
   WAITING_FOR_NEXT_REPORT
 }
+
+// Конфигурация проверок
+const checkConfig = {
+  obviousSpam: true,
+  cache: true,
+  gpt: true,
+  moderators: true
+};
 
 // Глобальные переменные
 let client: TelegramClient;
@@ -100,6 +139,8 @@ let autoMode = false;
 let isProcessing = false;
 let notifyAttempts = 0;
 let currentState: ReportProcessingState = ReportProcessingState.IDLE;
+let PROCESSING_INTERVAL = parseInt(process.env.PROCESSING_INTERVAL || '1000', 10);
+let COMMAND_DELAY = parseInt(process.env.COMMAND_DELAY || '150', 10);
 
 const MAX_NOTIFY_ATTEMPTS = 3;
 const reportQueue: Report[] = [];
@@ -125,359 +166,299 @@ const sysRegex = {
   internalLink: /🔶/
 };
 
-// -------------------- Инициализация и настройка --------------------
+// Функции проверки спама
+async function checkObviousSpam(report: Report): Promise<SpamDecision | null> {
+  if (!checkConfig.obviousSpam) return null;
 
-async function initClient(): Promise<TelegramClient> {
-  if (!API_ID || !API_HASH || !SESSION_STRING) {
-    throw new Error('API_ID, API_HASH, and SESSION_STRING must be set in .env file');
+  if ((report.mediaHashes?.length || 
+      report.messageContent?.some(msg => msg.includes('http') || msg.includes('@') || msg.match(/\+?[0-9]{10,14}/))) 
+     && report.complaintCount > 2) {
+    return { isSpam: true, reason: 'Media or links with high complaint count', confidence: 100 };
   }
 
-  DEEP_LOG && log('Initializing Telegram client...');
-  const stringSession = new StringSession(SESSION_STRING);
-  const client = new TelegramClient(stringSession, API_ID, API_HASH, {
-    connectionRetries: 5,
-    retryDelay: 1000,
-    useWSS: true,
-    requestRetries: 5,
-  });
+  if (report.messageContent?.some(msg => msg.includes('story'))) {
+    return { isSpam: true, reason: 'Story content', confidence: 100 };
+  }
+
+  // Добавьте здесь другие проверки на очевидный спам
+
+  return null;
+}
+
+async function checkCache(report: Report): Promise<SpamDecision | null> {
+  if (!checkConfig.cache) return null;
 
   try {
-    await client.connect();
-    const isAuthorized = await client.checkAuthorization();
-    if (!isAuthorized) {
-      throw new Error('Client is not authorized. Please check your session string.');
+    const key = `report:${report.reportId}`;
+    const cachedResult = await redis.get(key);
+    if (cachedResult) {
+      const cachedReport = JSON.parse(cachedResult) as Report;
+      if (isReportIdentical(report, cachedReport)) {
+        DEEP_LOG && log(`Cache hit for report ${report.reportId}`);
+        return { 
+          isSpam: cachedReport.isSpam, 
+          confidence: cachedReport.confidence || 100, 
+          reason: 'Cached result' 
+        };
+      }
     }
-    DEEP_LOG && log('Client connected and authorized successfully');
-    return client;
+    DEEP_LOG && log(`Cache miss for report ${report.reportId}`);
+    return null;
   } catch (error) {
-    logErr('initClient', error);
-    throw error;
+    logErr('checkCache', error);
+    return null;
   }
 }
 
-async function initDB() {
-  const client = await pool.connect();
+async function checkGPT(report: Report, sysInfo: SysInfo): Promise<SpamDecision | null> {
+  if (!checkConfig.gpt) {
+    DEEP_LOG && log('GPT check is disabled');
+    return null;
+  }
+
+  const model = await selectGptModel(report.messageContent?.join(' ') || '');
+  const gptPrompt = `Analyze multilingual Telegram messages for spam. Use provided context (complaints, source, sender) but focus primarily on message content. Classify as spam or not spam and provide a confidence score from 0 to 100.
+
+
+Spam (1) if clear:
+1. Commercial:
+   - Unsolicited ads, subtle marketing
+   - Self-promotion of unrelated channels/groups
+   - Disguised promotions (e.g., informative messages with channel links)
+2. Scams/Financial:
+   - Phishing, fake giveaways, get-rich-quick schemes
+   - Unrealistic financial promises, urgent decisions
+   - Suspicious cryptocurrency/airdrop mentions
+   - Offers of quick money or short-term "jobs"
+3. Deceptive/Adult:
+   - Impersonation, false promises
+   - Explicit content, unsolicited services
+   - Subtle invitations for private meetings, coded language
+   - Requests for private photos/information
+4. Unwanted:
+   - Chain messages, excessive invites
+   - Unsolicited job offers, surveys, personal requests
+   - Irrelevant business/political/religious messages
+5. Suspicious Behavior:
+   - Bot-like messages, repetitive content
+   - Attempts to move conversations to private channels
+   - Excessive emojis, especially at line starts
+   - Bypass attempts (e.g., unusual symbols)
+6. Harmful:
+   - Incitement to violence/illegal activities
+   - Sharing others' personal information
+
+Not Spam (0) for:
+1. Normal Interactions:
+   - Greetings, casual conversation, jokes
+   - Short messages, single words, numbers, or emojis (unless suspicious pattern)
+   - Questions, replies, opinions, reactions
+   - Any form of inquiry or response
+2. Legitimate Information:
+   - Relevant news, educational content
+   - Warnings about scams/spam (educational context)
+3. Group Activities:
+   - Bot commands (starting with "/"), unless they have 3 or more complaints
+   - Relevant polls
+   - Political discussions (unless inciting violence or illegal activities)
+   - Any message that could be relevant to a group's theme
+4. Expressive Language:
+   - Profanity, crude language
+   - Emotional outbursts or rants
+   - Insults, arguments, or disagreements, even if very offensive or aggressive
+5. Cultural Content:
+   - Local slang, cultural references/jokes
+   - Regional news/events discussion
+6. Any message without clear spam indicators
+
+Key Factors:
+1. Message content and intent in any language
+2. Relevance to the group's theme (provided in 'Source')
+3. Number of complaints
+4. Sender's behavior pattern
+
+Important Notes:
+- The 'Source' field indicates the group name. Use it for context, not as a spam indicator.
+- Telegram's spam probability is a minor factor; don't rely on it heavily.
+- Normal conversations, including casual chat and emoji usage, are not spam.
+- Short messages are usually not spam unless part of a suspicious pattern.
+- Personal opinions or reactions are generally not spam.
+- Business or financial discussions are allowed unless clearly scams or promotions.
+- Messages with high complaint counts should be scrutinized carefully, but complaint count alone is not definitive proof of spam.
+- Be extra cautious with messages offering quick money or short-term "jobs", especially if they mention specific amounts.
+
+Output: A single number from 0 to 100 representing spam likelihood:
+0-24: Confident it's not spam
+25-49: Leaning towards not spam
+50: Too ambiguous to determine
+51-75: Leaning towards spam
+76-100: Confident it's spam`;
+
+  const userPrompt = `Analyze:
+"${report.messageContent?.join('\n')}"
+Complaints: ${sysInfo.complaintCount}
+Source (Group Name): ${sysInfo.source}
+Sender: ${sysInfo.sender}
+Spam Prob: ${sysInfo.telegramSpamProbability}
+
+Spam likelihood (0-100):`;
+
   try {
-    await client.query('BEGIN');
+    const response = await retryGptRequest(
+      () => openai.chat.completions.create({
+        model: model,
+        messages: [
+          { role: "system", content: gptPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        max_tokens: 5,
+        temperature: 0.1,
+      }),
+      2,
+      30000,
+      35000
+    );
+
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) {
+      throw new Error('Empty GPT response');
+    }
+
+    const spamLikelihood = parseInt(content);
     
-    DEEP_LOG && log('Creating reports table if not exists...');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS reports (
-        id SERIAL PRIMARY KEY,
-        report_id TEXT UNIQUE,
-        message_content TEXT[],
-        media_hashes TEXT[],
-        complaint_count INTEGER NOT NULL,
-        source TEXT NOT NULL,
-        sender TEXT NOT NULL,
-        spam_probability INTEGER,
-        has_external_link BOOLEAN,
-        has_internal_link BOOLEAN,
-        mod_flood INTEGER DEFAULT 0,
-        mod_not_spam INTEGER DEFAULT 0,
-        is_spam BOOLEAN,
-        reason TEXT,
-        decision TEXT,
-        created_at TEXT DEFAULT to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'DD.MM.YY, HH24:MI:SS')
-      );
-    `);
-    
-    DEEP_LOG && log('Altering spam_probability column...');
-    await client.query(`
-      ALTER TABLE reports
-      ALTER COLUMN spam_probability DROP NOT NULL;
-    `);
-    
-    await client.query('COMMIT');
-    DEEP_LOG && log('Database initialized successfully');
+    if (isNaN(spamLikelihood) || spamLikelihood < 0 || spamLikelihood > 100) {
+      throw new Error(`Invalid GPT response: ${content}`);
+    }
+
+    DEEP_LOG && log(`GPT spam likelihood: ${spamLikelihood}`);
+
+    return {
+      isSpam: spamLikelihood > 50,
+      confidence: spamLikelihood,
+      reason: `GPT assessment: ${spamLikelihood}`
+    };
   } catch (error) {
-    await client.query('ROLLBACK');
-    logErr('initDB', error);
-    throw error;
-  } finally {
-    client.release();
+    logErr('checkGPT', error);
+    // В случае ошибки возвращаем null, чтобы система могла принять решение на основе других факторов
+    return null;
   }
 }
 
-async function initBot() {
-  if (!BOT_ID || !BOT_ACCESS_HASH) {
-    throw new Error('BOT_ID and BOT_ACCESS_HASH must be set in .env file');
-  }
+async function checkModerators(report: Report): Promise<SpamDecision | null> {
+  if (!checkConfig.moderators) return null;
 
-  try {
-    DEEP_LOG && log(`BOT_ID: ${BOT_ID}, BOT_ACCESS_HASH: ${BOT_ACCESS_HASH}`);
-    botEntity = new Api.InputPeerUser({
-      userId: bigInt(BOT_ID),
-      accessHash: bigInt(BOT_ACCESS_HASH)
-    });
-    DEEP_LOG && log('Bot entity initialized successfully');
-  } catch (error) {
-    logErr('initBot', error);
-    throw error;
-  }
+  if (report.modFlood >= 2) return { isSpam: true, confidence: 100, reason: 'Moderators: Flood' };
+  if (report.modNotSpam >= 2) return { isSpam: false, confidence: 0, reason: 'Moderators: Not Spam' };
+  if (report.modFlood === 1 && report.modNotSpam === 0) return { isSpam: true, confidence: 75, reason: 'Moderators: Leaning Flood' };
+  if (report.modNotSpam === 1 && report.modFlood === 0) return { isSpam: false, confidence: 25, reason: 'Moderators: Leaning Not Spam' };
+  if (report.modFlood === 1 && report.modNotSpam === 1) return { isSpam: false, confidence: 49, reason: 'Moderators: Conflicting opinions' };
+  
+  return null;
 }
 
-async function setupHandlers() {
-  if (!botEntity) throw new Error('Bot entity not initialized');
-  const botUserId = botEntity.userId.toJSNumber();
-
-  const handlers = [
-    { handler: handleCheck, options: { fromUsers: [botUserId], incoming: true, forwards: true } },
-    { handler: handleSys, options: { fromUsers: [botUserId], incoming: true, pattern: /😱\d+/ } },
-    { handler: handleAddMsg, options: { fromUsers: [botUserId], incoming: true } },
-    { handler: handleAdmin, options: { fromUsers: [ADMIN_ID], incoming: true } }
-  ];
-
-  handlers.forEach(({ handler, options }) => {
-    try {
-      client.addEventHandler(handler, new NewMessage(options));
-      DEEP_LOG && log(`Handler ${handler.name} set up successfully`);
-    } catch (error) {
-      logErr(`setupHandlers - ${handler.name}`, error);
-    }
-  });
-
-  DEEP_LOG && log('All event handlers set up successfully');
-}
-
-// -------------------- Обработка сообщений --------------------
-
-async function handleCheck(event: NewMessageEvent) {
-  if (!autoMode) {
-    DEEP_LOG && log('Automatic mode is off, skipping message check');
-    return;
-  }
-
-  const message = event.message;
-  if (
-    message instanceof Api.Message &&
-    event.isPrivate &&
-    botEntity &&
-    message.senderId?.toString() === botEntity.userId.toString()
-  ) {
-    DEEP_LOG && log(`Received message for check: ${message.message}`);
-    
-    if (currentState === ReportProcessingState.WAITING_FOR_NEXT_REPORT) {
-      currentState = ReportProcessingState.IDLE;
-      return;
-    }
-    
-    if (!currentReport.messageContent) currentReport.messageContent = [];
-    if (!currentReport.mediaHashes) currentReport.mediaHashes = [];
-    
-    let processedMessage = preprocessMessage(message.message || '');
-    
-    if (message.media instanceof Api.MessageMediaStory) {
-      const caption = (message.media as any).caption;
-      if (caption) processedMessage += ` [Story Caption: ${caption}]`;
-    }
-    
-    if (message.replyTo) {
-      try {
-        const repliedMessage = await message.getReplyMessage();
-        if (repliedMessage?.message) {
-          processedMessage += ` [Quoted: ${repliedMessage.message}]`;
-        }
-      } catch (error) {
-        logErr('handleCheck - getting replied message', error);
-      }
-    }
-    
-    if (processedMessage) currentReport.messageContent.push(processedMessage);
-    
-    if (message.media) {
-      try {
-        const mediaHash = await getMediaHash(message.media);
-        currentReport.mediaHashes.push(mediaHash);
-      } catch (error) {
-        logErr('handleCheck - getting media hash', error);
-      }
-    }
-    
-    DEEP_LOG && log(`Current report: ${JSON.stringify(currentReport, null, 2)}`);
-  }
-}
-
-async function handleSys(event: NewMessageEvent) {
-  const { message } = event;
-  if (
-    message instanceof Api.Message &&
-    event.isPrivate &&
-    botEntity &&
-    message.senderId?.toString() === botEntity.userId.toString()
-  ) {
-    DEEP_LOG && log(`Received system message: ${message.message}`);
-
-    const sysInfo = parseSysMsg(message.message || '');
-    DEEP_LOG && log(`Parsed system info: ${JSON.stringify(sysInfo, null, 2)}`);
-
-    if (currentState === ReportProcessingState.WAITING_FOR_MODERATOR_OPINION) {
-      currentReport = { ...currentReport, ...sysInfo };
-      DEEP_LOG && log(`Current report updated with moderator opinions: ${JSON.stringify(currentReport, null, 2)}`);
-      const index = reportQueue.findIndex(report => report.reportId === currentReport.reportId);
-      if (index !== -1) {
-        reportQueue[index] = currentReport as Report;
-      }
-      currentState = ReportProcessingState.IDLE;
-      return;
-    }
-
-    currentReport = { ...sysInfo };
-    DEEP_LOG && log(`New report received: ${JSON.stringify(currentReport, null, 2)}`);
-
-    if (!currentReport.reportId) {
-      log('Warning: reportId is missing in the current report');
-    } else {
-      DEEP_LOG && log(`Report ID found: ${currentReport.reportId}`);
-    }
-
-    const validationResult = validateReport(currentReport as Report);
-    if (validationResult.isValid) {
-      if (autoMode) {
-        reportQueue.push(currentReport as Report);
-        DEEP_LOG && log('Current report added to queue');
-        processNextReport();
-      } else {
-        await saveToCache(currentReport as Report);
-        DEEP_LOG && log('Current report saved to cache (auto mode off)');
-      }
-    } else {
-      log(`Report validation failed: ${validationResult.error}`);
-      DEEP_LOG && log(`Invalid report data: ${JSON.stringify(currentReport, null, 2)}`);
-    }
-  }
-}
-
-async function handleAddMsg(event: NewMessageEvent) {
-  const message = event.message;
-  if (
-    message instanceof Api.Message &&
-    event.isPrivate &&
-    botEntity &&
-    message.senderId?.toString() === botEntity.userId.toString()
-  ) {
-    DEEP_LOG && log(`Received additional message: ${message.message}`);
-
-    switch (message.message) {
-      case "No Reports Found":
-        DEEP_LOG && log('No reports found, sending /undo');
-        await sendToBot("/undo");
-        break;
-      case "Hello there! Send /next to start processing reports.":
-        if (autoMode) {
-          await sendToBot("/next");
-        }
-        break;
-      case "Please select 😡 BAN or 😌 NO.":
-      case "Sorry, an error has occurred during your request. Please try again later.":
-        await sendToBot("/undo");
-        break;
-      default:
-        if (message.message.startsWith("Your Fee for this month:")) {
-          DEEP_LOG && log(`Earnings info received: ${message.message}`);
-          await notify(`Earnings update: ${message.message}`);
-        }
-    }
-  }
-}
-
-async function handleAdmin(event: NewMessageEvent) {
-  if (!client || !client.connected) {
-    DEEP_LOG && log('Telegram client not connected. Attempting to reconnect...');
-    try {
-      await reconnectClient();
-    } catch (error) {
-      logErr('handleAdmin - reconnectClient', error);
-      return;
-    }
-  }
-
-  const message = event.message;
-  if (message instanceof Api.Message && message.senderId?.toString() === ADMIN_ID.toString()) {
-    DEEP_LOG && log(`Received admin message: ${message.message}`);
-    const command = message.message.toLowerCase();
-
-    switch (command) {
-      case '/start':
-        await startAutoMode();
-        await notify('Automatic mode started');
-        break;
-      case '/stop':
-        stopAutoMode();
-        await notify('Automatic mode stopped');
-        break;
-      case '/db':
-        await handleDbExport();
-        break;
-      case '/status':
-        await sendStatus();
-        break;
-      default:
-        if (command.startsWith('/time ')) {
-          const time = parseInt(command.split(' ')[1], 10);
-          if (!isNaN(time) && time > 0) {
-            process.env.PROCESSING_INTERVAL = time.toString();
-            await notify(`Processing interval set to ${time} ms`);
-          } else {
-            await notify('Invalid time value. Please enter a positive number.');
-          }
-        } else {
-          DEEP_LOG && log(`Unrecognized admin command: ${command}`);
-        }
-    }
-  }
-}
-
-// -------------------- Основные функции обработки --------------------
-
+// Основная функция обработки отчета
 async function processReport(report: Report): Promise<void> {
-  const processingInterval = getProcessingInterval();
   const startTime = Date.now();
 
-  // Параллельное выполнение проверки на очевидный спам и проверки кэша
-  const [obviousSpamDecision, cachedReport] = await Promise.all([
-    detectObviousSpam(report as unknown as Api.Message, report),
-    checkCache(report)
-  ]);
+  const sysInfo: SysInfo = {
+    complaintCount: report.complaintCount,
+    source: report.source,
+    sender: report.sender,
+    hasLink: report.hasExternalLink || report.hasInternalLink,
+    telegramSpamProbability: report.spamProbability
+  };
 
-  // Обработка результата проверки на очевидный спам
-  if (obviousSpamDecision.isSpam) {
-    DEEP_LOG && log(`Obvious spam detected: ${obviousSpamDecision.reason}`);
-    report.isSpam = true;
-    report.reason = obviousSpamDecision.reason || 'Obvious spam detection';
-    await sendDecision('😡 SPAM');
-    await saveReport(report);
-    await ensureMinimumInterval(startTime, processingInterval);
-    return;
+  // Проверка кэша
+  if (checkConfig.cache) {
+    const cachedDecision = await checkCache(report);
+    if (cachedDecision) {
+      DEEP_LOG && log(`Using cached result: ${cachedDecision.isSpam ? 'SPAM' : 'NOT SPAM'}`);
+      await delay(COMMAND_DELAY);
+      await sendDecision(cachedDecision.isSpam ? '😡 SPAM' : '😌 NO');
+      await ensureMinimumInterval(startTime, PROCESSING_INTERVAL);
+      return;
+    }
   }
 
-  // Обработка результата проверки кэша
-  if (cachedReport) {
-    DEEP_LOG && log(`Using cached result for report ${report.reportId}: ${cachedReport.isSpam ? 'SPAM' : 'NOT SPAM'}`);
-    await sendDecision(cachedReport.isSpam ? '😡 SPAM' : '😌 NO');
-    await ensureMinimumInterval(startTime, processingInterval);
-    return;
+  // Проверка на очевидный спам
+  if (checkConfig.obviousSpam) {
+    const obviousSpamDecision = await checkObviousSpam(report);
+    if (obviousSpamDecision) {
+      DEEP_LOG && log(`Obvious spam detected: ${obviousSpamDecision.reason}`);
+      await delay(COMMAND_DELAY);
+      await sendDecision(obviousSpamDecision.isSpam ? '😡 SPAM' : '😌 NO');
+      await saveReport({ ...report, ...obviousSpamDecision });
+      await ensureMinimumInterval(startTime, PROCESSING_INTERVAL);
+      return;
+    }
   }
 
-  // Если не найдено в кэше и не является очевидным спамом:
-  await sendToBot("/stats");
-
-  currentState = ReportProcessingState.WAITING_FOR_MODERATOR_OPINION;
-  await sendToBot(report.reportId);
-
-  // Обработка мнений модераторов
-  const decision = await processModeratorsOpinions(report);
-
-  if (decision === "/undo") {
-    DEEP_LOG && log("No conclusive moderator opinions, sending /undo");
-    await sendToBot("/undo");
-    currentState = ReportProcessingState.IDLE;
-    await ensureMinimumInterval(startTime, processingInterval);
-    return;
+  // GPT проверка
+  let gptDecision: SpamDecision | null = null;
+  if (checkConfig.gpt) {
+    gptDecision = await checkGPT(report, sysInfo);
+    if (gptDecision && (gptDecision.confidence! <= 24 || gptDecision.confidence! >= 76)) {
+      DEEP_LOG && log(`GPT decision: ${gptDecision.isSpam ? 'SPAM' : 'NOT SPAM'} (${gptDecision.confidence})`);
+      await delay(COMMAND_DELAY);
+      await sendDecision(gptDecision.isSpam ? '😡 SPAM' : '😌 NO');
+      await saveReport({ ...report, ...gptDecision });
+      await ensureMinimumInterval(startTime, PROCESSING_INTERVAL);
+      return;
+    }
   }
+
+  // Проверка модераторов
+  let moderatorDecision: SpamDecision | null = null;
+  if (checkConfig.moderators) {
+    await delay(COMMAND_DELAY);
+    await sendToBot("/stats");
+    await delay(COMMAND_DELAY);
+    await sendToBot(report.reportId);
+
+    currentState = ReportProcessingState.WAITING_FOR_MODERATOR_OPINION;
+
+    // Ожидаем мнения модераторов
+    const moderatorOpinionTimeout = 30000; // 30 секунд максимального ожидания
+    const moderatorOpinionStartTime = Date.now();
+    while (currentState === ReportProcessingState.WAITING_FOR_MODERATOR_OPINION) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (Date.now() - moderatorOpinionStartTime > moderatorOpinionTimeout) {
+        DEEP_LOG && log("Timeout waiting for moderator opinions");
+        break;
+      }
+    }
+
+    moderatorDecision = await checkModerators(report);
+    
+    await delay(COMMAND_DELAY);
+    await sendToBot("/next");
+  }
+
+  // Принятие решения
+  let finalDecision: SpamDecision;
+  if (moderatorDecision) {
+    finalDecision = moderatorDecision;
+    DEEP_LOG && log(`Using moderator decision: ${finalDecision.isSpam ? 'SPAM' : 'NOT SPAM'} (${finalDecision.confidence})`);
+  } else if (gptDecision) {
+    finalDecision = gptDecision;
+    DEEP_LOG && log(`Using GPT decision: ${finalDecision.isSpam ? 'SPAM' : 'NOT SPAM'} (${finalDecision.confidence})`);
+  } else {
+    // Если нет решения ни от модераторов, ни от GPT, принимаем решение на основе количества жалоб и спам-вероятности от Telegram
+    const spamScore = report.complaintCount * 10 + report.spamProbability;
+    finalDecision = {
+      isSpam: spamScore >= 50,
+      confidence: Math.min(Math.max(spamScore, 0), 100),
+      reason: `Decision based on complaint count (${report.complaintCount}) and Telegram spam probability (${report.spamProbability})`
+    };
+    DEEP_LOG && log(`Using complaint count and Telegram probability decision: ${finalDecision.isSpam ? 'SPAM' : 'NOT SPAM'} (${finalDecision.confidence})`);
+  }
+
+  // Отправляем решение
+  await delay(COMMAND_DELAY);
+  await sendDecision(finalDecision.isSpam ? '😡 SPAM' : '😌 NO');
+  await saveReport({ ...report, ...finalDecision });
 
   currentState = ReportProcessingState.WAITING_FOR_NEXT_REPORT;
-  await sendToBot("/next");
 
   // Ожидаем следующий отчет
   const nextReportTimeout = 10000; // 10 секунд максимального ожидания
@@ -490,109 +471,16 @@ async function processReport(report: Report): Promise<void> {
     }
   }
 
-  report.isSpam = decision === '😡 SPAM';
-  await sendDecision(decision);
-  await saveReport(report);
-
   currentState = ReportProcessingState.IDLE;
-  await ensureMinimumInterval(startTime, processingInterval);
+  await ensureMinimumInterval(startTime, PROCESSING_INTERVAL);
 }
 
-async function processModeratorsOpinions(report: Report): Promise<string> {
-  const moderatorOpinionTimeout = 30000; // 30 секунд максимального ожидания
-  const startTime = Date.now();
-  let lastOpinionTime = startTime;
-  
-  while (Date.now() - lastOpinionTime < moderatorOpinionTimeout) {
-    await new Promise(resolve => setTimeout(resolve, 100)); // Короткие интервалы проверки
-    
-    if (report.modFlood > 0 || report.modNotSpam > 0) {
-      // Получено новое мнение модератора, обновляем время последнего мнения
-      lastOpinionTime = Date.now();
-      DEEP_LOG && log(`Received moderator opinion. Current state: Flood ${report.modFlood}, NotSpam ${report.modNotSpam}`);
-    }
-    
-    // Проверяем, можем ли мы принять решение на основе текущих мнений
-    const decision = makeDecision(report);
-    if (decision !== "/undo") {
-      DEEP_LOG && log(`Decision made: ${decision}`);
-      return decision;
-    }
-    
-    // Проверяем, не превысили ли мы общее время ожидания
-    if (Date.now() - startTime >= 60000) { // Максимум 60 секунд общего ожидания
-      DEEP_LOG && log("Reached maximum total waiting time for moderator opinions");
-      break;
-    }
-  }
-
-  DEEP_LOG && log("No conclusive moderator opinions received within the timeout period");
-  return "/undo";
+// Вспомогательная функция для создания задержки
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function makeDecision(report: Report): string {
-  if (report.modFlood >= 2) return "😡 SPAM";
-  if (report.modNotSpam >= 2) return "😌 NO";
-  if (report.modFlood === 1 && report.modNotSpam === 0) return "😡 SPAM";
-  if (report.modNotSpam === 1 && report.modFlood === 0) return "😌 NO";
-  if (report.modFlood === 1 && report.modNotSpam === 1) return "😌 NO";
-  if (report.modFlood === 0 && report.modNotSpam === 0) return "/undo";
-  
-  DEEP_LOG && log(`Unexpected voting combination: modFlood = ${report.modFlood}, modNotSpam = ${report.modNotSpam}`);
-  return "😌 NO";
-}
-
-async function detectObviousSpam(message: Api.Message, report: Partial<Report>): Promise<SpamDecision> {
-  if ((message.media || 
-     message.message && (message.message.includes('http') || message.message.includes('@') || message.message.match(/\+?[0-9]{10,14}/))) 
-    && report.complaintCount && report.complaintCount > 2) {
-    return { isSpam: true, reason: 'Media or links with high complaint count' };
-  }
-
-  if (message.media instanceof Api.MessageMediaStory) {
-    return { isSpam: true, reason: 'Story content' };
-  }
-
-  if (message.replyMarkup instanceof Api.ReplyInlineMarkup) {
-    for (const row of message.replyMarkup.rows) {
-      for (const button of row.buttons) {
-        if (button instanceof Api.KeyboardButtonUrl) {
-          return { isSpam: true, reason: 'URL button detected' };
-        }
-      }
-    }
-  }
-
-  if (report.messageContent && report.messageContent.length > 3 && 
-    new Set(report.messageContent).size < report.messageContent.length * 0.7) {
-    return { isSpam: true, reason: 'Duplicate messages detected' };
-  }
-
-  const linkRegex = /(https?:\/\/[^\s]+)|(@\w+)/g;
-  const links = message.message?.match(linkRegex) || [];
-  const linkCounts = new Map<string, number>();
-  for (const link of links) {
-    const count = linkCounts.get(link) || 0;
-    if (count > 2) {
-      return { isSpam: true, reason: 'Repeated links or usernames' };
-    }
-    linkCounts.set(link, count + 1);
-  }
-
-  if (message.media instanceof Api.MessageMediaDocument && 
-    message.media.document instanceof Api.Document) {
-    const fileName = message.media.document.attributes
-      .find((attr): attr is Api.DocumentAttributeFilename => attr instanceof Api.DocumentAttributeFilename)?.fileName;
-    if (fileName && dangEx.includes(path.extname(fileName).toLowerCase())) {
-      return { isSpam: true, reason: 'Potentially harmful file detected' };
-    }
-  }
-
-  return { isSpam: false };
-}
-
-// -------------------- Вспомогательные функции --------------------
-
+// Вспомогательные функции
 function preprocessMessage(message: string): string {
   return message.split('\n').slice(1).join('\n');
 }
@@ -606,30 +494,30 @@ function parseSysMsg(msg: string): Partial<Report> {
     spamProbability: 0
   };
 
-  const reportIdMatch = msg.match(/#r(\d+)/);
+  const reportIdMatch = msg.match(sysRegex.reportId);
   if (reportIdMatch) info.reportId = reportIdMatch[0];
 
-  const complaintMatch = msg.match(/😱(\d+)/);
+  const complaintMatch = msg.match(sysRegex.complaintCount);
   if (complaintMatch) info.complaintCount = parseInt(complaintMatch[1]);
 
-  info.hasExternalLink = /🔴/.test(msg);
-  info.hasInternalLink = /🔶/.test(msg);
+  info.hasExternalLink = sysRegex.externalLink.test(msg);
+  info.hasInternalLink = sysRegex.internalLink.test(msg);
 
-  const sourceMatch = msg.match(/^(?:🗣\s*)?Source:\s*(.+)/m);
+  const sourceMatch = msg.match(sysRegex.source);
   if (sourceMatch) info.source = sourceMatch[1].trim();
 
-  const senderMatch = msg.match(/^Sender:\s*(.+)/m);
+  const senderMatch = msg.match(sysRegex.sender);
   if (senderMatch) info.sender = senderMatch[1].trim();
 
-  const spamProbMatch = msg.match(/(?:🌕|🌔|🌓|🌒|🌚)\s*(\d+)%/);
+  const spamProbMatch = msg.match(sysRegex.spamProbability);
   if (spamProbMatch) info.spamProbability = parseInt(spamProbMatch[1]);
 
   const lines = msg.split('\n');
   for (const line of lines) {
-    if (/– Flood/.test(line)) {
+    if (sysRegex.modFlood.test(line)) {
       info.modFlood = (info.modFlood || 0) + 1;
     }
-    if (/– Not Spam/.test(line)) {
+    if (sysRegex.modNotSpam.test(line)) {
       info.modNotSpam = (info.modNotSpam || 0) + 1;
     }
   }
@@ -696,27 +584,6 @@ function validateReport(report: Partial<Report>): ValidationResult {
   return { isValid: true };
 }
 
-// -------------------- Функции кэширования и базы данных --------------------
-
-async function checkCache(report: Report): Promise<Report | null> {
-  try {
-    const key = `report:${report.reportId}`;
-    const cachedResult = await redis.get(key);
-    if (cachedResult) {
-      const cachedReport = JSON.parse(cachedResult) as Report;
-      if (isReportIdentical(report, cachedReport)) {
-        DEEP_LOG && log(`Cache hit for report ${report.reportId}`);
-        return cachedReport;
-      }
-    }
-    DEEP_LOG && log(`Cache miss for report ${report.reportId}`);
-    return null;
-  } catch (error) {
-    logErr('checkCache', error);
-    return null;
-  }
-}
-
 function isReportIdentical(report1: Report, report2: Report): boolean {
   return report1.messageContent?.join('') === report2.messageContent?.join('') &&
          JSON.stringify(report1.mediaHashes) === JSON.stringify(report2.mediaHashes) &&
@@ -728,9 +595,10 @@ async function saveToCache(report: Report) {
     const key = `report:${report.reportId}`;
     const value = JSON.stringify({
       ...report,
-      cachedAt: new Date().toISOString()
+      cachedAt: Date.now()
     });
     await redis.set(key, value, 'EX', 86400 * 7); // Кэш на 7 дней
+    await redis.zadd('report_timestamps', Date.now(), report.reportId);
     DEEP_LOG && log(`Saved to cache: ${key}`);
   } catch (error) {
     logErr('saveToCache', error);
@@ -744,7 +612,19 @@ async function saveReport(report: Report) {
     return;
   }
   
-  DEEP_LOG && log(`Saving report: ${report.reportId}`);
+  DEEP_LOG && log(`Saving report to Redis: ${report.reportId}`);
+  try {
+    await saveToCache(report);
+    DEEP_LOG && log(`Report saved successfully to Redis: ${report.reportId}`);
+  } catch (error) {
+    logErr('saveReport - saving to Redis', error);
+    // Если сохранение в Redis не удалось, пытаемся сохранить напрямую в PostgreSQL
+    await saveToPostgres(report);
+  }
+}
+
+async function saveToPostgres(report: Report) {
+  DEEP_LOG && log(`Saving report to PostgreSQL: ${report.reportId}`);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -752,9 +632,9 @@ async function saveReport(report: Report) {
     INSERT INTO reports (
       report_id, message_content, media_hashes, complaint_count, source, sender,
       spam_probability, has_external_link, has_internal_link,
-      mod_flood, mod_not_spam, is_spam, reason, created_at
+      mod_flood, mod_not_spam, is_spam, reason, confidence, created_at
     ) 
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 
       to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'DD.MM.YY, HH24:MI:SS'))
     ON CONFLICT (report_id) 
     DO UPDATE SET
@@ -770,6 +650,7 @@ async function saveReport(report: Report) {
       mod_not_spam = EXCLUDED.mod_not_spam,
       is_spam = EXCLUDED.is_spam,
       reason = EXCLUDED.reason,
+      confidence = EXCLUDED.confidence,
       created_at = EXCLUDED.created_at
     `;
 
@@ -786,48 +667,119 @@ async function saveReport(report: Report) {
       report.modFlood,
       report.modNotSpam,
       report.isSpam,
-      report.reason
+      report.reason,
+      report.confidence
     ];
     await client.query(query, values);
     await client.query('COMMIT');
-    DEEP_LOG && log(`Report saved successfully: ${report.reportId}`);
-
-    // Синхронизация с кэшем
-    await saveToCache(report);
+    DEEP_LOG && log(`Report saved successfully to PostgreSQL: ${report.reportId}`);
   } catch (error) {
     await client.query('ROLLBACK');
-    logErr('saveReport', error);
+    logErr('saveToPostgres', error);
   } finally {
     client.release();
   }
 }
 
-async function transferDataFromRedisToPostgres() {
-  const keys = await redis.keys('report:*');
-  const pgClient = await pool.connect();
+// Инкрементальная выгрузка данных
+async function incrementalDataTransfer() {
+  const lastTransferKey = 'last_transfer_timestamp';
+  const lastTransfer = await redis.get(lastTransferKey) || '0';
+  const currentTime = Date.now().toString();
 
+  log('Starting incremental data transfer from Redis to PostgreSQL');
   try {
-    await pgClient.query('BEGIN');
-
+    const keys = await redis.zrangebyscore('report_timestamps', lastTransfer, currentTime);
     for (const key of keys) {
-      const value = await redis.get(key);
-      if (value) {
-        const report = JSON.parse(value) as Report;
-        await saveReport(report);
+      const reportData = await redis.get(`report:${key}`);
+      if (reportData) {
+        const report = JSON.parse(reportData) as Report;
+        await saveToPostgres(report);
       }
     }
-
-    await pgClient.query('COMMIT');
-    DEEP_LOG && log(`Transferred ${keys.length} records from Redis to PostgreSQL`);
+    await redis.set(lastTransferKey, currentTime);
+    log('Incremental data transfer completed successfully');
   } catch (error) {
-    await pgClient.query('ROLLBACK');
-    throw error;
-  } finally {
-    pgClient.release();
+    logErr('Incremental data transfer', error);
+    await notify('Failed to transfer data incrementally from Redis to PostgreSQL. Check logs for details.');
   }
 }
 
-// -------------------- Утилиты и вспомогательные функции --------------------
+// Настройка инкрементальных выгрузок
+const transferSchedules = ['0 */4 * * *', '0 23 * * *']; // Каждые 4 часа и в 23:00
+transferSchedules.forEach(cronSchedule => {
+  schedule.scheduleJob(cronSchedule, incrementalDataTransfer);
+});
+
+// Функция восстановления состояния из PostgreSQL
+async function restoreFromPostgresToRedis() {
+  log('Starting data restoration from PostgreSQL to Redis');
+  let restoredCount = 0;
+  let errorCount = 0;
+
+  const client = await pool.connect();
+  try {
+    const lastTransfer = await redis.get('last_transfer_timestamp') || '0';
+    const result = await client.query('SELECT * FROM reports WHERE created_at > $1', [lastTransfer]);
+    
+    for (const row of result.rows) {
+      try {
+        const report: Report = {
+          reportId: row.report_id,
+          messageContent: row.message_content,
+          mediaHashes: row.media_hashes,
+          complaintCount: row.complaint_count,
+          source: row.source,
+          sender: row.sender,
+          spamProbability: row.spam_probability,
+          hasExternalLink: row.has_external_link,
+          hasInternalLink: row.has_internal_link,
+          modFlood: row.mod_flood,
+          modNotSpam: row.mod_not_spam,
+          isSpam: row.is_spam,
+          reason: row.reason
+        };
+
+        await saveToCache(report);
+        await redis.zadd('report_timestamps', new Date(row.created_at).getTime(), report.reportId);
+        restoredCount++;
+      } catch (error) {
+        logErr(`Error restoring report ${row.report_id} to Redis`, error);
+        errorCount++;
+      }
+    }
+
+    log(`Data restoration completed. Restored: ${restoredCount}, Errors: ${errorCount}`);
+    
+    if (errorCount > 0) {
+      await notify(`Data restoration completed with errors. Restored: ${restoredCount}, Errors: ${errorCount}`);
+    } else {
+      await notify(`Data restoration completed successfully. Restored: ${restoredCount} reports.`);
+    }
+  } catch (error) {
+    logErr('restoreFromPostgresToRedis', error);
+    await notify('Failed to restore data from PostgreSQL to Redis. Check logs for details.');
+  } finally {
+    client.release();
+  }
+}
+
+// Функция проверки состояния Redis и восстановления при необходимости
+async function checkRedisAndRestore() {
+  try {
+    await redis.ping();
+  } catch (error) {
+    logErr('Redis connection lost', error);
+    await notify('Lost connection to Redis. Attempting to reconnect and restore data...');
+    
+    // Попытка переподключения к Redis
+    redis.disconnect();
+    await redis.connect();
+    
+    // Восстановление данных из PostgreSQL
+    await restoreFromPostgresToRedis();
+  }
+}
 
 function getProcessingInterval(): number {
   return parseInt(process.env.PROCESSING_INTERVAL || '1000', 10);
@@ -847,8 +799,6 @@ async function processNextReport() {
   if (report) {
     await new Promise(resolve => setTimeout(resolve, getProcessingInterval()));
     await processReport(report);
-    
-    await sendToBot("/next");
   }
 
   isProcessing = false;
@@ -924,6 +874,11 @@ Auto mode: ${autoMode ? 'On' : 'Off'}
 Processing delay: ${getProcessingInterval()} ms
 Database connection: ${await checkDB() ? 'Connected' : 'Disconnected'}
 Reports in database: ${await checkDBContent()}
+Check configuration:
+- Obvious spam: ${checkConfig.obviousSpam ? 'On' : 'Off'}
+- Cache: ${checkConfig.cache ? 'On' : 'Off'}
+- GPT: ${checkConfig.gpt ? 'On' : 'Off'}
+- Moderators: ${checkConfig.moderators ? 'On' : 'Off'}
   `;
   await notify(status);
 }
@@ -952,7 +907,7 @@ async function exportCSV(): Promise<string> {
     const result = await client.query('SELECT * FROM reports');
     DEEP_LOG && log(`Query executed. Found ${result.rows.length} rows.`);
 
-    const filename = `reports_export_${Date.now()}.csv`;
+    const filename = path.join(process.cwd(), `reports_export_${Date.now()}.csv`);
     const csvWriter = createObjectCsvWriter({
       path: filename,
       header: [
@@ -1058,8 +1013,256 @@ async function sendDecision(decision: string) {
   }
 }
 
-// -------------------- Основная функция --------------------
+async function selectGptModel(message: string): Promise<string> {
+  const tokenEstimate = message.split(/\s+/).length; // Грубая оценка количества токенов
 
+  if (tokenEstimate <= 100) {
+    return "gpt-4o-mini";
+  } else if (tokenEstimate <= 500) {
+    return "gpt-4o-2024-08-06";
+  } else {
+    return "gpt-4";
+  }
+}
+
+async function retryGptRequest<T>(
+  requestFn: () => Promise<T>,
+  maxRetries: number,
+  baseDelay: number,
+  maxDelay: number
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error('Max retries reached');
+}
+
+// Обработчики событий
+async function handleCheck(event: NewMessageEvent) {
+  if (!autoMode) {
+    DEEP_LOG && log('Automatic mode is off, skipping message check');
+    return;
+  }
+
+  const message = event.message;
+  if (
+    message instanceof Api.Message &&
+    event.isPrivate &&
+    botEntity &&
+    message.senderId?.toString() === botEntity.userId.toString()
+  ) {
+    DEEP_LOG && log(`Received message for check: ${message.message}`);
+    
+    if (currentState === ReportProcessingState.WAITING_FOR_NEXT_REPORT) {
+      currentState = ReportProcessingState.IDLE;
+      return;
+    }
+    
+    if (!currentReport.messageContent) currentReport.messageContent = [];
+    if (!currentReport.mediaHashes) currentReport.mediaHashes = [];
+    
+    let processedMessage = preprocessMessage(message.message || '');
+    
+    if (message.media instanceof Api.MessageMediaStory) {
+      const caption = (message.media as any).caption;
+      if (caption) processedMessage += ` [Story Caption: ${caption}]`;
+    }
+    
+    if (message.replyTo) {
+      try {
+        const repliedMessage = await message.getReplyMessage();
+        if (repliedMessage?.message) {
+          processedMessage += ` [Quoted: ${repliedMessage.message}]`;
+        }
+      } catch (error) {
+        logErr('handleCheck - getting replied message', error);
+      }
+    }
+    
+    if (processedMessage) currentReport.messageContent.push(processedMessage);
+    
+    if (message.media) {
+      try {
+        const mediaHash = await getMediaHash(message.media);
+        currentReport.mediaHashes.push(mediaHash);
+      } catch (error) {
+        logErr('handleCheck - getting media hash', error);
+      }
+    }
+    
+    DEEP_LOG && log(`Current report: ${JSON.stringify(currentReport, null, 2)}`);
+  }
+}
+
+async function handleSys(event: NewMessageEvent) {
+  const { message } = event;
+  if (
+    message instanceof Api.Message &&
+    event.isPrivate &&
+    botEntity &&
+    message.senderId?.toString() === botEntity.userId.toString()
+  ) {
+    DEEP_LOG && log(`Received system message: ${message.message}`);
+
+    const sysInfo = parseSysMsg(message.message || '');
+    DEEP_LOG && log(`Parsed system info: ${JSON.stringify(sysInfo, null, 2)}`);
+
+    if (currentState === ReportProcessingState.WAITING_FOR_MODERATOR_OPINION) {
+      currentReport = { ...currentReport, ...sysInfo };
+      DEEP_LOG && log(`Current report updated with moderator opinions: ${JSON.stringify(currentReport, null, 2)}`);
+      currentState = ReportProcessingState.IDLE;
+      return;
+    }
+
+    if (sysInfo.reportId) {
+      const existingReportIndex = reportQueue.findIndex(report => report.reportId === sysInfo.reportId);
+      if (existingReportIndex !== -1) {
+        DEEP_LOG && log(`Report ${sysInfo.reportId} already in queue, updating`);
+        reportQueue[existingReportIndex] = { ...reportQueue[existingReportIndex], ...sysInfo };
+      } else {
+        currentReport = { ...sysInfo };
+        DEEP_LOG && log(`New report received: ${JSON.stringify(currentReport, null, 2)}`);
+
+        const validationResult = validateReport(currentReport as Report);
+        if (validationResult.isValid) {
+          if (autoMode) {
+            reportQueue.push(currentReport as Report);
+            DEEP_LOG && log('Current report added to queue');
+            processNextReport();
+          } else {
+            await saveToCache(currentReport as Report);
+            DEEP_LOG && log('Current report saved to cache (auto mode off)');
+          }
+        } else {
+          log(`Report validation failed: ${validationResult.error}`);
+          DEEP_LOG && log(`Invalid report data: ${JSON.stringify(currentReport, null, 2)}`);
+        }
+      }
+    } else {
+      log('Warning: reportId is missing in the current report');
+    }
+  }
+}
+
+async function handleAddMsg(event: NewMessageEvent) {
+  const message = event.message;
+  if (
+    message instanceof Api.Message &&
+    event.isPrivate &&
+    botEntity &&
+    message.senderId?.toString() === botEntity.userId.toString()
+  ) {
+    DEEP_LOG && log(`Received additional message: ${message.message}`);
+
+    switch (message.message) {
+      case "No Reports Found":
+        DEEP_LOG && log('No reports found, sending /undo');
+        await sendToBot("/undo");
+        break;
+      case "Hello there! Send /next to start processing reports.":
+        if (autoMode) {
+          await sendToBot("/next");
+        }
+        break;
+      case "Please select 😡 BAN or 😌 NO.":
+      case "Sorry, an error has occurred during your request. Please try again later.":
+        await sendToBot("/undo");
+        break;
+      default:
+        if (message.message.startsWith("Your Fee for this month:")) {
+          DEEP_LOG && log(`Earnings info received: ${message.message}`);
+          await notify(`Earnings update: ${message.message}`);
+        }
+    }
+  }
+}
+
+async function handleAdmin(event: NewMessageEvent) {
+  if (!client || !client.connected) {
+    DEEP_LOG && log('Telegram client not connected. Attempting to reconnect...');
+    try {
+      await reconnectClient();
+    } catch (error) {
+      logErr('handleAdmin - reconnectClient', error);
+      return;
+    }
+  }
+
+  const message = event.message;
+  if (message instanceof Api.Message && message.senderId?.toString() === ADMIN_ID.toString()) {
+    DEEP_LOG && log(`Received admin message: ${message.message}`);
+    const command = message.message.toLowerCase();
+
+    switch (true) {
+      case command === '/start':
+        await startAutoMode();
+        await notify('Automatic mode started');
+        break;
+      case command === '/stop':
+        stopAutoMode();
+        await notify('Automatic mode stopped');
+        break;
+      case command === '/db':
+        await handleDbExport();
+        break;
+      case command === '/status':
+        await sendStatus();
+        break;
+      case command.startsWith('/time '):
+        const time = parseInt(command.split(' ')[1], 10);
+        if (!isNaN(time) && time > 0) {
+          PROCESSING_INTERVAL = time;
+          await notify(`Processing interval set to ${time} ms`);
+        } else {
+          await notify('Invalid time value. Please enter a positive number.');
+        }
+        break;
+      case command.startsWith('/delay '):
+        const delay = parseInt(command.split(' ')[1], 10);
+        if (!isNaN(delay) && delay > 0) {
+          COMMAND_DELAY = delay;
+          await notify(`Command delay set to ${delay} ms`);
+        } else {
+          await notify('Invalid delay value. Please enter a positive number.');
+        }
+        break;
+      case command.startsWith('/toggle '):
+        const toggles = command.split(' ').slice(1);
+        for (const toggle of toggles) {
+          switch (toggle) {
+            case 'obvs':
+              checkConfig.obviousSpam = !checkConfig.obviousSpam;
+              break;
+            case 'cache':
+              checkConfig.cache = !checkConfig.cache;
+              break;
+            case 'gpt':
+              checkConfig.gpt = !checkConfig.gpt;
+              break;
+            case 'mods':
+              checkConfig.moderators = !checkConfig.moderators;
+              break;
+            default:
+              await notify(`Unknown toggle: ${toggle}`);
+          }
+        }
+        await notify(`Check configuration updated:\n${JSON.stringify(checkConfig, null, 2)}`);
+        break;
+      default:
+        DEEP_LOG && log(`Unrecognized admin command: ${command}`);
+    }
+  }
+}
+
+// Основная функция
 async function main() {
   try {
     DEEP_LOG && log('Starting application...');
@@ -1079,6 +1282,14 @@ async function main() {
     }
 
     try {
+      await redis.ping();
+      DEEP_LOG && log('Successfully connected to Redis');
+    } catch (error) {
+      logErr('main - Redis connection', error);
+      throw new Error('Failed to connect to Redis');
+    }
+
+    try {
       client = await initClient();
       DEEP_LOG && log('Telegram client initialized');
     } catch (error) {
@@ -1094,18 +1305,6 @@ async function main() {
 
     app.listen(PORT, () => log(`Server running on port ${PORT}`));
 
-    // Установка ежедневного сохранения данных из Redis в PostgreSQL
-    schedule.scheduleJob('0 23 * * *', async () => {
-      DEEP_LOG && log('Starting daily data transfer from Redis to PostgreSQL');
-      try {
-        await transferDataFromRedisToPostgres();
-        DEEP_LOG && log('Daily data transfer completed successfully');
-      } catch (error) {
-        logErr('Daily data transfer', error);
-        await notify('Failed to transfer data from Redis to PostgreSQL. Check logs for details.');
-      }
-    });
-
     // Установка периодических проверок
     setInterval(async () => {
       const isStillConnected = await checkDB();
@@ -1120,6 +1319,8 @@ async function main() {
       await checkDB();
       const reportCount = await checkDBContent();
       DEEP_LOG && log(`Current number of reports in database: ${reportCount}`);
+
+      await checkRedisAndRestore();
     }, HEALTH_CHECK_INTERVAL);
 
     // Добавляем периодическую проверку соединения с Telegram
@@ -1192,6 +1393,123 @@ async function gracefulShutdown() {
 
   log('Graceful shutdown completed');
   process.exit(0);
+}
+
+// Инициализация клиента Telegram
+async function initClient(): Promise<TelegramClient> {
+  if (!API_ID || !API_HASH || !SESSION_STRING) {
+    throw new Error('API_ID, API_HASH, and SESSION_STRING must be set in .env file');
+  }
+
+  DEEP_LOG && log('Initializing Telegram client...');
+  const stringSession = new StringSession(SESSION_STRING);
+  const client = new TelegramClient(stringSession, API_ID, API_HASH, {
+    connectionRetries: 5,
+    retryDelay: 1000,
+    useWSS: true,
+    requestRetries: 5,
+  });
+
+  try {
+    await client.connect();
+    const isAuthorized = await client.checkAuthorization();
+    if (!isAuthorized) {
+      throw new Error('Client is not authorized. Please check your session string.');
+    }
+    DEEP_LOG && log('Client connected and authorized successfully');
+    return client;
+  } catch (error) {
+    logErr('initClient', error);
+    throw error;
+  }
+}
+
+// Инициализация базы данных
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    DEEP_LOG && log('Creating reports table if not exists...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id SERIAL PRIMARY KEY,
+        report_id TEXT UNIQUE,
+        message_content TEXT[],
+        media_hashes TEXT[],
+        complaint_count INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        spam_probability INTEGER,
+        has_external_link BOOLEAN,
+        has_internal_link BOOLEAN,
+        mod_flood INTEGER DEFAULT 0,
+        mod_not_spam INTEGER DEFAULT 0,
+        is_spam BOOLEAN,
+        reason TEXT,
+        decision TEXT,
+        created_at TEXT DEFAULT to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'DD.MM.YY, HH24:MI:SS')
+      );
+    `);
+    
+    DEEP_LOG && log('Altering spam_probability column...');
+    await client.query(`
+      ALTER TABLE reports
+      ALTER COLUMN spam_probability DROP NOT NULL;
+    `);
+    
+    await client.query('COMMIT');
+    DEEP_LOG && log('Database initialized successfully');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logErr('initDB', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// Инициализация бота
+async function initBot() {
+  if (!BOT_ID || !BOT_ACCESS_HASH) {
+    throw new Error('BOT_ID and BOT_ACCESS_HASH must be set in .env file');
+  }
+
+  try {
+    DEEP_LOG && log(`BOT_ID: ${BOT_ID}, BOT_ACCESS_HASH: ${BOT_ACCESS_HASH}`);
+    botEntity = new Api.InputPeerUser({
+      userId: bigInt(BOT_ID),
+      accessHash: bigInt(BOT_ACCESS_HASH)
+    });
+    DEEP_LOG && log('Bot entity initialized successfully');
+  } catch (error) {
+    logErr('initBot', error);
+    throw error;
+  }
+}
+
+// Настройка обработчиков событий
+async function setupHandlers() {
+  if (!botEntity) throw new Error('Bot entity not initialized');
+  const botUserId = botEntity.userId.toJSNumber();
+
+  const handlers = [
+    { handler: handleCheck, options: { fromUsers: [botUserId], incoming: true, forwards: true } },
+    { handler: handleSys, options: { fromUsers: [botUserId], incoming: true, pattern: /😱\d+/ } },
+    { handler: handleAddMsg, options: { fromUsers: [botUserId], incoming: true } },
+    { handler: handleAdmin, options: { fromUsers: [ADMIN_ID], incoming: true } }
+  ];
+
+  handlers.forEach(({ handler, options }) => {
+    try {
+      client.addEventHandler(handler, new NewMessage(options));
+      DEEP_LOG && log(`Handler ${handler.name} set up successfully`);
+    } catch (error) {
+      logErr(`setupHandlers - ${handler.name}`, error);
+    }
+  });
+
+  DEEP_LOG && log('All event handlers set up successfully');
 }
 
 // Запуск приложения
