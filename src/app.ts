@@ -164,8 +164,8 @@ let autoMode = false;
 let isProcessing = false;
 let notifyAttempts = 0;
 let currentState: ReportProcessingState = ReportProcessingState.IDLE;
-let PROCESSING_INTERVAL = parseInt(process.env.PROCESSING_INTERVAL || '1000', 10);
-let COMMAND_DELAY = parseInt(process.env.COMMAND_DELAY || '150', 10);
+let PROCESSING_INTERVAL = parseInt(process.env.PROCESSING_INTERVAL || '100', 10);
+let COMMAND_DELAY = parseInt(process.env.COMMAND_DELAY || '100', 10);
 let lastProcessedReportId: string | null = null;
 let reportQueue: Report[] = [];
 let postgresQueue: Report[] = [];
@@ -737,7 +737,7 @@ schedule.scheduleJob('0 2 * * *', () => {
 });
 
 function getProcessingInterval(): number {
-  return parseInt(process.env.PROCESSING_INTERVAL || '1000', 10);
+  return parseInt(process.env.PROCESSING_INTERVAL || '100', 10);
 }
 
 async function processNextReport() {
@@ -812,7 +812,7 @@ async function notify(msg: string) {
     DEEP_LOG && log(`Failed to notify admin: ${msg}. Attempt ${notifyAttempts}`);
     
     if (notifyAttempts < MAX_NOTIFY_ATTEMPTS) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await notify(msg);
     }
   }
@@ -1026,8 +1026,13 @@ async function sendToBot(message: string) {
 async function sendDecision(decision: string) {
   if (!botEntity) throw new Error('Bot entity not initialized');
   try {
-    await client.sendMessage(botEntity, { message: decision });
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+    client.sendMessage(botEntity!, { message: decision });
     DEEP_LOG && log(`Decision sent to bot: ${decision}`);
+    resolve();
+    }, 100);
+  });
   } catch (error) {
     logErr('sendDecision', error);
   }
@@ -1631,19 +1636,14 @@ async function processReport(report: Report): Promise<void> {
       DEEP_LOG && log(`Saved final decision to cache for ${report.reportId}: ${JSON.stringify(decision)}`);
     }
   
-// Send the decision
-if (decision) {
-  await new Promise<void>((resolve) => {
-    setTimeout(() => {
-      sendDecision(decision.isSpam ? '😡 SPAM' : '😌 NO');
-      saveReport({ ...report, ...decision, confidence: decision.confidence });
-      resolve();
-    }, 150);
-  });
-} else {
-  DEEP_LOG && log("No decision made, sending /undo");
-  await sendToBot("/undo");
-}
+    // Send the decision
+    if (decision) {
+      await sendDecision(decision.isSpam ? '😡 SPAM' : '😌 NO');
+      await saveReport({ ...report, ...decision, confidence: decision.confidence });
+    } else {
+      DEEP_LOG && log("No decision made, sending /undo");
+      await sendToBot("/undo");
+    }
 
     lastProcessedReportId = report.reportId;
 
