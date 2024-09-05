@@ -37,6 +37,8 @@ const MAX_CACHE_SIZE = 10000;
 const DB_SCHEMA_VERSION = '1.0';
 const MEDIA_EXPIRY = 600; // 10 minutes
 const ENABLE_GPT_MEDIA_ANALYSIS = true;
+const BUFFER_DELAY = 100; // 100 ms
+const MAX_PROCESSING_TIME = 30000; // 30 seconds
 
 // Initialize Express app
 const app = express();
@@ -85,7 +87,9 @@ let autoMode = true;
 let totalProcessedReports = 0;
 let totalProcessingTime = 0;
 let isProcessingReport = false;
-let currentOpenReport: string | null = null;
+let messageBuffer: Array<{type: 'check' | 'sys', content: string}> = [];
+let bufferTimeout: NodeJS.Timeout | null = null;
+let reportQueue: string[] = [];
 
 // Interfaces and types
 interface Report {
@@ -101,7 +105,7 @@ interface Report {
   timestamp: number;
   adminSender?: string;
   isOpen: boolean;
-  decisionSent: boolean; // Новое поле
+  decisionSent: boolean;
 }
 
 type SpamDecision = {
@@ -354,6 +358,23 @@ async function initClient(): Promise<TelegramClient> {
       throw new Error('Client is not authorized. Please check your session string.');
     }
     log('Client connected and authorized successfully', 'info');
+
+    // Добавляем обработчик для автоматического переподключения
+    client.addEventHandler(async (update) => {
+      if (update.className === 'UpdateConnectionState') {
+        if (update.state.className === 'ConnectionState' && !update.state.isConnected()) {
+          log('Connection lost. Attempting to reconnect...', 'info');
+          try {
+            await reconnect();
+          } catch (error) {
+            logErr('Reconnection failed', error);
+            // Здесь можно добавить дополнительную логику, например, уведомление администратора
+            await notify('Reconnection failed after multiple attempts. Manual intervention may be required.');
+          }
+        }
+      }
+    });
+
     return client;
   } catch (error) {
     logErr('initClient', error);
@@ -412,39 +433,101 @@ async function sendToBot(message: string) {
   });
 }
 
-async function reconnect() {
+async function sendInitialCommand() {
   try {
-    log('Attempting to reconnect Telegram client...', 'info');
-    if (client) {
-      await client.disconnect();
-    }
-    client = await initClient();
-    await setupHandlers();
-    log('Telegram client reconnected successfully', 'info');
+    await sendToBot("/next 9");
+    log('Sent initial command after connection', 'info');
   } catch (error) {
-    logErr('reconnect', error);
-    throw new Error('Failed to reconnect Telegram client');
+    logErr('sendInitialCommand', error);
   }
 }
 
+async function reconnect() {
+  let attempts = 0;
+  const maxAttempts = 5;
+  const delay = (attempt: number) => Math.min(Math.pow(2, attempt) * 1000, 30000);
+
+  while (attempts < maxAttempts) {
+    try {
+      log(`Attempting to reconnect Telegram client (attempt ${attempts + 1}/${maxAttempts})...`, 'info');
+      if (client) {
+        await client.disconnect();
+      }
+      client = await initClient();
+      await setupHandlers();
+      log('Telegram client reconnected successfully', 'info');
+      
+      // Отправляем начальную команду после успешного подключения
+      await sendInitialCommand();
+      return;
+    } catch (error) {
+      logErr(`reconnect attempt ${attempts + 1}`, error);
+      attempts++;
+      if (attempts < maxAttempts) {
+        const waitTime = delay(attempts);
+        log(`Waiting ${waitTime}ms before next reconnection attempt...`, 'info');
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+  throw new Error('Failed to reconnect Telegram client after multiple attempts');
+}
+
 // Report processing functions
-function openNew(): void {
-  const tempId = `temp_${Date.now()}`;
-  const newReport: Report = {
-    reportId: tempId,
-    messageContent: [],
-    mediaHashes: [],
-    complaintCount: 0,
-    source: '',
-    sender: '',
-    isSpam: -1,
-    timestamp: Date.now(),
-    isOpen: true,
-    decisionSent: false // Добавляем новое поле
-  };
-  currentOpenReport = tempId;
-  saveCache(newReport);
-  log(`New report opened with temp ID: ${tempId}`, 'debug');
+async function processBuffer() {
+  if (messageBuffer.length === 0) return;
+
+  const sysMessage = messageBuffer.find(msg => msg.type === 'sys');
+  if (!sysMessage) {
+    log('No system message found in buffer, skipping processing', 'debug');
+    messageBuffer = [];
+    return;
+  }
+
+  const sysInfo = await parseSys(sysMessage.content);
+  if (!sysInfo.reportId) {
+    log('No reportId found in system message, skipping processing', 'debug');
+    messageBuffer = [];
+    return;
+  }
+
+  let report = await getFromCache(sysInfo.reportId);
+  if (report) {
+    // Update existing report
+    report.messageContent = [...new Set([...report.messageContent, ...messageBuffer.filter(msg => msg.type === 'check' && !msg.content.startsWith('media:')).map(msg => msg.content)])];
+    report.mediaHashes = [...new Set([...report.mediaHashes, ...messageBuffer.filter(msg => msg.type === 'check' && msg.content.startsWith('media:')).map(msg => msg.content.slice(6))])];
+    report.complaintCount = sysInfo.complaintCount || report.complaintCount;
+    report.source = sysInfo.source || report.source;
+    report.sender = sysInfo.sender || report.sender;
+    report.adminSender = sysInfo.adminSender || report.adminSender;
+  } else {
+    // Create new report
+    report = {
+      reportId: sysInfo.reportId,
+      messageContent: messageBuffer.filter(msg => msg.type === 'check' && !msg.content.startsWith('media:')).map(msg => msg.content),
+      mediaHashes: messageBuffer.filter(msg => msg.type === 'check' && msg.content.startsWith('media:')).map(msg => msg.content.slice(6)),
+      complaintCount: sysInfo.complaintCount || 0,
+      source: sysInfo.source || '',
+      sender: sysInfo.sender || '',
+      adminSender: sysInfo.adminSender,
+      isSpam: -1,
+      timestamp: Date.now(),
+      isOpen: true,
+      decisionSent: false
+    };
+  }
+
+  await saveCache(report);
+  log(`Updated and cached report: ${JSON.stringify(report)}`, 'debug');
+
+  if (!isProcessingReport) {
+    await processReport(report);
+  } else {
+    log(`Another report is being processed. Queuing ${report.reportId} for later processing`, 'debug');
+    reportQueue.push(report.reportId);
+  }
+
+  messageBuffer = [];
 }
 
 async function processReport(report: Report): Promise<void> {
@@ -460,32 +543,49 @@ async function processReport(report: Report): Promise<void> {
     log(`Starting to process report ${report.reportId}`, 'debug');
     let decision: SpamDecision | null = null;
 
+    // Проверяем кэш в начале
+    decision = await checkCache(report.reportId);
+    if (decision) {
+      log(`Using initial cached decision for report ${report.reportId}`, 'debug');
+      await applyDecision(report, decision);
+      return;
+    }
+
     // Fast check
     decision = await fastCheck(report);
+    if (decision) {
+      await applyDecision(report, decision);
+      return;
+    }
 
-    // If no decision from fast check, proceed with moderator check
-    if (!decision) {
-      const modResult = await modCheck(report);
-      if (modResult.decision) {
-        decision = modResult.decision;
-      } else if (modResult.newSysMsg) {
-        // If no clear decision from moderators but we got a new sysMsg, proceed with GPT check
-        decision = await gptCheck(report);
+    // Moderator check
+    const modResult = await modCheck(report);
+    if (modResult.decision) {
+      decision = modResult.decision;
+      await applyDecision(report, decision);
+      return;
+    }
+
+    // Проверяем кэш снова после modCheck
+    decision = await checkCache(report.reportId);
+    if (decision) {
+      log(`Using cached decision after modCheck for report ${report.reportId}`, 'debug');
+      await applyDecision(report, decision);
+      return;
+    }
+
+    // GPT check
+    if (modResult.newSysMsg) {
+      decision = await gptCheck(report);
+      if (decision) {
+        await applyDecision(report, decision);
+        return;
       }
     }
 
-    if (decision) {
-      await applyDecision(report, decision);
-    } else {
-      log(`No decision made for ${report.reportId}, skipping to next report`, 'debug');
-      await sendToBot("/next 9");
-    }
-
-    // Open a new report for the next message
-    openNew();
-
-    // Close the current report
-    await closeReport(report.reportId);
+    // Если решение не принято, отправляем команду на следующий отчет
+    log(`No decision made for ${report.reportId}, skipping to next report`, 'debug');
+    await sendToBot("/next 1");
 
   } catch (error) {
     logErr('processReport', error);
@@ -497,12 +597,29 @@ async function processReport(report: Report): Promise<void> {
     
     isProcessingReport = false;
     log(`Finished processing report ${report.reportId}`, 'debug');
+
+    // Process next report in queue
+    if (reportQueue.length > 0) {
+      const nextReportId = reportQueue.shift();
+      if (nextReportId) {
+        const nextReport = await getFromCache(nextReportId);
+        if (nextReport) {
+          setImmediate(() => processReport(nextReport));
+        }
+      }
+    } else {
+      // Если очередь пуста, отправляем команду на следующий отчет
+      await sendToBot("/next 3");
+    }
   }
 }
 
 async function fastCheck(report: Report): Promise<SpamDecision | null> {
   const cachedDecision = await checkCache(report.reportId);
-  if (cachedDecision) return cachedDecision;
+  if (cachedDecision) {
+    log(`Using cached decision for report ${report.reportId}`, 'debug');
+    return cachedDecision;
+  }
 
   const hasLinksOrContacts = report.messageContent.some(msg => 
     msg.includes('http') || msg.includes('@') || /\+?\d{10,}/.test(msg)
@@ -525,7 +642,8 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
 }
 
 async function modCheck(report: Report): Promise<{ decision: SpamDecision | null, newSysMsg: boolean }> {
-  const MAX_ATTEMPTS = 5; // Максимальное количество попыток
+  const MAX_ATTEMPTS = 5;
+  const TIMEOUT = 10000; // 10 seconds timeout
   let attempts = 0;
 
   try {
@@ -551,25 +669,33 @@ async function modCheck(report: Report): Promise<{ decision: SpamDecision | null
     while (attempts < MAX_ATTEMPTS) {
       attempts++;
       
-      // Send "/next 2" command
       await sendToBot("/next 2");
-      const receivedCorrectSysMsg = await waitForSysMsg(report.reportId);
+      const receivedCorrectSysMsg = await withTimeout(waitForSysMsg(report.reportId), TIMEOUT);
       if (!receivedCorrectSysMsg) {
         log(`Did not receive correct sysMsg for ${report.reportId} after attempt ${attempts}`, 'error');
-        continue; // Try again
+        continue;
       }
 
-      // Process moderator decision only after receiving the correct sysMsg without "Admin:"
       const lastSysMsg = await redis.get('last_sys_msg');
-      if (lastSysMsg && !lastSysMsg.includes('Admin:')) {
-        const decision = report.adminSender ? processMod(report.adminSender) : null;
+      if (lastSysMsg) {
+        const decision = processMod(lastSysMsg);
+        if (decision) {
+          log(`Moderator decision applied for report ${report.reportId}: ${JSON.stringify(decision)}`, 'debug');
+          // Сохраняем решение модератора в кэше
+          const updatedReport: Report = {
+            ...report,
+            isSpam: decision.isSpam,
+            reason: decision.reason,
+            confidence: decision.confidence,
+          };
+          await saveCache(updatedReport);
+        } else {
+          log(`No clear moderator decision for report ${report.reportId}`, 'debug');
+        }
         return { decision, newSysMsg: true };
-      } else {
-        log(`Received sysMsg with Admin for ${report.reportId}, attempt ${attempts}`, 'debug');
       }
     }
 
-    // If we've reached this point, we've exceeded the maximum number of attempts
     log(`Exceeded maximum attempts (${MAX_ATTEMPTS}) for report ${report.reportId}`, 'error');
     return { decision: null, newSysMsg: false };
   } catch (error) {
@@ -587,14 +713,20 @@ function processMod(sysMsg: string): SpamDecision | null {
     return null;
   }
 
-  if (floodCount >= 2) {
-    return { isSpam: 1, reason: "Moderators: Multiple Flood", confidence: 100, checkType: 'moderator' };
-  } else if (notSpamCount >= 2) {
-    return { isSpam: 0, reason: "Moderators: Multiple Not Spam", confidence: 100, checkType: 'moderator' };
-  } else if (floodCount === 1 && notSpamCount === 0) {
-    return { isSpam: 1, reason: "Moderators: Single Flood", confidence: 90, checkType: 'moderator' };
-  } else if (notSpamCount === 1 && floodCount === 0) {
-    return { isSpam: 0, reason: "Moderators: Single Not Spam", confidence: 90, checkType: 'moderator' };
+  if (floodCount >= 1) {
+    return { 
+      isSpam: 1, 
+      reason: floodCount > 1 ? "Moderators: Multiple Flood" : "Moderators: Single Flood", 
+      confidence: floodCount > 1 ? 100 : 90, 
+      checkType: 'moderator' 
+    };
+  } else if (notSpamCount >= 1) {
+    return { 
+      isSpam: 0, 
+      reason: notSpamCount > 1 ? "Moderators: Multiple Not Spam" : "Moderators: Single Not Spam", 
+      confidence: notSpamCount > 1 ? 100 : 90, 
+      checkType: 'moderator' 
+    };
   }
 
   log(`Ambiguous moderator opinions: ${floodCount} Flood, ${notSpamCount} Not Spam`, 'debug');
@@ -602,18 +734,59 @@ function processMod(sysMsg: string): SpamDecision | null {
 }
 
 async function gptCheck(report: Report): Promise<SpamDecision | null> {
-  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information (including any images) for potential spam. Consider all aspects, including content, context, metadata, and visual elements. Be cautious and conservative in your assessment to minimize false positives.
+  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam. Consider all aspects, including content, context, metadata, and visual elements. Be cautious and conservative in your assessment to minimize false positives.
 
 Guidelines for spam classification:
-1. Look for clear indicators of commercial spam such as unsolicited advertising, promotional content, or affiliate marketing.
-2. Consider the relevance of the message and images to the group's topic or recent conversations.
-3. Evaluate the use of excessive formatting, caps, repetitive patterns, or suspicious visual elements that may indicate spam.
-4. Assess the presence of suspicious links, especially shortened URLs or links to unfamiliar domains.
-5. Check for signs of automation or bulk messaging that could indicate spam campaigns.
-6. Consider the complaint count, but don't rely solely on it for classification.
-7. Be aware of potential false positives in cases of controversial but legitimate content.
-8. For images, look for spam-related text, QR codes, or promotional imagery.
-9. In cases with no message content, focus on available metadata and image analysis.
+1. Commercial Spam:
+   - Unsolicited ads, subtle marketing
+   - Self-promotion of unrelated channels/groups
+   - Disguised promotions (e.g., informative messages with channel links)
+2. Scams/Financial:
+   - Phishing, fake giveaways, get-rich-quick schemes
+   - Unrealistic financial promises, urgent decisions
+   - Suspicious cryptocurrency/airdrop mentions
+   - Offers of quick money or short-term "jobs"
+3. Deceptive/Adult Content:
+   - Impersonation, false promises
+   - Explicit content, unsolicited services
+   - Subtle invitations for private meetings, coded language
+4. Unwanted Content:
+   - Chain messages, excessive invites
+   - Unsolicited job offers, surveys, personal requests
+5. Suspicious Behavior:
+   - Bot-like messages, repetitive content
+   - Attempts to move conversations to private channels
+   - Excessive emojis, especially at line starts
+6. Harmful Content:
+   - Incitement to violence/illegal activities
+   - Sharing others' personal information
+7. Any message with clear spam indicators
+
+Not Spam:
+1. Normal interactions (greetings, casual conversation, jokes)
+2. Short messages, single words, numbers, or emojis (unless part of a suspicious pattern)
+3. Questions, replies, opinions, reactions
+4. Legitimate information (relevant news, educational content, political discussions)
+5. Group-related activities (relevant polls, discussions)
+6. Expressive language (profanity, emotional outbursts, arguments, rudeness, agression, discrimination, hate speech, insults)
+7. Cultural content (local slang, cultural references)
+8. Warnings about scams/spam (educational context)
+9. Any message without clear spam indicators
+
+Key Factors to Consider:
+1. Message content and intent in any language
+2. Presence and nature of links or media
+3. Language tone and message structure
+4. Relevance to typical group conversations
+5. Provided context (complaints, source)
+6. Cultural and linguistic context
+
+Important Notes:
+- Normal conversations, including casual chat and emoji usage, are not spam
+- Offensive language or aggression alone are not indicators of spam
+- Messages with high complaint counts should be scrutinized carefully, but complaint count alone is not definitive proof of spam
+- Sharing of links or information is not automatically spam, but context is crucial
+- Be extra cautious with messages offering quick money or short-term "jobs", especially if they mention specific amounts
 
 Classify the information as either spam (1) or not spam (0). Provide a confidence score from 0 to 100, where 100 is absolute certainty.
 
@@ -658,7 +831,7 @@ Your analysis:`;
     // Process text content
     if (report.messageContent.length > 0) {
       const textResponse = await openai.chat.completions.create({
-        model: "gpt-4-1106-preview",
+        model: "gpt-4",
         messages: textMessages,
         max_tokens: 10,
         temperature: 0.1,
@@ -677,10 +850,7 @@ Your analysis:`;
         }
       }
     }
-    // Process media content only if:
-    // 1. ENABLE_GPT_MEDIA_ANALYSIS is true
-    // 2. There's no text content
-    // 3. There are media hashes to analyze
+    // Process media content
     else if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0) {
       for (const mediaHash of report.mediaHashes) {
         if (await isGPT4VisionCompatible(mediaHash)) {
@@ -756,7 +926,9 @@ function generateUserPrompt(report: Report): string {
 async function applyDecision(report: Report, decision: SpamDecision): Promise<void> {
   log(`Applying decision for ${report.reportId}: ${JSON.stringify(decision)}`, 'debug');
   
-  await sendDecision(report, decision);
+  if (!report.decisionSent) {
+    await sendDecision(report, decision);
+  }
   
   const updatedReport: Report = {
     ...report,
@@ -784,15 +956,6 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
   await saveCache(report);
 }
 
-async function closeReport(reportId: string): Promise<void> {
-  const report = await getFromCache(reportId);
-  if (report) {
-    report.isOpen = false;
-    await saveCache(report);
-    log(`Closed report ${reportId}`, 'debug');
-  }
-}
-
 // Cache functions
 async function saveCache(report: Report): Promise<void> {
   const cacheKey = `report:${report.reportId}`;
@@ -816,11 +979,12 @@ async function checkCache(reportId: string): Promise<SpamDecision | null> {
   const cachedReport = await getFromCache(reportId);
   
   if (cachedReport && cachedReport.isSpam !== -1) {
+    log(`Found cached decision for report ${reportId}`, 'debug');
     return {
       isSpam: cachedReport.isSpam,
       reason: cachedReport.reason || "Cached decision",
       confidence: cachedReport.confidence || 100,
-      checkType: 'fast'
+      checkType: cachedReport.adminSender ? 'moderator' : 'fast'
     };
   }
 
@@ -955,23 +1119,13 @@ async function handleCheck(event: NewMessageEvent) {
   ) {
     log(`Received message for check: ${message.message}`, 'debug');
 
-    if (!currentOpenReport) {
-      openNew();
-    }
-
-    const report = await getFromCache(currentOpenReport!);
-    if (!report) {
-      log(`No open report found for ${currentOpenReport}`, 'error');
-      return;
-    }
-
     const processedMessage = preprocess(message.message || '');
-    report.messageContent.push(processedMessage);
+    messageBuffer.push({type: 'check', content: processedMessage});
 
     if (message.media) {
       try {
         const mediaHash = await getHash(message.media);
-        report.mediaHashes.push(mediaHash);
+        messageBuffer.push({type: 'check', content: `media:${mediaHash}`});
         
         // Download and store media for potential GPT-4 Vision analysis
         await downloadAndStoreMedia(message.media);
@@ -980,8 +1134,7 @@ async function handleCheck(event: NewMessageEvent) {
       }
     }
 
-    await saveCache(report);
-    log(`Updated current report: ${JSON.stringify(report)}`, 'debug');
+    scheduleProcessing();
   }
 }
 
@@ -997,82 +1150,10 @@ async function handleSys(event: NewMessageEvent) {
     log(`Received system message: ${message.message}`, 'debug');
 
     // Save the last system message in Redis
-    await redis.set('last_sys_msg', message.message, 'EX', 30); // Store for 30 seconds
+    await redis.set('last_sys_msg', message.message, 'EX', 30);
 
-    const sysInfo = await parseSys(message.message || '');
-    log(`Parsed system info: ${JSON.stringify(sysInfo)}`, 'debug');
-
-    if (sysInfo.reportId) {
-      const report = await getFromCache(currentOpenReport!);
-      if (report && report.reportId === currentOpenReport) {
-        // Update the report with the system info
-        const updatedReport: Report = {
-          ...report,
-          ...sysInfo,
-          reportId: sysInfo.reportId,
-          isOpen: false
-        };
-
-        await saveCache(updatedReport);
-
-        if (sysInfo.adminSender) {
-          // This is a sysMsg with moderator opinions
-          await handleModeratorOpinion(updatedReport);
-        } else if (!isProcessingReport) {
-          // This is the first sysMsg or a new report, and no report is currently being processed
-          log(`Received initial sysMsg for report ${sysInfo.reportId}`, 'debug');
-          // Close the current report
-          await closeReport(currentOpenReport!);
-          currentOpenReport = null;
-          // Start processing the new report
-          await processReport(updatedReport);
-        } else {
-          // If another report is already being processed, just log this
-          log(`Received sysMsg for report ${sysInfo.reportId}, but another report is being processed.`, 'debug');
-        }
-      } else {
-        log(`Received sysMsg for unknown report ${sysInfo.reportId}`, 'error');
-      }
-    } else {
-      log('Warning: reportId is missing in the system message', 'error');
-    }
-  }
-}
-
-async function handleModeratorOpinion(report: Report) {
-  log(`Handling moderator opinion for report ${report.reportId}`, 'debug');
-
-  const sysMsg = await redis.get('last_sys_msg');
-  if (!sysMsg) {
-    log(`No system message found for report ${report.reportId}`, 'error');
-    return;
-  }
-
-  // Save moderator opinion in the separate LRU cache
-  moderatorOpinionsCache.set(report.reportId, sysMsg);
-
-  const decision = processMod(sysMsg);
-  if (decision) {
-    log(`Moderator decision for ${report.reportId}: ${JSON.stringify(decision)}`, 'debug');
-    
-    // Apply the decision
-    await applyDecision(report, decision);
-
-    // Update the cache with the new decision
-    await saveCache({
-      ...report,
-      isSpam: decision.isSpam,
-      reason: decision.reason,
-      confidence: decision.confidence,
-      isOpen: false
-    });
-  } else {
-    log(`No clear decision from moderators for report ${report.reportId}`, 'debug');
-    if (!isProcessingReport) {
-      // If there's no clear decision and no report is currently being processed,
-      // start processing this report with GPT check
-      await processReport(report);
-    }
+    messageBuffer.push({type: 'sys', content: message.message || ''});
+    scheduleProcessing();
   }
 }
 
@@ -1095,7 +1176,7 @@ async function handleAddMsg(event: NewMessageEvent) {
       // This is handled in waitStats function
     } else if (message.message?.includes("Hello there! Send /next to start processing reports.")) {
       if (autoMode) {
-        await sendToBot("/next 6");
+        await sendToBot("/next 3");
       }
     } else if (message.message?.includes("Please select 😡 BAN or 😌 NO.") ||
                message.message?.includes("Sorry, an error has occurred during your request. Please try again later.")) {
@@ -1124,7 +1205,7 @@ async function handleAdmin(event: NewMessageEvent) {
       case command === '/start':
         autoMode = true;
         await notify('Automatic mode started');
-        await sendToBot("/next 7");
+        await sendToBot("/next 4");
         break;
       case command === '/stop':
         autoMode = false;
@@ -1187,23 +1268,24 @@ async function waitUpdated(reportId: string, timeout: number = 5000): Promise<st
 async function waitForSysMsg(expectedReportId: string, timeout: number = 10000): Promise<boolean> {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const checkInterval = setInterval(async () => {
-      const lastSysMsg = await redis.get('last_sys_msg');
-      if (lastSysMsg) {
-        const sysInfo = await parseSys(lastSysMsg);
-        if (sysInfo.reportId === expectedReportId) {
-          clearInterval(checkInterval);
-          resolve(true);
+    const checkInterval = setInterval(
+      async () => {
+        const lastSysMsg = await redis.get('last_sys_msg');
+        if (lastSysMsg) {
+          const sysInfo = await parseSys(lastSysMsg);
+          if (sysInfo.reportId === expectedReportId) {
+            clearInterval(checkInterval);
+            resolve(true);
+          }
         }
-      }
-      if (Date.now() - startTime > timeout) {
-        clearInterval(checkInterval);
-        resolve(false);
-      }
-    }, 100);
-  });
-}
-
+        if (Date.now() - startTime > timeout) {
+          clearInterval(checkInterval);
+          resolve(false);
+        }
+      }, 100);
+    });
+  }
+  
 function preprocess(message: string): string {
   return message.split('\n').slice(1).join('\n').trim();
 }
@@ -1250,8 +1332,8 @@ async function undo(reportId?: string): Promise<void> {
     const lastAddMsg = await redis.get('last_add_msg');
     if (lastAddMsg && (lastAddMsg.includes("Undone") || lastAddMsg.includes("Nothing to undo"))) {
       log(`Successful undo for report ${id}`, 'debug');
-      report.decisionSent = false; // Сбрасываем флаг отправки решения
-      report.isOpen = true; // Снова открываем отчет
+      report.decisionSent = false;
+      report.isOpen = true;
       await saveCache(report);
       return;
     }
@@ -1448,6 +1530,14 @@ async function setupHandlers() {
 
   log('All event handlers set up successfully', 'info');
 }
+
+// Schedule processing
+function scheduleProcessing() {
+  if (bufferTimeout) {
+    clearTimeout(bufferTimeout);
+  }
+  bufferTimeout = setTimeout(processBuffer, BUFFER_DELAY);
+}
   
 // Graceful shutdown
 async function gracefulShutdown() {
@@ -1521,6 +1611,20 @@ async function main() {
     schedule.scheduleJob('*/5 * * * *', limitCacheSize);
 
     // Set up error handling
+    process.on('uncaughtException', async (error) => {
+      logErr('Uncaught Exception', error);
+      await notify(`Uncaught Exception: ${error.message}. Attempting to recover...`);
+      await gracefulShutdown();
+      process.exit(1);
+    });
+
+    process.on('unhandledRejection', async (reason, promise) => {
+      logErr('Unhandled Rejection', reason);
+      await notify(`Unhandled Rejection: ${reason}. Attempting to recover...`);
+      await gracefulShutdown();
+      process.exit(1);
+    });
+
     process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
       log('UnhandledRejection', 'error');
       log(`Reason: ${reason}`, 'error');
@@ -1544,11 +1648,10 @@ async function main() {
     await notify('Application initialized successfully');
     await sendStatus(); // Send initial status to admin
 
-    // // Start processing reports
-    // if (autoMode) {
-    //   openNew();
-    //   await sendToBot("/next 7");
-    // }
+    // Start processing reports if in auto mode
+    if (autoMode) {
+      await sendToBot("/next 6");
+    }
 
   } catch (error) {
     logErr('main', error);
@@ -1562,5 +1665,3 @@ main().catch(error => {
   logErr('main function', error);
   process.exit(1);
 });
-
-export { app };
