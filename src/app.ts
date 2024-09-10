@@ -1724,10 +1724,10 @@ async function main() {
     await notify('Application initialized successfully');
     await sendStatus();
 
-    // if (autoMode) {
-    //   log('Starting auto mode', 'info');
-    //   await sendToBot("/next 1");
-    // }
+    if (autoMode) {
+      log('Starting auto mode', 'info');
+      await sendToBot("/next 1");
+    }
 
   } catch (error) {
     logErr('main', error);
