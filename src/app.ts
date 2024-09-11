@@ -11,11 +11,9 @@ import express from 'express';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import Redis from 'ioredis';
-import { LRUCache } from 'lru-cache';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import pkg from 'pg';
-import { createHash } from 'crypto';
 
 dotenv.config();
 
@@ -46,12 +44,7 @@ const MAX_PROCESSING_TIME = 55000; // 55 seconds
 const app = express();
 
 // Initialize Redis
-const redis = new Redis.Redis(REDIS_URL, {
-  maxRetriesPerRequest: 3,
-  enableOfflineQueue: false,
-  connectTimeout: 10000,
-  commandTimeout: 5000,
-});
+const redis = new Redis.Redis(REDIS_URL);
 
 // Initialize PostgreSQL
 const { Pool } = pkg;
@@ -96,21 +89,7 @@ let bufferTimeout: NodeJS.Timeout | null = null;
 let processingReports: Set<string> = new Set();
 let nextCommandTimeout: NodeJS.Timeout | null = null;
 let undoRange: { start: string; end: string } | null = null;
-let lastCommandTime = 0;
-let averageProcessingTime = 5000; 
 
-// Caches
-const reportCache = new LRUCache<string, Report>({
-  max: 10000, // Maximum number of items in cache
-  ttl: 1000 * 60 * 60 * 24, // 24 hours
-});
-
-const mediaCache = new LRUCache<string, Buffer>({
-  max: 1000, // Maximum number of items in cache
-  ttl: 1000 * 60 * 30, // 30 minutes
-  maxSize: 100 * 1024 * 1024, // 100 MB
-  sizeCalculation: (value) => value.length,
-});
 
 // Interfaces and types
 interface BufferItem {
@@ -151,9 +130,6 @@ const sysRegex = {
   source: /^(?:🗣\s*)?Source:\s*(.+)/m,
   sender: /^Sender:\s*(.+)/m,
 };
-
-const linkRegex = /https?:\/\/\S+|@\S+|\+?\d{10,}/;
-const dangerousFileExtensions = new Set(['apk', 'exe', 'js', 'bat', 'cmd', 'vbs', 'ps1', 'jar', 'msi', 'com', 'scr', 'pif']);
 
 // Utility functions
 const log = (message: string, level: 'info' | 'debug' | 'error' | 'warn' = 'info') => {
@@ -408,28 +384,28 @@ async function handleAdd(event: NewMessageEvent) {
                messageContent.includes("Sorry, an error has occurred during your request. Please try again later.") ||
                messageContent.includes("No Reports Found")) {
       if (!processingReports.has('undos')) {
-        await sendToBot("/undo");
-      }
-    } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
-      const reportIdMatch = messageContent.match(/#r(\d+)/);
-      if (reportIdMatch) {
-        const reportId = reportIdMatch[1];
-        if (isReportInUndoRange(reportId)) {
-          processingReports.delete(reportId);
-          const cachedReport = await redis.get(`report:${reportId}`);
-          if (cachedReport) {
-            const report = JSON.parse(cachedReport) as Report;
-            const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
-            if (report.isSpam !== expectedDecision) {
-              log(`Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${report.isSpam}`, 'warn');
-            }
+      await sendToBot("/undo");
+    }
+  } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
+    const reportIdMatch = messageContent.match(/#r(\d+)/);
+    if (reportIdMatch) {
+      const reportId = reportIdMatch[1];
+      if (isReportInUndoRange(reportId)) {
+        processingReports.delete(reportId);
+        const cachedReport = await redis.get(`report:${reportId}`);
+        if (cachedReport) {
+          const report = JSON.parse(cachedReport) as Report;
+          const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
+          if (report.isSpam !== expectedDecision) {
+            log(`Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${report.isSpam}`, 'warn');
           }
-        } else {
-          log(`Ignoring report ${reportId} as it's outside the undo range`, 'debug');
         }
+      } else {
+        log(`Ignoring report ${reportId} as it's outside the undo range`, 'debug');
       }
     }
   }
+}
 }
 
 function isReportInUndoRange(reportId: string): boolean {
@@ -442,27 +418,11 @@ function isReportInUndoRange(reportId: string): boolean {
 async function processBuffer(currentTimestamp: number) {
   log(`Processing buffer at timestamp ${currentTimestamp}`, 'debug');
   
-  const messages = messageBuffer.filter(msg => msg.timestamp <= currentTimestamp);
-  const checkMessages = messages.filter(msg => msg.type === 'check');
-  const sysMessages = messages.filter(msg => msg.type === 'sys');
-
-  const processedPairs = new Set<string>();
-  const messageMap = new Map<number | undefined, BufferItem>();
-
-  // Create a map of checkMessages for faster lookup
-  checkMessages.forEach(msg => {
-    if (msg.replyTo) {
-      messageMap.set(msg.replyTo, msg);
-    }
-  });
-
-  const reportsToProcess: Report[] = [];
-  const reportIdsToFetch: string[] = [];
+  const checkMessages = messageBuffer.filter(msg => msg.type === 'check' && msg.timestamp <= currentTimestamp);
+  const sysMessages = messageBuffer.filter(msg => msg.type === 'sys' && msg.timestamp <= currentTimestamp);
 
   for (const sysMsg of sysMessages) {
-    if (!sysMsg.reportId) continue;
-
-    let matchingCheckMsg = messageMap.get(sysMsg.replyTo);
+    let matchingCheckMsg = checkMessages.find(checkMsg => checkMsg.replyTo === sysMsg.replyTo);
     
     if (!matchingCheckMsg) {
       matchingCheckMsg = checkMessages.find(checkMsg => 
@@ -470,146 +430,49 @@ async function processBuffer(currentTimestamp: number) {
       );
     }
 
-    if (matchingCheckMsg) {
-      const pairKey = `${sysMsg.reportId}-${matchingCheckMsg.timestamp}`;
-      if (!processedPairs.has(pairKey)) {
-        processedPairs.add(pairKey);
-        reportIdsToFetch.push(sysMsg.reportId);
-        reportsToProcess.push({
-          reportId: sysMsg.reportId,
-          messageContent: [matchingCheckMsg.content],
-          mediaHashes: matchingCheckMsg.mediaHashes || [],
-          complaintCount: 0,
-          source: '',
-          sender: '',
-          isSpam: -1,
-          timestamp: sysMsg.timestamp,
-          replyTo: matchingCheckMsg.replyTo,
-          ...parseSysMessage(sysMsg.content)
-        });
-      }
+    if (matchingCheckMsg && sysMsg.reportId) {
+      scheduleDelayedProcessing(sysMsg, matchingCheckMsg);
     }
   }
-
-  const cachedReports = await batchGetFromRedis(reportIdsToFetch);
-  const reportsToSave: Report[] = [];
-
-  for (let i = 0; i < reportsToProcess.length; i++) {
-    const report = reportsToProcess[i];
-    const cachedReport = cachedReports[i];
-
-    if (cachedReport && cachedReport.isSpam !== -1) {
-      await applyDecision(report, {
-        isSpam: cachedReport.isSpam,
-        reason: cachedReport.reason || 'Cached decision',
-        checkType: 'default'
-      });
-    } else {
-      const processedReport = await processReport(report);
-      if (processedReport) {
-        reportsToSave.push(processedReport);
-      }
-    }
-  }
-
-  await batchSaveToRedis(reportsToSave);
-
-  // Remove processed messages from the buffer
-  messageBuffer = messageBuffer.filter(msg => 
-    !(processedPairs.has(`${msg.reportId}-${msg.timestamp}`) || 
-      (msg.type === 'check' && processedPairs.has(`${sysMessages.find(s => s.replyTo === msg.replyTo)?.reportId}-${msg.timestamp}`)))
-  );
-
-  log(`Processed ${processedPairs.size} reports`, 'debug');
 }
 
-async function batchSaveToRedis(reports: Report[]): Promise<void> {
-  const pipeline = redis.pipeline();
-  
-  for (const report of reports) {
-    const key = `report:${report.reportId}`;
-    pipeline.set(key, JSON.stringify(report), 'EX', 86400); // 24 hours expiry
-  }
-
-  try {
-    await pipeline.exec();
-    log(`Batch saved ${reports.length} reports to Redis`, 'debug');
-  } catch (error) {
-    logErr('batchSaveToRedis', error);
-  }
-}
-
-async function batchGetFromRedis(reportIds: string[]): Promise<(Report | null)[]> {
-  const pipeline = redis.pipeline();
-  
-  for (const reportId of reportIds) {
-    pipeline.get(`report:${reportId}`);
-  }
-
-  try {
-    const results = await pipeline.exec();
-    return results!.map(([err, result]) => {
-      if (err || !result) return null;
-      return JSON.parse(result as string) as Report;
-    });
-  } catch (error) {
-    logErr('batchGetFromRedis', error);
-    return reportIds.map(() => null);
-  }
-}
-
-async function limitCacheSize() {
-  try {
-    const currentSize = await getCacheSize();
-    log(`Current cache size: ${currentSize.toFixed(2)} MB`, 'debug');
-
-    if (currentSize > MAX_CACHE_SIZE_MB) {
-      const keysToRemove = Math.ceil((currentSize - MAX_CACHE_SIZE_MB) / 0.1); // Assuming average report size of 0.1 MB
-      const keys = await redis.keys('report:*');
-      const oldestKeys = keys.sort().slice(0, keysToRemove);
-      
-      if (oldestKeys.length > 0) {
-        await redis.del(...oldestKeys);
-        log(`Removed ${oldestKeys.length} oldest keys from Redis cache`, 'info');
-      }
-    }
-  } catch (error) {
-    logErr('limitCacheSize', error);
-  }
-}
-
-async function processReport(report: Report): Promise<Report | null> {
+async function processReport(report: Report): Promise<void> {
   log(`Processing report ${report.reportId}`, 'debug');
   
+  // Проверяем, обрабатывается ли уже отчет
   if (processingReports.has(report.reportId)) {
     log(`Report ${report.reportId} is currently being processed.`, 'warn');
+    // Проверяем, прошло ли достаточно времени с начала обработки
     const processingStartTime = await redis.get(`processing_start:${report.reportId}`);
     if (processingStartTime) {
       const elapsedTime = Date.now() - parseInt(processingStartTime);
       if (elapsedTime < MAX_PROCESSING_TIME) {
         log(`Skipping report ${report.reportId}. It's been processing for ${elapsedTime}ms`, 'debug');
-        return null;
+        return;
       } else {
         log(`Report ${report.reportId} processing timeout. Reprocessing.`, 'warn');
       }
     }
   }
 
+  // Устанавливаем флаг обработки и время начала
   processingReports.add(report.reportId);
-  await redis.set(`processing_start:${report.reportId}`, Date.now().toString(), 'EX', 600); // 10 minutes TTL
+  await redis.set(`processing_start:${report.reportId}`, Date.now().toString(), 'EX', 600); // 10 минут TTL
   
   let decision: SpamDecision | null = null;
   const processingStartTime = Date.now();
 
   try {
     if (processingReports.has('undos')) {
+      // В режиме undo используем только GPT для проверки
       decision = await gptCheck(report);
     } else {
+      // Обычный режим проверки
       const cachedDecision = await checkCache(report.reportId);
-      if (cachedDecision && (Date.now() - report.timestamp) < 24 * 60 * 60 * 1000) { // 24 hours
+      if (cachedDecision && (Date.now() - report.timestamp) < 24 * 60 * 60 * 1000) { // 24 часа
         log(`Cache hit for report ${report.reportId}`, 'debug');
         await applyDecision(report, cachedDecision);
-        return report;
+        return;
       }
 
       decision = await fastCheck(report);
@@ -625,11 +488,9 @@ async function processReport(report: Report): Promise<Report | null> {
       await applyDecision(report, decision);
     }
 
-    return report;
   } catch (error) {
     logErr(`processReport for ${report.reportId}`, error);
     await scheduleNextCommand();
-    return null;
   } finally {
     const processingTime = Date.now() - processingStartTime;
     if (processingTime > MAX_PROCESSING_TIME) {
@@ -644,56 +505,68 @@ async function processReport(report: Report): Promise<Report | null> {
 async function fastCheck(report: Report): Promise<SpamDecision | null> {
   log(`Starting fast check for report ${report.reportId}`, 'debug');
   
-  const reasons: string[] = [];
-
-  // Check for links or contacts
-  if (report.messageContent.some(msg => linkRegex.test(msg))) {
-    reasons.push("Links/contacts detected");
-  }
+  const hasLinksOrContacts = report.messageContent.some(msg => 
+    msg.includes('http') || msg.includes('@') || /\+?\d{10,}/.test(msg)
+  );
   
-  // Check for dangerous file extensions
-  if (report.mediaHashes.some(hash => {
-    const ext = hash.split('.').pop()?.toLowerCase();
-    return ext && dangerousFileExtensions.has(ext);
-  })) {
-    reasons.push("Dangerous file detected");
-  }
+  const dangerousFileExtensions = ['apk', 'exe', 'js', 'bat', 'cmd', 'vbs', 'ps1', 'jar', 'msi', 'com', 'scr', 'pif'];
+  const hasDangerousFile = report.mediaHashes.some(hash => 
+    dangerousFileExtensions.some(ext => hash.toLowerCase().endsWith(`.${ext}`))
+  );
   
-  // Check for inline keyboards, stories, and media complaints
-  const mediaFlags = {
-    hasInlineKeyboard: false,
-    hasStory: false,
-    mediaCount: 0
-  };
+  const hasInlineKeyboard = report.mediaHashes.some(hash => 
+    hash.startsWith('url_button:') || hash.startsWith('callback_button:') || hash === 'inline_keyboard:generic'
+  );
+  
+  const hasStory = report.mediaHashes.some(hash => hash.startsWith('story:'));
+  
+  const hasMediaWithComplaints = report.mediaHashes.length > 0 && report.complaintCount > 2;
 
-  for (const hash of report.mediaHashes) {
-    if (hash.startsWith('url_button:') || hash.startsWith('callback_button:') || hash === 'inline_keyboard:generic') {
-      mediaFlags.hasInlineKeyboard = true;
-    } else if (hash.startsWith('story:')) {
-      mediaFlags.hasStory = true;
-    } else {
-      mediaFlags.mediaCount++;
-    }
+  if (hasLinksOrContacts || 
+      hasDangerousFile || 
+      hasInlineKeyboard || 
+      hasStory || 
+      hasMediaWithComplaints) {
+    let reason = "Fast check:";
+    if (hasLinksOrContacts) reason += " Links/contacts detected";
+    if (hasDangerousFile) reason += " Dangerous file detected";
+    if (hasInlineKeyboard) reason += " Inline keyboard detected";
+    if (hasStory) reason += " Story detected";
+    if (hasMediaWithComplaints) reason += " Media with >2 complaints";
 
-    if (mediaFlags.hasInlineKeyboard && mediaFlags.hasStory && mediaFlags.mediaCount > 0) {
-      break;
-    }
-  }
-
-  if (mediaFlags.hasInlineKeyboard) reasons.push("Inline keyboard detected");
-  if (mediaFlags.hasStory) reasons.push("Story detected");
-  if (mediaFlags.mediaCount > 0 && report.complaintCount > 2) reasons.push("Media with >2 complaints");
-
-  if (reasons.length > 0) {
-    log(`Fast check detected spam for report ${report.reportId}: ${reasons.join(", ")}`, 'debug');
+    log(`Fast check detected spam for report ${report.reportId}: ${reason}`, 'debug');
     return { 
       isSpam: 1, 
-      reason: `Fast check: ${reasons.join(", ")}`, 
+      reason: reason.trim(), 
       checkType: 'fast'
     };
   }
 
   log(`Fast check did not detect spam for report ${report.reportId}`, 'debug');
+  return null;
+}
+
+async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMedia | null> {
+  try {
+    const message = await retry(async () => {
+      const messages = await client.getMessages(botEntity!, { ids: [messageId] });
+      return messages[0];
+    }, 3, 1000);
+
+    if (message && message instanceof Api.Message && message.media) {
+      log(`Retrieved media from message ${messageId}`, 'debug');
+      return message.media;
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('FLOOD_WAIT')) {
+      const waitTime = parseInt(error.message.split('_')[2]) || 30;
+      log(`FLOOD_WAIT encountered. Waiting for ${waitTime} seconds before retrying.`, 'warn');
+      await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
+      return getMediaFromMessage(messageId);
+    }
+    logErr('getMediaFromMessage', error);
+  }
+  log(`No media found for message ${messageId}`, 'debug');
   return null;
 }
 
@@ -775,167 +648,168 @@ Your analysis:`;
      - Memes or humorous images that could be used to mask promotional content
      - Visuals that are significantly lower or higher quality than typical group content
   
-  Remember to ALWAYS provide ONLY a definitive answer ("0" for not spam or "1" for spam). If uncertain, classify based on the most likely scenario given the available information and guidelines.
+REMEMBER: Your response must be ONLY the digit 1 (for spam) or 0 (for not spam). No other text or explanation is allowed.
   
   Your analysis:`;
 
-  const userPrompt = generateUserPrompt(report);
+const userPrompt = generateUserPrompt(report);
 
-  const textMessages: Array<ChatCompletionMessageParam> = [
-    { role: "system", content: gptPrompt },
-    { role: "user", content: userPrompt }
-  ];
+const textMessages: Array<ChatCompletionMessageParam> = [
+  { role: "system", content: gptPrompt },
+  { role: "user", content: userPrompt }
+];
 
-  const mediaMessages: Array<ChatCompletionMessageParam> = [
-    { role: "system", content: mediaPrompt },
-  ];
+const mediaMessages: Array<ChatCompletionMessageParam> = [
+  { role: "system", content: mediaPrompt },
+];
 
-  log(`GPT userPrompt for report ${report.reportId}:
-  ${userPrompt}`, 'debug');
+log(`GPT userPrompt for report ${report.reportId}:
+${userPrompt}`, 'debug');
 
-  try {
-    let textDecision: SpamDecision | null = null;
-    let mediaDecision: SpamDecision | null = null;
+try {
+  let textDecision: SpamDecision | null = null;
+  let mediaDecision: SpamDecision | null = null;
 
-    // Проверка на наличие текстового содержания или только метаданных
-    if (report.messageContent.some(content => content.trim() !== '') || (report.sender && report.complaintCount > 0)) {
-      const textResponse = await retryGptRequest(async () => {
-        return openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: textMessages,
-          max_tokens: 1,
-          temperature: 0.1,
-        });
+  // Проверка на наличие текстового содержания или только метаданных
+  if (report.messageContent.some(content => content.trim() !== '') || (report.sender && report.complaintCount > 0)) {
+    const textResponse = await retryGptRequest(async () => {
+      return openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: textMessages,
+        max_tokens: 1,
+        temperature: 0.1,
       });
+    });
+    
+    const textContent = textResponse.choices[0]?.message?.content?.trim();
+    if (textContent === '0' || textContent === '1') {
+      textDecision = {
+        isSpam: Number(textContent),
+        reason: Number(textContent) === 1 ? "GPT: spam" : "GPT: not spam",
+        checkType: 'gpt'
+      };
+    } else {
+        log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
+        // If GPT-4o-mini gives an inconclusive response, try with GPT-4o
+        const gpt4Response = await retryGptRequest(async () => {
+          return openai.chat.completions.create({
+            model: "gpt-4o-2024-08-06",
+            messages: textMessages,
+            max_tokens: 1,
+            temperature: 0.1,
+          });
+        });
 
-      const textContent = textResponse.choices[0]?.message?.content?.trim();
-        if (textContent === '0' || textContent === '1') {
+        const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
+        if (gpt4Content === '0' || gpt4Content === '1') {
           textDecision = {
-            isSpam: Number(textContent),
-            reason: Number(textContent) === 1 ? "GPT: spam" : "GPT: not spam",
-            checkType: 'gpt'
+            isSpam: Number(gpt4Content),
+            reason: Number(gpt4Content) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
+            checkType: 'gpt4'
           };
-        } else {
-          log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
-          // If GPT-4o-mini gives an inconclusive response, try with GPT-4o
-          const gpt4Response = await retryGptRequest(async () => {
+        }
+      
+    }
+  }
+
+  if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0 && report.messageContent.length === 0) {
+    for (const mediaHash of report.mediaHashes) {
+      if (await isGPT4VisionCompatible(mediaHash)) {
+        const mediaKey = `media:${mediaHash.split(':')[1]}`;
+        const mediaBuffer = await getMediaFromRedis(mediaKey);
+        if (mediaBuffer) {
+          log(`Sending media content to GPT for report ${report.reportId}, media hash: ${mediaHash}`, 'debug');
+          const base64Image = mediaBuffer.toString('base64');
+          mediaMessages.push({
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+            ] as ChatCompletionContentPart[]
+          });
+
+          const mediaResponse = await retryGptRequest(async () => {
             return openai.chat.completions.create({
-              model: "gpt-4o-2024-08-06",
-              messages: textMessages,
+              model: "gpt-4o",
+              messages: mediaMessages,
               max_tokens: 1,
-              temperature: 0.1,
+              temperature: 0.2,
             });
           });
 
-          const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
-          if (gpt4Content === '0' || gpt4Content === '1') {
-            textDecision = {
-              isSpam: Number(gpt4Content),
-              reason: Number(gpt4Content) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
-              checkType: 'gpt4'
+          const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
+          log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
+          if (mediaContent === '0' || mediaContent === '1') {
+            mediaDecision = {
+              isSpam: Number(mediaContent),
+              reason: `GPT media: ${Number(mediaContent) === 1 ? 'spam' : 'not spam'}`,
+              checkType: 'gpt'
             };
-          }
-      }
-    }
-
-    if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0 && report.messageContent.length === 0) {
-      for (const mediaHash of report.mediaHashes) {
-        if (await isGPT4VisionCompatible(mediaHash)) {
-          const mediaKey = `media:${mediaHash.split(':')[1]}`;
-          const mediaBuffer = await getMediaFromRedis(mediaKey);
-          if (mediaBuffer) {
-            log(`Sending media content to GPT for report ${report.reportId}, media hash: ${mediaHash}`, 'debug');
-            const base64Image = mediaBuffer.toString('base64');
-            mediaMessages.push({
-              role: "user",
-              content: [
-                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-              ] as ChatCompletionContentPart[]
-            });
-
-            const mediaResponse = await retryGptRequest(async () => {
-              return openai.chat.completions.create({
-                model: "gpt-4o",
-                messages: mediaMessages,
-                max_tokens: 1,
-                temperature: 0.2,
-              });
-            });
-
-            const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
-            log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
-            if (mediaContent === '0' || mediaContent === '1') {
-              mediaDecision = {
-                isSpam: Number(mediaContent),
-                reason: `GPT media: ${Number(mediaContent) === 1 ? 'spam' : 'not spam'}`,
-                checkType: 'gpt'
-              };
-              if (mediaDecision.isSpam === 1) {
-                break;
-              }
+            if (mediaDecision.isSpam === 1) {
+              break;
             }
           }
         }
       }
     }
-
-    if (textDecision && mediaDecision) {
-      // If both text and media decisions are available, prefer spam classification
-      return textDecision.isSpam === 1 || mediaDecision.isSpam === 1 ? 
-        (textDecision.isSpam === 1 ? textDecision : mediaDecision) : 
-        (textDecision.isSpam === 0 ? textDecision : mediaDecision);
-    } else if (textDecision) {
-      log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
-      return textDecision;
-    } else if (mediaDecision) {
-      log(`GPT media check decision for report ${report.reportId}: ${JSON.stringify(mediaDecision)}`, 'debug');
-      return mediaDecision;
-    }
-
-    // Если решение не было принято, но есть информация о sender и complaintCount
-    if (!textDecision && !mediaDecision && report.sender && report.complaintCount > 0) {
-      const senderAnalysisPrompt = `Analyze the following information for potential spam:
-      Sender: ${report.sender}
-      Complaint count: ${report.complaintCount}
-      
-      Consider the sender's name for any indicators of spam (e.g., unusual characters, numbers, or promotional content in the name).
-      Factor in the complaint count, but remember it's not definitive proof of spam.
-      
-      Provide a classification (1 for spam, 0 for not spam).
-      Output format: [classification]
-      Example: 1 or 0`;
-
-      const senderAnalysisResponse = await retryGptRequest(async () => {
-        return openai.chat.completions.create({
-          model: "gpt-4o-mini-2024-07-18",
-          messages: [
-            { role: "system", content: gptPrompt },
-            { role: "user", content: senderAnalysisPrompt }
-          ],
-          max_tokens: 1,
-          temperature: 0.1,
-        });
-      });
-
-      const senderAnalysisContent = senderAnalysisResponse.choices[0]?.message?.content?.trim();
-      if (senderAnalysisContent === '0' || senderAnalysisContent === '1') {
-        return {
-          isSpam: Number(senderAnalysisContent),
-          reason: Number(senderAnalysisContent) === 1 ? "GPT sender analysis: potential spam" : "GPT sender analysis: likely not spam",
-          checkType: 'gpt'
-        };
-      }
-    }
-
-    // If no decision was made, log the issue and return null
-    log(`GPT check did not make a decision for report ${report.reportId}`, 'warn');
-    return null;
-
-  } catch (error) {
-    logErr('gptCheck', error);
-    log(`GPT check failed for report ${report.reportId}`, 'error');
-    throw error;
   }
+
+  if (textDecision && mediaDecision) {
+    // If both text and media decisions are available, prefer spam classification
+    return textDecision.isSpam === 1 || mediaDecision.isSpam === 1 ? 
+      (textDecision.isSpam === 1 ? textDecision : mediaDecision) : 
+      (textDecision.isSpam === 0 ? textDecision : mediaDecision);
+  } else if (textDecision) {
+    log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
+    return textDecision;
+  } else if (mediaDecision) {
+    log(`GPT media check decision for report ${report.reportId}: ${JSON.stringify(mediaDecision)}`, 'debug');
+    return mediaDecision;
+  }
+
+  // Если решение не было принято, но есть информация о sender и complaintCount
+  if (!textDecision && !mediaDecision && report.sender && report.complaintCount > 0) {
+    const senderAnalysisPrompt = `Analyze the following information for potential spam:
+    Sender: ${report.sender}
+    Complaint count: ${report.complaintCount}
+    
+    Consider the sender's name for any indicators of spam (e.g., unusual characters, numbers, or promotional content in the name).
+    Factor in the complaint count, but remember it's not definitive proof of spam.
+    
+    Provide a classification (1 for spam, 0 for not spam).
+    Output format: [classification]
+    Example: 1 or 0`;
+
+    const senderAnalysisResponse = await retryGptRequest(async () => {
+      return openai.chat.completions.create({
+        model: "gpt-4o-mini-2024-07-18",
+        messages: [
+          { role: "system", content: gptPrompt },
+          { role: "user", content: senderAnalysisPrompt }
+        ],
+        max_tokens: 1,
+        temperature: 0.1,
+      });
+    });
+
+    const senderAnalysisContent = senderAnalysisResponse.choices[0]?.message?.content?.trim();
+    if (senderAnalysisContent === '0' || senderAnalysisContent === '1') {
+      return {
+        isSpam: Number(senderAnalysisContent),
+        reason: Number(senderAnalysisContent) === 1 ? "GPT sender analysis: potential spam" : "GPT sender analysis: likely not spam",
+        checkType: 'gpt'
+      };
+    }
+  }
+
+  // If no decision was made, log the issue and return null
+  log(`GPT check did not make a decision for report ${report.reportId}`, 'warn');
+  return null;
+
+} catch (error) {
+  logErr('gptCheck', error);
+  log(`GPT check failed for report ${report.reportId}`, 'error');
+  throw error;
+}
 }
 
 async function retryGptRequest<T>(request: () => Promise<T>, maxRetries: number = 3): Promise<T> {
@@ -955,6 +829,20 @@ async function isGPT4VisionCompatible(mediaHash: string): Promise<boolean> {
   const GPT4VisionCompatibleMedia = ['photo', 'sticker', 'gif', 'video', 'videonote'];
   const mediaType = mediaHash.split(':')[0];
   return GPT4VisionCompatibleMedia.includes(mediaType);
+}
+
+async function getMediaFromRedis(mediaKey: string): Promise<Buffer | null> {
+  try {
+    const mediaBase64 = await redis.get(mediaKey);
+    if (mediaBase64) {
+      log(`Retrieved media from Redis for key: ${mediaKey}`, 'debug');
+      return Buffer.from(mediaBase64, 'base64');
+    }
+  } catch (error) {
+    logErr('getMediaFromRedis', error);
+  }
+  log(`No media found in Redis for key: ${mediaKey}`, 'debug');
+  return null;
 }
 
 // Helper functions
@@ -1063,7 +951,6 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
 async function saveCache(report: Report): Promise<void> {
   try {
     const key = `report:${report.reportId}`;
-    reportCache.set(key, report);
     await redis.set(key, JSON.stringify(report), 'EX', 86400); // 24 hours expiry
     log(`Report ${report.reportId} saved to cache`, 'debug');
   } catch (error) {
@@ -1074,23 +961,17 @@ async function saveCache(report: Report): Promise<void> {
 async function checkCache(reportId: string): Promise<SpamDecision | null> {
   try {
     const key = `report:${reportId}`;
-    let cachedReport = reportCache.get(key);
-    
-    if (!cachedReport) {
-      const cachedData = await redis.get(key);
-      if (cachedData) {
-        cachedReport = JSON.parse(cachedData) as Report;
-        reportCache.set(key, cachedReport);
+    const cachedReport = await redis.get(key);
+    if (cachedReport) {
+      const report = JSON.parse(cachedReport) as Report;
+      if (report.isSpam !== -1) {
+        log(`Cache hit for report ${reportId}`, 'debug');
+        return {
+          isSpam: report.isSpam,
+          reason: report.reason || 'Cached decision',
+          checkType: 'default'
+        };
       }
-    }
-
-    if (cachedReport && cachedReport.isSpam !== -1) {
-      log(`Cache hit for report ${reportId}`, 'debug');
-      return {
-        isSpam: cachedReport.isSpam,
-        reason: cachedReport.reason || 'Cached decision',
-        checkType: 'default'
-      };
     }
   } catch (error) {
     logErr('checkCache', error);
@@ -1267,72 +1148,103 @@ async function getCacheSize(): Promise<number> {
   }
 }
 
+async function limitCacheSize() {
+  try {
+    const currentSize = await getCacheSize();
+    log(`Current cache size: ${currentSize.toFixed(2)} MB`, 'debug');
+
+    if (currentSize > MAX_CACHE_SIZE_MB) {
+      const keysToRemove = Math.ceil((currentSize - MAX_CACHE_SIZE_MB) / 0.1); // Assuming average report size of 0.1 MB
+      const keys = await redis.keys('report:*');
+      const oldestKeys = keys.sort().slice(0, keysToRemove);
+      
+      if (oldestKeys.length > 0) {
+        await redis.del(...oldestKeys);
+        log(`Removed ${oldestKeys.length} oldest keys from Redis cache`, 'info');
+      }
+    }
+  } catch (error) {
+    logErr('limitCacheSize', error);
+  }
+}
+
 // Media handling functions
 async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null): Promise<string> {
   if (!media) return 'empty';
   
-  const mediaType = media.className;
-  let hashContent = '';
-
-  switch (mediaType) {
-    case 'MessageMediaEmpty':
-      return 'empty';
-    case 'MessageMediaPhoto':
-      hashContent = `photo:${(media as Api.MessageMediaPhoto).photo?.id || 'unknown'}`;
-      break;
-    case 'MessageMediaDocument':
-      const document = (media as Api.MessageMediaDocument).document;
-      if (document instanceof Api.Document) {
-        const fileType = document.mimeType.split('/')[0];
-        const attribute = document.attributes.find(attr => 
-          attr instanceof Api.DocumentAttributeSticker ||
-          attr instanceof Api.DocumentAttributeAnimated ||
-          attr instanceof Api.DocumentAttributeVideo
-        );
-        
-        if (attribute instanceof Api.DocumentAttributeSticker) {
-          hashContent = `sticker:${document.id}`;
-        } else if (attribute instanceof Api.DocumentAttributeAnimated) {
-          hashContent = `gif:${document.id}`;
-        } else if (attribute instanceof Api.DocumentAttributeVideo) {
-          hashContent = attribute.roundMessage ? `videonote:${document.id}` : `video:${document.id}`;
-        } else {
-          hashContent = `${fileType}:${document.id}`;
-        }
-      }
-      break;
-    case 'MessageMediaWebPage':
-      const webpage = (media as Api.MessageMediaWebPage).webpage;
-      if (webpage instanceof Api.WebPage) {
-        hashContent = `webpage:${webpage.url}`;
-      } else if (webpage instanceof Api.WebPageEmpty) {
-        hashContent = `webpage:empty`;
-      } else if (webpage instanceof Api.WebPageNotModified) {
-        hashContent = `webpage:not_modified`;
-      } else {
-        hashContent = `webpage:unknown`;
-      }
-      break;
-    case 'MessageMediaStory':
-      hashContent = `story:${(media as Api.MessageMediaStory).id}`;
-      break;
-    case 'ReplyInlineMarkup':
-      hashContent = processInlineMarkup(media as Api.ReplyInlineMarkup);
-      break;
-    default:
-      hashContent = `unknown:${mediaType}`;
+  if (media instanceof Api.MessageMediaEmpty) {
+    log('Media type: MessageMediaEmpty', 'debug');
+    return 'empty';
   }
-
-  return createHash('md5').update(hashContent).digest('hex');
+  
+  if (media instanceof Api.MessageMediaPhoto) {
+    log('Media type: MessageMediaPhoto', 'debug');
+    return `photo:${media.photo?.id || 'unknown'}`;
+  }
+  
+  if (media instanceof Api.MessageMediaDocument) {
+    const document = media.document;
+    if (document instanceof Api.Document) {
+      const fileType = document.mimeType.split('/')[0];
+      const attribute = document.attributes.find(attr => 
+        attr instanceof Api.DocumentAttributeSticker ||
+        attr instanceof Api.DocumentAttributeAnimated ||
+        attr instanceof Api.DocumentAttributeVideo
+      );
+      
+      if (attribute instanceof Api.DocumentAttributeSticker) {
+        log('Media type: Sticker', 'debug');
+        return `sticker:${document.id}`;
+      }
+      if (attribute instanceof Api.DocumentAttributeAnimated) {
+        log('Media type: GIF', 'debug');
+        return `gif:${document.id}`;
+      }
+      if (attribute instanceof Api.DocumentAttributeVideo) {
+        log(`Media type: ${attribute.roundMessage ? 'Video Note' : 'Video'}`, 'debug');
+        return attribute.roundMessage ? `videonote:${document.id}` : `video:${document.id}`;
+      }
+      
+      log(`Media type: ${fileType}`, 'debug');
+      return `${fileType}:${document.id}`;
+    }
+  }
+  
+  if (media instanceof Api.MessageMediaWebPage) {
+    log('Media type: MessageMediaWebPage', 'debug');
+    if (media.webpage instanceof Api.WebPage) {
+      return `webpage:${media.webpage.url}`;
+    } else if (media.webpage instanceof Api.WebPageEmpty) {
+      return `webpage:empty`;
+    } else if (media.webpage instanceof Api.WebPageNotModified) {
+      return `webpage:not_modified`;
+    }
+    return `webpage:unknown`;
+  }
+  
+  if (media instanceof Api.MessageMediaStory) {
+    log('Media type: MessageMediaStory', 'debug');
+    return `story:${media.id}`;
+  }
+  
+  if (media instanceof Api.ReplyInlineMarkup) {
+    log('Media type: ReplyInlineMarkup', 'debug');
+    return processInlineMarkup(media);
+  }
+  
+  log(`Unknown media type: ${media.className}`, 'debug');
+  return `unknown:${media.className}`;
 }
 
 function processInlineMarkup(markup: Api.ReplyInlineMarkup): string {
   for (const row of markup.rows) {
     for (const button of row.buttons) {
       if (button instanceof Api.KeyboardButtonUrl) {
+        log(`Inline URL button found: ${button.url}`, 'debug');
         return `url_button:${button.url}`;
       }
       if (button instanceof Api.KeyboardButtonCallback) {
+        log('Inline callback button found', 'debug');
         return `callback_button:${button.data.toString('hex')}`;
       }
     }
@@ -1340,26 +1252,28 @@ function processInlineMarkup(markup: Api.ReplyInlineMarkup): string {
   return 'inline_keyboard:generic';
 }
 
-async function getMediaFromRedis(mediaKey: string): Promise<Buffer | null> {
+async function downloadAndStoreMedia(media: Api.TypeMessageMedia, mediaKey: string): Promise<boolean> {
   try {
-    const cachedMedia = mediaCache.get(mediaKey);
-    if (cachedMedia) {
-      log(`Retrieved media from cache for key: ${mediaKey}`, 'debug');
-      return cachedMedia;
-    }
-
-    const mediaBase64 = await redis.get(mediaKey);
-    if (mediaBase64) {
-      const buffer = Buffer.from(mediaBase64, 'base64');
-      mediaCache.set(mediaKey, buffer);
-      log(`Retrieved media from Redis for key: ${mediaKey}`, 'debug');
-      return buffer;
+    if (media instanceof Api.MessageMediaPhoto && media.photo) {
+      const buffer = await client.downloadMedia(media);
+      if (buffer) {
+        await redis.set(mediaKey, buffer.toString('base64'), 'EX', MEDIA_EXPIRY);
+        log(`Downloaded and stored photo media: ${mediaKey}`, 'debug');
+        return true;
+      }
+    } else if (media instanceof Api.MessageMediaDocument && media.document) {
+      const buffer = await client.downloadMedia(media);
+      if (buffer) {
+        await redis.set(mediaKey, buffer.toString('base64'), 'EX', MEDIA_EXPIRY);
+        log(`Downloaded and stored document media: ${mediaKey}`, 'debug');
+        return true;
+      }
     }
   } catch (error) {
-    logErr('getMediaFromRedis', error);
+    logErr('downloadAndStoreMedia', error);
   }
-  log(`No media found for key: ${mediaKey}`, 'debug');
-  return null;
+  log(`Failed to download and store media: ${mediaKey}`, 'warn');
+  return false;
 }
 
 // Next command scheduling
@@ -1367,25 +1281,37 @@ async function scheduleNextCommand() {
   if (nextCommandTimeout) {
     clearTimeout(nextCommandTimeout);
   }
-
-  const now = Date.now();
-  const timeSinceLastCommand = now - lastCommandTime;
-  
-  // Адаптивно корректируем время задержки
-  if (timeSinceLastCommand < averageProcessingTime) {
-    averageProcessingTime = Math.max(averageProcessingTime * 0.9, 1000); // Уменьшаем, но не ниже 1 секунды
-  } else {
-    averageProcessingTime = Math.min(averageProcessingTime * 1.1, 10000); // Увеличиваем, но не выше 10 секунд
-  }
-
   nextCommandTimeout = setTimeout(async () => {
     if (autoMode) {
-      lastCommandTime = Date.now();
       await sendToBot("/next 2");
     }
-  }, averageProcessingTime);
+  }, 5000); // 5 seconds delay before sending the next command
+}
 
-  log(`Next command scheduled in ${averageProcessingTime}ms`, 'debug');
+function scheduleDelayedProcessing(sysMsg: BufferItem, checkMsg: BufferItem) {
+  if (sysMsg.reportId) {
+    setTimeout(() => {
+      processReport({
+        reportId: sysMsg.reportId!,
+        messageContent: [checkMsg.content],
+        mediaHashes: checkMsg.mediaHashes || [],
+        complaintCount: 0,
+        source: '',
+        sender: '',
+        isSpam: -1,
+        timestamp: sysMsg.timestamp,
+        replyTo: checkMsg.replyTo,
+        ...parseSysMessage(sysMsg.content)
+      });
+      
+      messageBuffer = messageBuffer.filter(msg => 
+        !(msg.type === 'sys' && msg.reportId === sysMsg.reportId) &&
+        !(msg.type === 'check' && msg === checkMsg)
+      );
+    }, 1000);
+  } else {
+    log('Cannot schedule delayed processing: sysMsg.reportId is undefined', 'error');
+  }
 }
 
 // Admin functions
@@ -1571,7 +1497,8 @@ async function initDB() {
         ) THEN
           ALTER TABLE reports ADD CONSTRAINT unique_report_id_created_at UNIQUE (report_id, created_at);
         END IF;
-      END $$;`);
+      END $$;
+    `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_reports_is_spam_created_at ON reports (is_spam, created_at);
