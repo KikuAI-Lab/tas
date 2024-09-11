@@ -14,7 +14,6 @@ import Redis from 'ioredis';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import pkg from 'pg';
-import fs from 'fs';
 
 dotenv.config();
 
@@ -108,7 +107,6 @@ interface Report {
   sender: string;
   isSpam: number;
   reason?: string;
-  confidence?: number;
   timestamp: number;
   decisionSent?: boolean;
   isOpen?: boolean;
@@ -118,7 +116,6 @@ interface Report {
 type SpamDecision = {
   isSpam: number;
   reason: string;
-  confidence: number;
   checkType: 'fast' | 'gpt' | 'gpt4' | 'default';
 };
 
@@ -301,10 +298,10 @@ async function handleCheck(event: NewMessageEvent) {
             }
           }
         }
-      }
 
-      mediaKey = `media:${message.media instanceof Api.MessageMediaPhoto ? message.media.photo?.id : (message.media instanceof Api.MessageMediaDocument ? message.media.document?.id : 'unknown')}`;
-      log(`Media key generated: ${mediaKey}`, 'debug');
+        mediaKey = `media:${message.media instanceof Api.MessageMediaPhoto ? message.media.photo?.id : (message.media instanceof Api.MessageMediaDocument ? message.media.document?.id : 'unknown')}`;
+        log(`Media key generated: ${mediaKey}`, 'debug');
+      }
     }
 
     if (message.replyMarkup) {
@@ -445,7 +442,7 @@ async function processReport(report: Report): Promise<void> {
       return;
     }
 
-    if (report.mediaHashes.length > 0) {
+    if (report.messageContent.length === 0 && report.mediaHashes.length > 0) {
       const checkMsg = messageBuffer.find(msg => msg.type === 'check' && msg.replyTo === report.replyTo);
       if (checkMsg && checkMsg.mediaKey) {
         const media = await getMediaFromMessage(report.replyTo!);
@@ -461,7 +458,7 @@ async function processReport(report: Report): Promise<void> {
       return;
     }
 
-    decision = { isSpam: 0, reason: "No spam detected", confidence: 50, checkType: 'default' };
+    decision = { isSpam: 0, reason: "No spam detected", checkType: 'default' };
     await applyDecision(report, decision);
 
   } catch (error) {
@@ -494,25 +491,24 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   
   const hasStory = report.mediaHashes.some(hash => hash.startsWith('story:'));
   
-  const hasPhoto = report.mediaHashes.some(hash => hash.startsWith('photo:'));
+  const hasMediaWithComplaints = report.mediaHashes.length > 0 && report.complaintCount > 2;
 
-  if ((hasLinksOrContacts && report.complaintCount > 2) || 
+  if (hasLinksOrContacts || 
       hasDangerousFile || 
       hasInlineKeyboard || 
       hasStory || 
-      (hasPhoto && report.complaintCount > 2)) {
+      hasMediaWithComplaints) {
     let reason = "Fast check:";
-    if (hasLinksOrContacts && report.complaintCount > 2) reason += " Links/contacts with >2 complaints";
+    if (hasLinksOrContacts) reason += " Links/contacts detected";
     if (hasDangerousFile) reason += " Dangerous file detected";
     if (hasInlineKeyboard) reason += " Inline keyboard detected";
     if (hasStory) reason += " Story detected";
-    if (hasPhoto && report.complaintCount > 2) reason += " Photo with >2 complaints";
+    if (hasMediaWithComplaints) reason += " Media with >2 complaints";
 
     log(`Fast check detected spam for report ${report.reportId}: ${reason}`, 'debug');
     return { 
       isSpam: 1, 
       reason: reason.trim(), 
-      confidence: 90, 
       checkType: 'fast'
     };
   }
@@ -528,7 +524,7 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
       return messages[0];
     }, 3, 1000);
 
-    if (message && message.media) {
+    if (message && message instanceof Api.Message && message.media) {
       log(`Retrieved media from message ${messageId}`, 'debug');
       return message.media;
     }
@@ -549,15 +545,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
   const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Use semantic analysis to understand the context, intent, and underlying meaning of messages. Consider all aspects, including content, context, metadata, and visual elements. Provide a definitive answer: either 1 (spam) or 0 (not spam).
-  
-  Semantic Analysis Guidelines:
-  1. Analyze the overall meaning and intent of the message, not just individual words.
-  2. Consider tone, sentiment, and implied meanings in the context of the conversation.
-  3. Identify relationships between concepts in the message to understand its purpose.
-  4. Evaluate the coherence of the message within the broader conversation.
-  5. Detect subtle patterns or inconsistencies that may indicate deceptive content.
-  6. Assess the relevance of the message to the group's theme and ongoing discussion.
-  
+
   Spam Indicators (Prioritized):
   
   1. High Priority (Strong indicators of spam):
@@ -602,39 +590,14 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   - Bot commands (starting with "/"), unless clearly misused
   - Warnings about scams or spam
   
-  Special Cases:
-  - Political content: Generally not spam unless promoting unrelated products/services
-  - Short messages or emojis: Evaluate in context of user's behavior pattern
-  - Profanity or insults: Not automatically spam, consider discussion context
-  - Financial discussions: Scrutinize carefully, but don't auto-classify as spam
-  - Adult content: Consider group theme and context before classifying
-  
-  Additional Guidelines:
-  - Messages in non-Latin scripts (e.g., Chinese, Japanese) require careful scrutiny, especially if out of context
-  - Complaint count increases suspicion but is not definitive proof of spam
-  - Phrases indicating availability for meetings may be spam in certain contexts
-  - Consider the sender's previous messages and behavior pattern if available
-  - The presence of "Bot links:", "Channel links:", "User links:", or "Group links:" increases suspicion
-  
-  Additional Semantic Considerations:
-  - Look for semantic inconsistencies that might indicate automated or bulk messaging
-  - Analyze the semantic similarity between the message and known spam patterns
-  - Consider the semantic distance between the message topic and the group's usual discussions
-  - Evaluate the semantic coherence of user responses in the conversation flow
-  
-  ALWAYS answer ONLY "0" for not spam, or "1" for spam.
+  Remember to ALWAYS provide ONLY a definitive answer ("0" for not spam or "1" for spam). If uncertain, classify based on the most likely scenario given the available information and guidelines.
   
   Your analysis:`;
 
   const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image or media content for potential spam. Consider visual elements, text within images, and the context of the media in the group. Provide a definitive classification: 1 (spam) or 0 (not spam).
-  
-  Visual Analysis Guidelines:
-  1. Analyze the overall composition and purpose of the image in the context of a Telegram group.
-  2. Identify and interpret any text overlays, logos, or branding elements.
-  3. Assess the presence and nature of QR codes, barcodes, or other encoded information.
-  4. Evaluate the image for signs of manipulation or artificial generation.
-  5. Consider the emotional impact and intended audience of the visual content.
-  6. Analyze any graphs, charts, or infographics for misleading information.
+
+  Output format: [classification]
+  Example: 1 or 0
   
   Spam Indicators (Prioritized):
   
@@ -658,31 +621,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
      - Memes or humorous images that could be used to mask promotional content
      - Visuals that are significantly lower or higher quality than typical group content
   
-  Context Considerations:
-  - Evaluate the relevance of the image to the group's theme and recent discussions
-  - Consider cultural context and potential cultural references in the image
-  - Assess whether the image is a response to a previous message or a standalone post
-  - Factor in the sender's history and reputation in the group, if available
-  
-  Not Spam:
-  - Genuine personal photos or images relevant to ongoing discussions
-  - News-related images or infographics from reputable sources
-  - Memes or humorous images that align with the group's culture and don't promote anything
-  - Screenshots sharing legitimate information or troubleshooting steps
-  - Art or creative works shared in appropriate contexts
-  
-  Special Cases:
-  - Political or activist imagery: Generally not spam unless clearly promoting unrelated products/services
-  - Adult content: Consider the group's theme and rules before classifying
-  - Brand logos or product images: May be legitimate in certain discussion contexts
-  
-  Additional Semantic Considerations for Visual Content:
-  - Analyze the semantic relationship between visual elements and any accompanying text
-  - Consider the semantic consistency of the image with the group's typical content
-  - Evaluate the emotional tone conveyed by the image and its appropriateness for the group
-  - Assess the visual rhetoric and how it might be used to influence viewers
-  
-  ALWAYS answer ONLY "0" for not spam, or "1" for spam.
+  Remember to ALWAYS provide ONLY a definitive answer ("0" for not spam or "1" for spam). If uncertain, classify based on the most likely scenario given the available information and guidelines.
   
   Your analysis:`;
 
@@ -705,22 +644,20 @@ try {
   let mediaDecision: SpamDecision | null = null;
 
   // Проверка на наличие текстового содержания или только метаданных
-  if (report.messageContent.length > 0 || (report.sender && report.complaintCount > 0)) {
+  if (report.messageContent.some(content => content.trim() !== '') || (report.sender && report.complaintCount > 0)) {
     const textResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: textMessages,
-      max_tokens: 5,
+      max_tokens: 1,
       temperature: 0.1,
     });
 
     const textContent = textResponse.choices[0]?.message?.content?.trim();
     if (textContent) {
-      const [classification, confidence] = textContent.split(',');
-      if (classification === '0' || classification === '1') {
+      if (textContent === '0' || textContent === '1') {
         textDecision = {
-          isSpam: Number(classification),
-          reason: Number(classification) === 1 ? "GPT: spam" : "GPT: not spam",
-          confidence: Number(confidence) || 50,
+          isSpam: Number(textContent),
+          reason: Number(textContent) === 1 ? "GPT: spam" : "GPT: not spam",
           checkType: 'gpt'
         };
       } else {
@@ -729,27 +666,23 @@ try {
         const gpt4Response = await openai.chat.completions.create({
           model: "gpt-4o-2024-08-06",
           messages: textMessages,
-          max_tokens: 5,
+          max_tokens: 1,
           temperature: 0.1,
         });
 
         const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
-        if (gpt4Content) {
-          const [gpt4Classification, gpt4Confidence] = gpt4Content.split(',');
-          if (gpt4Classification === '0' || gpt4Classification === '1') {
-            textDecision = {
-              isSpam: Number(gpt4Classification),
-              reason: Number(gpt4Classification) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
-              confidence: Number(gpt4Confidence) || 50,
-              checkType: 'gpt4'
-            };
-          }
+        if (gpt4Content === '0' || gpt4Content === '1') {
+          textDecision = {
+            isSpam: Number(gpt4Content),
+            reason: Number(gpt4Content) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
+            checkType: 'gpt4'
+          };
         }
       }
     }
   }
 
-  if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0) {
+  if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0 && report.messageContent.length === 0) {
     for (const mediaHash of report.mediaHashes) {
       if (await isGPT4VisionCompatible(mediaHash)) {
         const mediaKey = `media:${mediaHash.split(':')[1]}`;
@@ -765,7 +698,7 @@ try {
           });
 
           const mediaResponse = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
+            model: "gpt-4o",
             messages: mediaMessages,
             max_tokens: 1,
             temperature: 0.2,
@@ -773,12 +706,10 @@ try {
 
           const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
           log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
-          if (mediaContent) {
-            const [classification, confidence] = mediaContent.split(',');
+          if (mediaContent === '0' || mediaContent === '1') {
             mediaDecision = {
-              isSpam: classification === '1' ? 1 : 0,
-              reason: `GPT media: ${classification === '1' ? 'spam' : 'not spam'}`,
-              confidence: Number(confidence) || 50,
+              isSpam: Number(mediaContent),
+              reason: `GPT media: ${Number(mediaContent) === 1 ? 'spam' : 'not spam'}`,
               checkType: 'gpt'
             };
             if (mediaDecision.isSpam === 1) {
@@ -791,8 +722,10 @@ try {
   }
 
   if (textDecision && mediaDecision) {
-    // If both text and media decisions are available, use the one with higher confidence or prefer spam classification
-    return textDecision.confidence >= mediaDecision.confidence ? textDecision : mediaDecision;
+    // If both text and media decisions are available, prefer spam classification
+    return textDecision.isSpam === 1 || mediaDecision.isSpam === 1 ? 
+      (textDecision.isSpam === 1 ? textDecision : mediaDecision) : 
+      (textDecision.isSpam === 0 ? textDecision : mediaDecision);
   } else if (textDecision) {
     log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
     return textDecision;
@@ -810,31 +743,27 @@ try {
     Consider the sender's name for any indicators of spam (e.g., unusual characters, numbers, or promotional content in the name).
     Factor in the complaint count, but remember it's not definitive proof of spam.
     
-    Provide a classification (1 for spam, 0 for not spam) and a confidence score (0-100).
-    Output format: [classification],[confidence]
-    Example: 1,70 or 0,60`;
+    Provide a classification (1 for spam, 0 for not spam).
+    Output format: [classification]
+    Example: 1 or 0`;
 
     const senderAnalysisResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini-2024-07-18",
       messages: [
         { role: "system", content: gptPrompt },
         { role: "user", content: senderAnalysisPrompt }
       ],
-      max_tokens: 5,
+      max_tokens: 1,
       temperature: 0.1,
     });
 
     const senderAnalysisContent = senderAnalysisResponse.choices[0]?.message?.content?.trim();
-    if (senderAnalysisContent) {
-      const [classification, confidence] = senderAnalysisContent.split(',');
-      if (classification === '0' || classification === '1') {
-        return {
-          isSpam: Number(classification),
-          reason: Number(classification) === 1 ? "GPT sender analysis: potential spam" : "GPT sender analysis: likely not spam",
-          confidence: Number(confidence) || 50,
-          checkType: 'gpt'
-        };
-      }
+    if (senderAnalysisContent === '0' || senderAnalysisContent === '1') {
+      return {
+        isSpam: Number(senderAnalysisContent),
+        reason: Number(senderAnalysisContent) === 1 ? "GPT sender analysis: potential spam" : "GPT sender analysis: likely not spam",
+        checkType: 'gpt'
+      };
     }
   }
 
@@ -948,7 +877,6 @@ async function applyDecision(report: Report, decision: SpamDecision): Promise<vo
     ...report,
     isSpam: decision.isSpam,
     reason: decision.reason,
-    confidence: decision.confidence,
     isOpen: false,
     decisionSent: true
   };
@@ -993,7 +921,6 @@ async function checkCache(reportId: string): Promise<SpamDecision | null> {
         return {
           isSpam: report.isSpam,
           reason: report.reason || 'Cached decision',
-          confidence: report.confidence || 100,
           checkType: 'default'
         };
       }
@@ -1360,7 +1287,6 @@ async function generateCacheCsvReport(reports: Report[]): Promise<string> {
     header: [
       {id: 'reportId', title: 'Report ID'},
       {id: 'isSpam', title: 'Is Spam'},
-      {id: 'confidence', title: 'Confidence'},
       {id: 'reason', title: 'Reason'},
       {id: 'timestamp', title: 'Timestamp'},
       {id: 'source', title: 'Source'},
@@ -1397,7 +1323,6 @@ async function initDB() {
         sender TEXT NOT NULL,
         is_spam INTEGER,
         reason TEXT,
-        confidence FLOAT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       ) PARTITION BY RANGE (created_at);
     `);
@@ -1493,14 +1418,13 @@ async function saveRedisToPostgres() {
             report.sender,
             report.isSpam,
             report.reason,
-            report.confidence,
             new Date(report.timestamp)
           ];
         });
 
         const query = `
-          INSERT INTO reports (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, confidence, created_at)
-          VALUES ${values.map((_, index) => `($${index * 10 + 1}, $${index * 10 + 2}, $${index * 10 + 3}, $${index * 10 + 4}, $${index * 10 + 5}, $${index * 10 + 6}, $${index * 10 + 7}, $${index * 10 + 8}, $${index * 10 + 9}, $${index * 10 + 10})`).join(', ')}
+          INSERT INTO reports (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, created_at)
+          VALUES ${values.map((_, index) => `($${index * 9 + 1}, $${index * 9 + 2}, $${index * 9 + 3}, $${index * 9 + 4}, $${index * 9 + 5}, $${index * 9 + 6}, $${index * 9 + 7}, $${index * 9 + 8}, $${index * 9 + 9})`).join(', ')}
           ON CONFLICT (report_id, created_at) DO UPDATE SET
           message_content = EXCLUDED.message_content,
           media_hashes = EXCLUDED.media_hashes,
@@ -1508,8 +1432,7 @@ async function saveRedisToPostgres() {
           source = EXCLUDED.source,
           sender = EXCLUDED.sender,
           is_spam = EXCLUDED.is_spam,
-          reason = EXCLUDED.reason,
-          confidence = EXCLUDED.confidence
+          reason = EXCLUDED.reason
         `;
 
         await client.query(query, values.flat());
@@ -1540,7 +1463,6 @@ async function generateCsvReport(): Promise<string> {
         sender,
         is_spam,
         reason,
-        confidence,
         created_at
       FROM reports
       WHERE created_at >= NOW() - INTERVAL '7 days'
@@ -1558,7 +1480,6 @@ async function generateCsvReport(): Promise<string> {
         {id: 'sender', title: 'Sender'},
         {id: 'is_spam', title: 'Is Spam'},
         {id: 'reason', title: 'Reason'},
-        {id: 'confidence', title: 'Confidence'},
         {id: 'created_at', title: 'Created At'}
       ]
     });
@@ -1636,7 +1557,6 @@ async function setupHandlers() {
       await handleAdd(event);
     }
   }, new NewMessage({ fromUsers: [botUserId], incoming: true, forwards: false, outgoing: false }));
-
 }
 
 // System health check
