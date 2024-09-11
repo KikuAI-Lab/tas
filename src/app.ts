@@ -121,7 +121,7 @@ type SpamDecision = {
   isSpam: number;
   reason: string;
   confidence: number;
-  checkType: 'fast' | 'gpt' | 'default';
+  checkType: 'fast' | 'gpt' | 'gpt4' | 'default';
 };
 
 type UndoTimer = {
@@ -550,217 +550,315 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
 async function gptCheck(report: Report): Promise<SpamDecision | null> {
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
-  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Consider all aspects, including content, context, metadata, and visual elements. Be cautious and conservative in your assessment to minimize false positives. You must provide a definitive answer: either 1 (spam) or 0 (not spam).
+  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Use semantic analysis to understand the context, intent, and underlying meaning of messages. Consider all aspects, including content, context, metadata, and visual elements. Provide a definitive answer: either 1 (spam) or 0 (not spam), followed by a confidence score from 0 to 100.
 
-Guidelines for spam classification:
-1. Commercial Spam:
-   - Unsolicited ads, subtle marketing
-   - Self-promotion of unrelated channels/groups
-   - Disguised promotions (e.g., informative messages with channel links)
-2. Scams/Financial:
-   - Phishing, fake giveaways, get-rich-quick schemes
-   - Unrealistic financial promises, urgent decisions
-   - Suspicious cryptocurrency/airdrop mentions
-   - Offers of quick money or short-term "jobs"
-3. Deceptive/Adult Content:
-   - Impersonation, false promises
-   - Explicit content, unsolicited services
-   - Subtle invitations for private meetings, coded language for sexual services
-   - Requests for private photos/information
-   - Encrypted messages like "GV、TN、TF、CP 指數無限賣出" (likely adult content sales)
-   - Phrases like "я свободна" or "available" in context of potential sexual services
-   - Suggestive or flirtatious messages that seem out of context
-   - Euphemisms or innuendos commonly used to disguise sexual content
-4. Unwanted Content:
-   - Chain messages, excessive invites
-   - Unsolicited job offers, surveys, personal requests
-   - Requests to write in private messages (e.g., "write + in private") are often associated with spam or scams
-5. Suspicious Behavior:
-   - Bot-like messages, repetitive content
-   - Attempts to move conversations to private channels
-   - Excessive emojis, especially at line starts
-6. Harmful Content:
-   - Incitement to violence/illegal activities
-   - Sharing others' personal information
-7. Any message with clear spam indicators
+  Output format: [classification],[confidence]
+  Example: 1,85 or 0,70
+  
+  Semantic Analysis Guidelines:
+  1. Analyze the overall meaning and intent of the message, not just individual words.
+  2. Consider tone, sentiment, and implied meanings in the context of the conversation.
+  3. Identify relationships between concepts in the message to understand its purpose.
+  4. Evaluate the coherence of the message within the broader conversation.
+  5. Detect subtle patterns or inconsistencies that may indicate deceptive content.
+  6. Assess the relevance of the message to the group's theme and ongoing discussion.
+  
+  Spam Indicators (Prioritized):
+  
+  1. High Priority (Strong indicators of spam):
+     - Unsolicited commercial content or subtle marketing
+     - Phishing attempts, fake giveaways, unrealistic financial promises
+     - Explicit sexual content or coded invitations for sexual services
+     - Attempts to move conversations to private channels or other platforms
+     - Sharing personal information of others without consent
+     - Messages with over 500 consecutive identical symbols or emojis
+     - Clear incitement to violence or illegal activities
+  
+  2. Medium Priority (Suspicious, requires context):
+     - Self-promotion of unrelated channels/groups
+     - Cryptocurrency/airdrop mentions, especially with urgent calls to action
+     - Job offers, especially those promising quick or easy money
+     - Excessive use of emojis, especially at line starts
+     - Presence of multiple links, especially to bots or channels
+     - Non-Latin script used out of cultural context
+     - Encrypted or coded messages resembling adult content sales
+     - Requests to write in private messages (e.g., "write + in private")
+  
+  3. Low Priority (Potential red flags, heavily context-dependent):
+     - Off-topic messages for the group's theme
+     - Use of common spam keywords (e.g., 'earnings', 'investments')
+     - Short, repetitive messages or single character responses
+     - Sender names containing links or solicitations
+     - Higher complaint counts
+  
+  Context Considerations:
+  - Evaluate messages within the conversation flow and group's theme
+  - Consider cultural and linguistic context, including sender's country flag
+  - Assess relevance to ongoing discussions or group activities
+  - Factor in complaint counts, but don't rely on them exclusively
+  - The group's purpose and typical content should guide your judgment
+  
+  Not Spam:
+  - Normal interactions, casual conversations, jokes
+  - Legitimate information sharing, news, educational content
+  - Expressive language, including profanity or emotional outbursts
+  - Cultural content, local slang, region-specific discussions
+  - Political discussions or criticisms, even if aggressive
+  - Bot commands (starting with "/"), unless clearly misused
+  - Warnings about scams or spam
+  
+  Special Cases:
+  - Political content: Generally not spam unless promoting unrelated products/services
+  - Short messages or emojis: Evaluate in context of user's behavior pattern
+  - Profanity or insults: Not automatically spam, consider discussion context
+  - Financial discussions: Scrutinize carefully, but don't auto-classify as spam
+  - Adult content: Consider group theme and context before classifying
+  
+  Additional Guidelines:
+  - Messages in non-Latin scripts (e.g., Chinese, Japanese) require careful scrutiny, especially if out of context
+  - Complaint count increases suspicion but is not definitive proof of spam
+  - Phrases indicating availability for meetings may be spam in certain contexts
+  - Consider the sender's previous messages and behavior pattern if available
+  - The presence of "Bot links:", "Channel links:", "User links:", or "Group links:" increases suspicion
+  
+  Additional Semantic Considerations:
+  - Look for semantic inconsistencies that might indicate automated or bulk messaging
+  - Analyze the semantic similarity between the message and known spam patterns
+  - Consider the semantic distance between the message topic and the group's usual discussions
+  - Evaluate the semantic coherence of user responses in the conversation flow
+  
+  Remember to always provide a definitive answer (0 or 1). If uncertain, classify based on the most likely scenario given the available information, guidelines, and semantic analysis.
+  
+  Your analysis:`;
 
-Not Spam:
-1. Normal interactions (greetings, casual conversation, jokes)
-2. Short messages, single words, numbers, or emojis (unless part of a suspicious pattern)
-3. Questions, replies, opinions, reactions
-4. Legitimate information (relevant news, educational content)
-5. Group-related activities (relevant polls, discussions)
-6. Expressive language (profanity, emotional outbursts, arguments, rudeness, aggression, discrimination, hate speech, insults)
-7. Cultural content (local slang, cultural references)
-8. Warnings about scams/spam
-9. Any message without clear spam indicators
-10. Bot commands (starting with "/"), unless they have 3 or more complaints
-11. Political discussions, especially in Russian or Ukrainian, even if aggressive or insulting
-12. Emotional or exaggerated messages that don't promote products or services
+  const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image or media content for potential spam. Consider visual elements, text within images, and the context of the media in the group. Provide a definitive classification: 1 (spam) or 0 (not spam), followed by a confidence score from 0 to 100.
 
-Key Factors to Consider:
-1. Message content and intent in any language
-2. Presence and nature of links or media
-3. Language tone and message structure
-4. Relevance to typical group conversations
-5. Provided context (complaints, source, sender's country flag)
-6. Cultural and linguistic context
-7. Group's theme and purpose
+  Output format: classification,confidence
+  Example: 1,85 or 0,70
+  
+  Visual Analysis Guidelines:
+  1. Analyze the overall composition and purpose of the image in the context of a Telegram group.
+  2. Identify and interpret any text overlays, logos, or branding elements.
+  3. Assess the presence and nature of QR codes, barcodes, or other encoded information.
+  4. Evaluate the image for signs of manipulation or artificial generation.
+  5. Consider the emotional impact and intended audience of the visual content.
+  6. Analyze any graphs, charts, or infographics for misleading information.
+  
+  Spam Indicators (Prioritized):
+  
+  1. High Priority (Strong indicators of spam):
+     - Explicit promotional content or advertisements unrelated to the group's theme
+     - Visuals containing unrealistic financial promises or get-rich-quick schemes
+     - Sexually explicit imagery or suggestive content inappropriate for the group
+     - Images with excessive branding or watermarks from unrelated sources
+     - Visuals encouraging users to join other groups, channels, or external websites
+     - Screenshots of conversations or apps promoting specific services or products
+  
+  2. Medium Priority (Suspicious, requires context):
+     - Infographics or charts about cryptocurrency or financial opportunities
+     - Images with multiple QR codes or links
+     - Visuals that seem out of place or unrelated to the group's usual content
+     - Stock photos or generic imagery commonly used in spam
+     - Screenshots of social media posts with promotional content
+  
+  3. Low Priority (Potential red flags, heavily context-dependent):
+     - Images with text in a different language than the group's primary language
+     - Memes or humorous images that could be used to mask promotional content
+     - Visuals that are significantly lower or higher quality than typical group content
+  
+  Context Considerations:
+  - Evaluate the relevance of the image to the group's theme and recent discussions
+  - Consider cultural context and potential cultural references in the image
+  - Assess whether the image is a response to a previous message or a standalone post
+  - Factor in the sender's history and reputation in the group, if available
+  
+  Not Spam:
+  - Genuine personal photos or images relevant to ongoing discussions
+  - News-related images or infographics from reputable sources
+  - Memes or humorous images that align with the group's culture and don't promote anything
+  - Screenshots sharing legitimate information or troubleshooting steps
+  - Art or creative works shared in appropriate contexts
+  
+  Special Cases:
+  - Political or activist imagery: Generally not spam unless clearly promoting unrelated products/services
+  - Adult content: Consider the group's theme and rules before classifying
+  - Brand logos or product images: May be legitimate in certain discussion contexts
+  
+  Additional Semantic Considerations for Visual Content:
+  - Analyze the semantic relationship between visual elements and any accompanying text
+  - Consider the semantic consistency of the image with the group's typical content
+  - Evaluate the emotional tone conveyed by the image and its appropriateness for the group
+  - Assess the visual rhetoric and how it might be used to influence viewers
+  
+  Remember to always provide a definitive answer (0 or 1). If uncertain, classify based on the most likely scenario given the available information and guidelines.
+  
+  Your analysis:`;
 
-Important Notes:
-- Normal conversations, including casual chat and emoji usage, are not spam
-- Offensive language or aggression alone are not indicators of spam
-- Messages with high complaint counts should be scrutinized carefully, but complaint count alone is not definitive proof of spam
-- Sharing of links or information is not automatically spam, but context is crucial
-- Be extra cautious with messages offering quick money or short-term "jobs", especially if they mention specific amounts
-- Text with non-Latin characters (e.g., Chinese, Japanese) should be scrutinized more carefully, as it's often suspicious in certain contexts
-- Aggressive political discussions or insults, especially in Russian or Ukrainian, are typically not spam
-- The sender's country flag (provided in the "Sender" field) can offer context for cultural references
-- Any discussions of business or finances are more likely to be spam and should be carefully evaluated
-- Encrypted or coded messages, especially those resembling adult content sales, should be classified as spam
-- Phrases indicating availability for meetings, especially in contexts that suggest sexual services, should be treated as potential spam
-- Pay close attention to subtle sexual innuendos or euphemisms that may indicate hidden adult content
-- Short messages or single characters (like "+") are not spam unless they are part of a clear spam pattern or have a high complaint count
-- Consider the group's theme when evaluating potentially controversial or adult content
-- Political discussions, even if aggressive or containing insults, are generally not spam unless they include clear spam indicators
-- Emotional or exaggerated messages about updates, news, or events are not necessarily spam if they don't promote products or services
+const userPrompt = generateUserPrompt(report);
 
-Classify the information as either spam (1) or not spam (0). Provide a confidence score from 0 to 100, where 100 is absolute certainty.
+const textMessages: Array<ChatCompletionMessageParam> = [
+  { role: "system", content: gptPrompt },
+  { role: "user", content: userPrompt }
+];
 
-Output your response in the following format:
-classification,confidence
+const mediaMessages: Array<ChatCompletionMessageParam> = [
+  { role: "system", content: mediaPrompt },
+];
 
-Example outputs:
-1,95
-0,80
-
-Your analysis:`;
-
-  const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image for potential spam. Focus on visual elements that may indicate unsolicited advertising, promotional content, or affiliate marketing.
-
-Guidelines for image spam classification:
-1. Look for clear visual indicators of commercial spam such as promotional banners, product advertisements, or marketing materials.
-2. Check for text overlays that promote products, services, or websites.
-3. Assess the presence of QR codes or barcodes that may lead to promotional content.
-4. Evaluate any logos or branding elements that seem out of context or overtly commercial.
-5. Consider the overall composition and purpose of the image in the context of a Telegram group.
-6. Be cautious of images that may contain subtle or explicit sexual content.
-7. Pay attention to screenshots of conversations or apps that might be promoting specific services or products.
-
-Classify the image as either spam (1) or not spam (0). Provide a confidence score from 0 to 100, where 100 is absolute certainty.
-
-Output your response in the following format:
-classification,confidence
-
-Your analysis:`;
-
-  const userPrompt = generateUserPrompt(report);
-
-  const textMessages: Array<ChatCompletionMessageParam> = [
-    { role: "system", content: gptPrompt },
-    { role: "user", content: userPrompt }
-  ];
-
-  const mediaMessages: Array<ChatCompletionMessageParam> = [
-    { role: "system", content: mediaPrompt },
-  ];
-
-  log(`GPT userPrompt for report ${report.reportId}:
+log(`GPT userPrompt for report ${report.reportId}:
 ${userPrompt}`, 'debug');
 
-  try {
-    let textDecision: SpamDecision | null = null;
-    let mediaDecision: SpamDecision | null = null;
+try {
+  let textDecision: SpamDecision | null = null;
+  let mediaDecision: SpamDecision | null = null;
 
-    if (report.messageContent.length > 0) {
-      const textResponse = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: textMessages,
-        max_tokens: 5,
-        temperature: 0.1,
-      });
+  // Проверка на наличие текстового содержания или только метаданных
+  if (report.messageContent.length > 0 || (report.sender && report.complaintCount > 0)) {
+    const textResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini-2024-07-18",
+      messages: textMessages,
+      max_tokens: 5,
+      temperature: 0.1,
+    });
 
-      const textContent = textResponse.choices[0]?.message?.content?.trim();
-      if (textContent) {
-        const [classification, confidence] = textContent.split(',');
-        if (classification === '0' || classification === '1') {
-          textDecision = {
-            isSpam: Number(classification),
-            reason: Number(classification) === 1 ? "GPT: spam" : "GPT: not spam",
-            confidence: Number(confidence) || 50,
-            checkType: 'gpt'
-          };
-        } else {
-          log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
-          textDecision = {
-            isSpam: 0,
-            reason: "GPT: inconclusive response",
-            confidence: 50,
-            checkType: 'gpt'
-          };
+    const textContent = textResponse.choices[0]?.message?.content?.trim();
+    if (textContent) {
+      const [classification, confidence] = textContent.split(',');
+      if (classification === '0' || classification === '1') {
+        textDecision = {
+          isSpam: Number(classification),
+          reason: Number(classification) === 1 ? "GPT: spam" : "GPT: not spam",
+          confidence: Number(confidence) || 50,
+          checkType: 'gpt'
+        };
+      } else {
+        log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
+        // If GPT-4o-mini gives an inconclusive response, try with GPT-4o
+        const gpt4Response = await openai.chat.completions.create({
+          model: "gpt-4o-2024-08-06",
+          messages: textMessages,
+          max_tokens: 5,
+          temperature: 0.1,
+        });
+
+        const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
+        if (gpt4Content) {
+          const [gpt4Classification, gpt4Confidence] = gpt4Content.split(',');
+          if (gpt4Classification === '0' || gpt4Classification === '1') {
+            textDecision = {
+              isSpam: Number(gpt4Classification),
+              reason: Number(gpt4Classification) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
+              confidence: Number(gpt4Confidence) || 50,
+              checkType: 'gpt4'
+            };
+          }
         }
       }
     }
+  }
 
-    if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0) {
-      for (const mediaHash of report.mediaHashes) {
-        if (await isGPT4VisionCompatible(mediaHash)) {
-          const mediaKey = `media:${mediaHash.split(':')[1]}`;
-          const mediaBuffer = await getMediaFromRedis(mediaKey);
-          if (mediaBuffer) {
-            log(`Sending media content to GPT for report ${report.reportId}, media hash: ${mediaHash}`, 'debug');
-            const base64Image = mediaBuffer.toString('base64');
-            mediaMessages.push({
-              role: "user",
-              content: [
-                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-              ] as ChatCompletionContentPart[]
-            });
+  if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0) {
+    for (const mediaHash of report.mediaHashes) {
+      if (await isGPT4VisionCompatible(mediaHash)) {
+        const mediaKey = `media:${mediaHash.split(':')[1]}`;
+        const mediaBuffer = await getMediaFromRedis(mediaKey);
+        if (mediaBuffer) {
+          log(`Sending media content to GPT for report ${report.reportId}, media hash: ${mediaHash}`, 'debug');
+          const base64Image = mediaBuffer.toString('base64');
+          mediaMessages.push({
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+            ] as ChatCompletionContentPart[]
+          });
 
-            const mediaResponse = await openai.chat.completions.create({
-              model: "gpt-4o-mini",
-              messages: mediaMessages,
-              max_tokens: 1,
-              temperature: 0.2,
-            });
+          const mediaResponse = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: mediaMessages,
+            max_tokens: 1,
+            temperature: 0.2,
+          });
 
-            const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
-            log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
-            if (mediaContent) {
-              const [classification, confidence] = mediaContent.split(',');
-              mediaDecision = {
-                isSpam: classification === '1' ? 1 : 0,
-                reason: `GPT media: ${classification === '1' ? 'spam' : 'not spam'}`,
-                confidence: Number(confidence) || 50,
-                checkType: 'gpt'
-              };
-              if (mediaDecision.isSpam === 1) {
-                break;
-              }
+          const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
+          log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
+          if (mediaContent) {
+            const [classification, confidence] = mediaContent.split(',');
+            mediaDecision = {
+              isSpam: classification === '1' ? 1 : 0,
+              reason: `GPT media: ${classification === '1' ? 'spam' : 'not spam'}`,
+              confidence: Number(confidence) || 50,
+              checkType: 'gpt'
+            };
+            if (mediaDecision.isSpam === 1) {
+              break;
             }
           }
         }
       }
     }
-
-    if (textDecision && mediaDecision) {
-      // If both text and media decisions are available, use the one with higher confidence or prefer spam classification
-      return textDecision.confidence >= mediaDecision.confidence ? textDecision : mediaDecision;
-    } else if (textDecision) {
-      log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
-      return textDecision;
-    } else if (mediaDecision) {
-      log(`GPT media check decision for report ${report.reportId}: ${JSON.stringify(mediaDecision)}`, 'debug');
-      return mediaDecision;
-    }
-
-    log(`GPT check did not make a decision for report ${report.reportId}`, 'debug');
-    return null;
-  } catch (error) {
-    logErr('gptCheck', error);
-    log(`GPT check failed for report ${report.reportId}`, 'debug');
-    return null;
   }
+
+  if (textDecision && mediaDecision) {
+    // If both text and media decisions are available, use the one with higher confidence or prefer spam classification
+    return textDecision.confidence >= mediaDecision.confidence ? textDecision : mediaDecision;
+  } else if (textDecision) {
+    log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
+    return textDecision;
+  } else if (mediaDecision) {
+    log(`GPT media check decision for report ${report.reportId}: ${JSON.stringify(mediaDecision)}`, 'debug');
+    return mediaDecision;
+  }
+
+  // Если решение не было принято, но есть информация о sender и complaintCount
+  if (!textDecision && !mediaDecision && report.sender && report.complaintCount > 0) {
+    const senderAnalysisPrompt = `Analyze the following information for potential spam:
+    Sender: ${report.sender}
+    Complaint count: ${report.complaintCount}
+    
+    Consider the sender's name for any indicators of spam (e.g., unusual characters, numbers, or promotional content in the name).
+    Factor in the complaint count, but remember it's not definitive proof of spam.
+    
+    Provide a classification (1 for spam, 0 for not spam) and a confidence score (0-100).
+    Output format: [classification],[confidence]
+    Example: 1,70 or 0,60`;
+
+    const senderAnalysisResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini-2024-07-18",
+      messages: [
+        { role: "system", content: gptPrompt },
+        { role: "user", content: senderAnalysisPrompt }
+      ],
+      max_tokens: 5,
+      temperature: 0.1,
+    });
+
+    const senderAnalysisContent = senderAnalysisResponse.choices[0]?.message?.content?.trim();
+    if (senderAnalysisContent) {
+      const [classification, confidence] = senderAnalysisContent.split(',');
+      if (classification === '0' || classification === '1') {
+        return {
+          isSpam: Number(classification),
+          reason: Number(classification) === 1 ? "GPT sender analysis: potential spam" : "GPT sender analysis: likely not spam",
+          confidence: Number(confidence) || 50,
+          checkType: 'gpt'
+        };
+      }
+    }
+  }
+
+  // If no decision was made, stop the bot and notify admin
+  log(`GPT check did not make a decision for report ${report.reportId}`, 'error');
+  autoMode = false;
+  await notify(`Critical error: GPT models failed to classify report ${report.reportId}. Bot has been stopped.`);
+  throw new Error(`Classification failure for report ${report.reportId}`);
+
+} catch (error) {
+  logErr('gptCheck', error);
+  log(`GPT check failed for report ${report.reportId}`, 'error');
+  autoMode = false;
+  await notify(`Critical error in GPT check for report ${report.reportId}. Bot has been stopped.`);
+  throw error;
+}
 }
 
 async function isGPT4VisionCompatible(mediaHash: string): Promise<boolean> {
@@ -838,7 +936,7 @@ function generateUserPrompt(report: Report): string {
     prompt += "\nMessage content:\n";
     prompt += `"""\n${report.messageContent.join('\n')}\n"""`;
   } else {
-    prompt += "\nNote: No message content available. Analyzing based on context and media.";
+    prompt += "\nNote: No message content available. Analyzing based on context and metadata.";
   }
 
   return prompt;
