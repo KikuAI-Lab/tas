@@ -32,14 +32,12 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const BOT_ACCESS_HASH = process.env.BOT_ACCESS_HASH!;
 
 // Constants
-let COMMAND_DELAY = 200;
-const MAX_CACHE_SIZE = 10000;
+let COMMAND_DELAY = 100;
 const DB_SCHEMA_VERSION = '1.0';
 const MEDIA_EXPIRY = 30; // 30 seconds
 const ENABLE_GPT_MEDIA_ANALYSIS = true;
 const BUFFER_DELAY = 100; // 100 ms
 const MAX_PROCESSING_TIME = 55000; // 55 seconds
-const CACHE_CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
 const MAX_CACHE_SIZE_MB = 100; // 100 MB
 
 // Initialize Express app
@@ -550,10 +548,7 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
 async function gptCheck(report: Report): Promise<SpamDecision | null> {
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
-  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Use semantic analysis to understand the context, intent, and underlying meaning of messages. Consider all aspects, including content, context, metadata, and visual elements. Provide a definitive answer: either 1 (spam) or 0 (not spam), followed by a confidence score from 0 to 100.
-
-  Output format: [classification],[confidence]
-  Example: 1,85 or 0,70
+  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Use semantic analysis to understand the context, intent, and underlying meaning of messages. Consider all aspects, including content, context, metadata, and visual elements. Provide a definitive answer: either 1 (spam) or 0 (not spam).
   
   Semantic Analysis Guidelines:
   1. Analyze the overall meaning and intent of the message, not just individual words.
@@ -627,14 +622,11 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   - Consider the semantic distance between the message topic and the group's usual discussions
   - Evaluate the semantic coherence of user responses in the conversation flow
   
-  Remember to always provide a definitive answer (0 or 1). If uncertain, classify based on the most likely scenario given the available information, guidelines, and semantic analysis.
+  ALWAYS answer ONLY "0" for not spam, or "1" for spam.
   
   Your analysis:`;
 
-  const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image or media content for potential spam. Consider visual elements, text within images, and the context of the media in the group. Provide a definitive classification: 1 (spam) or 0 (not spam), followed by a confidence score from 0 to 100.
-
-  Output format: classification,confidence
-  Example: 1,85 or 0,70
+  const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image or media content for potential spam. Consider visual elements, text within images, and the context of the media in the group. Provide a definitive classification: 1 (spam) or 0 (not spam).
   
   Visual Analysis Guidelines:
   1. Analyze the overall composition and purpose of the image in the context of a Telegram group.
@@ -690,7 +682,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   - Evaluate the emotional tone conveyed by the image and its appropriateness for the group
   - Assess the visual rhetoric and how it might be used to influence viewers
   
-  Remember to always provide a definitive answer (0 or 1). If uncertain, classify based on the most likely scenario given the available information and guidelines.
+  ALWAYS answer ONLY "0" for not spam, or "1" for spam.
   
   Your analysis:`;
 
@@ -715,7 +707,7 @@ try {
   // Проверка на наличие текстового содержания или только метаданных
   if (report.messageContent.length > 0 || (report.sender && report.complaintCount > 0)) {
     const textResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini-2024-07-18",
+      model: "gpt-4o-mini",
       messages: textMessages,
       max_tokens: 5,
       temperature: 0.1,
@@ -823,7 +815,7 @@ try {
     Example: 1,70 or 0,60`;
 
     const senderAnalysisResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini-2024-07-18",
+      model: "gpt-4o-mini",
       messages: [
         { role: "system", content: gptPrompt },
         { role: "user", content: senderAnalysisPrompt }
