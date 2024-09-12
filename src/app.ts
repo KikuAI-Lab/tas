@@ -14,6 +14,7 @@ import Redis from 'ioredis';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import pkg from 'pg';
+import { LRUCache } from 'lru-cache';
 
 dotenv.config();
 
@@ -39,6 +40,7 @@ const BUFFER_DELAY = 100; // 100 ms
 const MAX_CACHE_SIZE_MB = 100; // 100 MB
 const GPT_RETRY_DELAY = 10000; // 10 seconds
 const MAX_PROCESSING_TIME = 55000; // 55 seconds
+const REDIS_BATCH_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
 // Initialize Express app
 const app = express();
@@ -80,6 +82,13 @@ const logger = winston.createLogger({
   ]
 });
 
+// Initialize LRU Cache
+const lruCache = new LRUCache<string, Report>({
+  max: 10000,
+  maxSize: MAX_CACHE_SIZE_MB * 1024 * 1024, // Convert MB to bytes
+  sizeCalculation: (value, key) => JSON.stringify(value).length + key.length,
+});
+
 // Global variables
 let client: TelegramClient;
 let botEntity: Api.InputPeerUser | null = null;
@@ -88,8 +97,11 @@ let messageBuffer: BufferItem[] = [];
 let bufferTimeout: NodeJS.Timeout | null = null;
 let processingReports: Set<string> = new Set();
 let nextCommandTimeout: NodeJS.Timeout | null = null;
+let checkNewReportsTimeout: NodeJS.Timeout | null = null;
 let undoRange: { start: string; end: string } | null = null;
-
+let isProcessingReports = false;
+let redisBatchTimeout: NodeJS.Timeout | null = null;
+let redisBatch: Report[] = [];
 
 // Interfaces and types
 interface BufferItem {
@@ -376,36 +388,37 @@ async function handleAdd(event: NewMessageEvent) {
     message.senderId?.toString() === botEntity.userId.toString()
   ) {
     const messageContent = message.message || '';
-    if (messageContent.includes("Hello there! Send /next to start processing reports.")) {
+    if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
+        messageContent.includes("Sorry, this action can no longer be undone.")) {
       if (autoMode && !processingReports.has('undos')) {
         await sendToBot("/next 1");
       }
-    } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.") ||
-               messageContent.includes("Sorry, an error has occurred during your request. Please try again later.") ||
-               messageContent.includes("No Reports Found")) {
-      if (!processingReports.has('undos')) {
-      await sendToBot("/undo");
     }
-  } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
-    const reportIdMatch = messageContent.match(/#r(\d+)/);
-    if (reportIdMatch) {
-      const reportId = reportIdMatch[1];
-      if (isReportInUndoRange(reportId)) {
-        processingReports.delete(reportId);
-        const cachedReport = await redis.get(`report:${reportId}`);
-        if (cachedReport) {
-          const report = JSON.parse(cachedReport) as Report;
-          const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
-          if (report.isSpam !== expectedDecision) {
-            log(`Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${report.isSpam}`, 'warn');
+    else if (messageContent.includes("Please select 😡 BAN or 😌 NO.") ||
+               messageContent.includes("Sorry, an error has occurred during your request. Please try again later.") ||
+               messageContent.includes("No reports found.")) {
+      if (!processingReports.has('undos')) {
+        await sendToBot("/undo");
+      }
+    } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
+      const reportIdMatch = messageContent.match(/#r(\d+)/);
+      if (reportIdMatch) {
+        const reportId = reportIdMatch[1];
+        if (isReportInUndoRange(reportId)) {
+          processingReports.delete(reportId);
+          const cachedReport = lruCache.get(`report:${reportId}`);
+          if (cachedReport) {
+            const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
+            if (cachedReport.isSpam !== expectedDecision) {
+              log(`Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${cachedReport.isSpam}`, 'warn');
+            }
           }
+        } else {
+          log(`Ignoring report ${reportId} as it's outside the undo range`, 'debug');
         }
-      } else {
-        log(`Ignoring report ${reportId} as it's outside the undo range`, 'debug');
       }
     }
   }
-}
 }
 
 function isReportInUndoRange(reportId: string): boolean {
@@ -426,7 +439,7 @@ async function processBuffer(currentTimestamp: number) {
     
     if (!matchingCheckMsg) {
       matchingCheckMsg = checkMessages.find(checkMsg => 
-        Math.abs(checkMsg.timestamp - sysMsg.timestamp) < 1000
+        Math.abs(checkMsg.timestamp - sysMsg.timestamp) < 100
       );
     }
 
@@ -439,10 +452,11 @@ async function processBuffer(currentTimestamp: number) {
 async function processReport(report: Report): Promise<void> {
   log(`Processing report ${report.reportId}`, 'debug');
   
-  // Проверяем, обрабатывается ли уже отчет
+  resetNextCommandTimer();
+  isProcessingReports = true;
+  
   if (processingReports.has(report.reportId)) {
     log(`Report ${report.reportId} is currently being processed.`, 'warn');
-    // Проверяем, прошло ли достаточно времени с начала обработки
     const processingStartTime = await redis.get(`processing_start:${report.reportId}`);
     if (processingStartTime) {
       const elapsedTime = Date.now() - parseInt(processingStartTime);
@@ -455,7 +469,6 @@ async function processReport(report: Report): Promise<void> {
     }
   }
 
-  // Устанавливаем флаг обработки и время начала
   processingReports.add(report.reportId);
   await redis.set(`processing_start:${report.reportId}`, Date.now().toString(), 'EX', 600); // 10 минут TTL
   
@@ -464,10 +477,8 @@ async function processReport(report: Report): Promise<void> {
 
   try {
     if (processingReports.has('undos')) {
-      // В режиме undo используем только GPT для проверки
       decision = await gptCheck(report);
     } else {
-      // Обычный режим проверки
       const cachedDecision = await checkCache(report.reportId);
       if (cachedDecision && (Date.now() - report.timestamp) < 24 * 60 * 60 * 1000) { // 24 часа
         log(`Cache hit for report ${report.reportId}`, 'debug');
@@ -499,6 +510,10 @@ async function processReport(report: Report): Promise<void> {
     }
     processingReports.delete(report.reportId);
     await redis.del(`processing_start:${report.reportId}`);
+    isProcessingReports = false;
+    if (processingReports.size === 0 && messageBuffer.length === 0) {
+      await scheduleNextCommand();
+    }
   }
 }
 
@@ -573,56 +588,59 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
 async function gptCheck(report: Report): Promise<SpamDecision | null> {
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
-  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Consider all aspects, including content, context, metadata, and visual elements. Provide ONLY a single digit as your answer: 1 for spam, 0 for not spam. DO NOT provide any explanation or additional text.
+  const gptPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided information for potential spam in any language. Use semantic analysis to understand the context and meaning of messages, especially for short texts or potential spam warnings. Consider all aspects, including content, context, metadata, and visual elements. Provide ONLY a single digit as your answer: 1 for spam, 0 for not spam. DO NOT provide any explanation or additional text.
 
-Spam Indicators (Prioritized):
-
-1. High Priority (Strong indicators of spam):
-   - Unsolicited commercial content or subtle marketing
-   - Phishing attempts, fake giveaways, unrealistic financial promises
-   - Explicit sexual content or coded invitations for sexual services
-   - Attempts to move conversations to private channels or other platforms
-   - Sharing personal information of others without consent
-   - Messages with over 500 consecutive identical symbols or emojis
-   - Clear incitement to violence or illegal activities
-
-2. Medium Priority (Suspicious, requires context):
-   - Self-promotion of unrelated channels/groups
-   - Cryptocurrency/airdrop mentions, especially with urgent calls to action
-   - Job offers, especially those promising quick or easy money
-   - Excessive use of emojis, especially at line starts
-   - Presence of multiple links, especially to bots or channels
-   - Non-Latin script used out of cultural context
-   - Encrypted or coded messages resembling adult content sales
-   - Requests to write in private messages (e.g., "write + in private")
-
-3. Low Priority (Potential red flags, heavily context-dependent):
-   - Off-topic messages for the group's theme
-   - Use of common spam keywords (e.g., 'earnings', 'investments')
-   - Short, repetitive messages or single character responses
-   - Sender names containing links or solicitations
-   - Higher complaint counts
-
-Context Considerations:
-- Evaluate messages within the conversation flow and group's theme
-- Consider cultural and linguistic context, including sender's country flag
-- Assess relevance to ongoing discussions or group activities
-- Factor in complaint counts, but don't rely on them exclusively
-- The group's purpose and typical content should guide your judgment
-- The 'Source' field provides the name of the group where the message was sent. Use this for context, not for spam evaluation
-
-Not Spam:
-- Normal interactions, casual conversations, jokes
-- Legitimate information sharing, news, educational content
-- Expressive language, including profanity or emotional outbursts
-- Cultural content, local slang, region-specific discussions
-- Political discussions or criticisms, even if aggressive
-- Bot commands (starting with "/"), unless clearly misused
-- Warnings about scams or spam
-
-REMEMBER: Your response must be ONLY the digit 1 (for spam) or 0 (for not spam). No other text or explanation is allowed.
-
-Your analysis:`;
+  Spam Indicators (Prioritized):
+  
+  1. High Priority (Strong indicators of spam):
+     - Unsolicited commercial content or subtle marketing
+     - Phishing attempts, fake giveaways, unrealistic financial promises
+     - Explicit sexual content or coded invitations for sexual services
+     - Attempts to move conversations to private channels or other platforms
+     - Sharing personal information of others without consent
+     - Messages with over 500 consecutive identical symbols or emojis
+     - Clear incitement to violence or illegal activities
+  
+  2. Medium Priority (Suspicious, requires context):
+     - Self-promotion of unrelated channels/groups
+     - Cryptocurrency/airdrop mentions, especially with urgent calls to action
+     - Job offers, especially those promising quick or easy money
+     - Excessive use of emojis, especially at line starts
+     - Presence of multiple links, especially to bots or channels
+     - Non-Latin script used out of cultural context
+     - Encrypted or coded messages resembling adult content sales
+     - Requests to write in private messages (e.g., "write + in private")
+  
+  3. Low Priority (Potential red flags, heavily context-dependent):
+     - Off-topic messages for the group's theme
+     - Use of common spam keywords (e.g., 'earnings', 'investments')
+     - Short, repetitive messages or single character responses
+     - Sender names containing links or solicitations
+     - Higher complaint counts
+  
+  Context Considerations:
+  - Use semantic analysis to understand the meaning and intent of messages
+  - Evaluate messages within the conversation flow and group's theme
+  - Consider cultural and linguistic context, including sender's country flag
+  - Assess relevance to ongoing discussions or group activities
+  - Factor in complaint counts, but don't rely on them exclusively
+  - The group's purpose and typical content should guide your judgment
+  - The 'Source' field provides the name of the group where the message was sent. Use this for context, not for spam evaluation
+  
+  Not Spam:
+  - Normal interactions, casual conversations, jokes
+  - Legitimate information sharing, news, educational content
+  - Expressive language, including profanity or emotional outbursts
+  - Cultural content, local slang, region-specific discussions
+  - Political discussions or criticisms, even if aggressive
+  - Bot commands (starting with "/"), unless clearly misused
+  - Warnings about scams or spam (e.g., messages containing only the word "Scam" or similar warnings)
+  - Short messages that might be part of an ongoing conversation
+  - Messages that semantically align with the group's theme or current discussion
+  
+  REMEMBER: Your response must be ONLY the digit 1 (for spam) or 0 (for not spam). No other text or explanation is allowed.
+  
+  Your analysis:`;
 
   const mediaPrompt = `As an AI trained in commercial spam detection for Telegram groups, analyze the provided image or media content for potential spam. Consider visual elements, text within images, and the context of the media in the group. Provide a definitive classification: 1 (spam) or 0 (not spam).
   
@@ -951,24 +969,49 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
 async function saveCache(report: Report): Promise<void> {
   try {
     const key = `report:${report.reportId}`;
-    await redis.set(key, JSON.stringify(report), 'EX', 86400); // 24 hours expiry
+    lruCache.set(key, report);
+    redisBatch.push(report);
+    if (redisBatch.length >= 100 || !redisBatchTimeout) {
+      await saveRedisBatch();
+    }
     log(`Report ${report.reportId} saved to cache`, 'debug');
   } catch (error) {
     logErr('saveCache', error);
   }
 }
 
+async function saveRedisBatch(): Promise<void> {
+  if (redisBatchTimeout) {
+    clearTimeout(redisBatchTimeout);
+  }
+  if (redisBatch.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const report of redisBatch) {
+      const key = `report:${report.reportId}`;
+      pipeline.set(key, JSON.stringify(report), 'EX', 86400); // 24 hours expiry
+    }
+    try {
+      await pipeline.exec();
+      log(`Batch of ${redisBatch.length} reports saved to Redis`, 'debug');
+    } catch (error) {
+      logErr('saveRedisBatch', error);
+    } finally {
+      redisBatch = [];
+    }
+  }
+  redisBatchTimeout = setTimeout(saveRedisBatch, REDIS_BATCH_INTERVAL);
+}
+
 async function checkCache(reportId: string): Promise<SpamDecision | null> {
   try {
     const key = `report:${reportId}`;
-    const cachedReport = await redis.get(key);
+    const cachedReport = lruCache.get(key) || JSON.parse(await redis.get(key) || 'null');
     if (cachedReport) {
-      const report = JSON.parse(cachedReport) as Report;
-      if (report.isSpam !== -1) {
+      if (cachedReport.isSpam !== -1) {
         log(`Cache hit for report ${reportId}`, 'debug');
         return {
-          isSpam: report.isSpam,
-          reason: report.reason || 'Cached decision',
+          isSpam: cachedReport.isSpam,
+          reason: cachedReport.reason || 'Cached decision',
           checkType: 'default'
         };
       }
@@ -979,16 +1022,19 @@ async function checkCache(reportId: string): Promise<SpamDecision | null> {
   return null;
 }
 
-async function handleUndosCommand() {
+async function handleUndosCommand(startReportId?: string, endReportId?: string) {
   if (processingReports.has('undos')) {
     await notify('Undo process is already running.');
     return;
   }
 
+  if (!startReportId || !endReportId) {
+    await notify('Please provide both start and end report IDs. Usage: /undos startReportId endReportId');
+    return;
+  }
+
   processingReports.add('undos');
-  log('Starting undos process', 'info');
-  const startReportId = '1758143860';
-  const endReportId = '1758198718';
+  log(`Starting undos process from report ${startReportId} to ${endReportId}`, 'info');
 
   try {
     undoRange = { start: startReportId, end: endReportId };
@@ -1093,13 +1139,12 @@ async function waitForReport(reportId: string): Promise<Report | null> {
 
 async function getCachedReport(reportId: string): Promise<Report | null> {
   try {
-    const cachedData = await redis.get(`report:${reportId}`);
-    if (cachedData) {
-      const report = JSON.parse(cachedData) as Report;
+    const cachedReport = lruCache.get(`report:${reportId}`) || JSON.parse(await redis.get(`report:${reportId}`) || 'null');
+    if (cachedReport) {
       // Reset the spam status and reason for re-evaluation
-      report.isSpam = -1;
-      report.reason = undefined;
-      return report;
+      cachedReport.isSpam = -1;
+      cachedReport.reason = undefined;
+      return cachedReport;
     }
   } catch (error) {
     logErr('getCachedReport', error);
@@ -1109,17 +1154,26 @@ async function getCachedReport(reportId: string): Promise<Report | null> {
 
 async function cleanupCache() {
   try {
-    const keys = await redis.keys('report:*');
     const now = Date.now();
     let deletedCount = 0;
 
-    for (const key of keys) {
-      const report = JSON.parse(await redis.get(key) || '{}') as Report;
+    for (const [key, report] of lruCache.entries()) {
       if (now - report.timestamp > 24 * 60 * 60 * 1000) { // 24 hours
-        await redis.del(key);
+        lruCache.delete(key);
         deletedCount++;
       }
     }
+
+    const redisKeys = await redis.keys('report:*');
+    const pipeline = redis.pipeline();
+    for (const key of redisKeys) {
+      const report = JSON.parse(await redis.get(key) || '{}') as Report;
+      if (now - report.timestamp > 24 * 60 * 60 * 1000) {
+        pipeline.del(key);
+        deletedCount++;
+      }
+    }
+    await pipeline.exec();
 
     log(`Cleaned up ${deletedCount} old reports from cache`, 'info');
   } catch (error) {
@@ -1129,10 +1183,14 @@ async function cleanupCache() {
 
 async function getCacheSize(): Promise<number> {
   try {
-    const keys = await redis.keys('report:*');
     let totalSize = 0;
 
-    for (const key of keys) {
+    for (const [key, value] of lruCache.entries()) {
+      totalSize += JSON.stringify(value).length + key.length;
+    }
+
+    const redisKeys = await redis.keys('report:*');
+    for (const key of redisKeys) {
       const size = await redis.memory('USAGE', key);
       if (size !== null) {
         totalSize += size;
@@ -1155,8 +1213,11 @@ async function limitCacheSize() {
 
     if (currentSize > MAX_CACHE_SIZE_MB) {
       const keysToRemove = Math.ceil((currentSize - MAX_CACHE_SIZE_MB) / 0.1); // Assuming average report size of 0.1 MB
-      const keys = await redis.keys('report:*');
-      const oldestKeys = keys.sort().slice(0, keysToRemove);
+      const lruKeys = Array.from(lruCache.keys()).slice(0, keysToRemove);
+      lruKeys.forEach(key => lruCache.delete(key));
+      
+      const redisKeys = await redis.keys('report:*');
+      const oldestKeys = redisKeys.sort().slice(0, keysToRemove);
       
       if (oldestKeys.length > 0) {
         await redis.del(...oldestKeys);
@@ -1281,11 +1342,55 @@ async function scheduleNextCommand() {
   if (nextCommandTimeout) {
     clearTimeout(nextCommandTimeout);
   }
+  if (checkNewReportsTimeout) {
+    clearTimeout(checkNewReportsTimeout);
+  }
+  
+  // Проверяем, есть ли необработанные отчеты в буфере
+  if (messageBuffer.length > 0 || processingReports.size > 0) {
+    log('Skipping /next 2 command as there are unprocessed reports', 'debug');
+    return;
+  }
+
   nextCommandTimeout = setTimeout(async () => {
-    if (autoMode) {
-      await sendToBot("/next 2");
+    if (autoMode && !isProcessingReports) {
+      try {
+        log('Sending /next 2 command', 'debug');
+        await sendToBot("/next 2");
+        checkNewReportsTimeout = setTimeout(checkForNewReports, 100000); // 100 секунд
+      } catch (error) {
+        logErr('Error sending /next 2 command', error);
+        await notify('Failed to send /next 2 command. Attempting to recover...');
+        await gracefulShutdown();
+      }
+    } else {
+      log('Skipping /next 2 command as reports are being processed', 'debug');
     }
   }, 5000); // 5 seconds delay before sending the next command
+}
+
+async function checkForNewReports() {
+  if (messageBuffer.length === 0 && processingReports.size === 0) {
+    log('No new reports received after /next 2. Restarting application...', 'warn');
+    await notify('No new reports received. Restarting application for safety.');
+    await gracefulShutdown();
+    process.exit(1); // Это вызовет перезапуск приложения на Heroku
+  } else {
+    log('New reports received and being processed', 'debug');
+  }
+}
+
+function resetNextCommandTimer() {
+  if (nextCommandTimeout) {
+    clearTimeout(nextCommandTimeout);
+    nextCommandTimeout = null;
+  }
+  if (checkNewReportsTimeout) {
+    clearTimeout(checkNewReportsTimeout);
+    checkNewReportsTimeout = null;
+  }
+  isProcessingReports = true;
+  log('Next command timer reset due to ongoing report processing', 'debug');
 }
 
 function scheduleDelayedProcessing(sysMsg: BufferItem, checkMsg: BufferItem) {
@@ -1329,59 +1434,86 @@ async function handleAdmin(event: NewMessageEvent) {
   const message = event.message;
   if (message instanceof Api.Message && message.senderId?.toString() === ADMIN_ID) {
     log(`Received admin message: ${message.message}`, 'debug');
-    const command = message.message.toLowerCase();
+    const commandParts = message.message.toLowerCase().split(' ');
+    const command = commandParts[0];
 
-    switch (true) {
-      case command === '/start':
+    switch (command) {
+      case '/start':
         autoMode = true;
         await notify('Automatic mode started. Decisions and bot commands will be sent.');
         await scheduleNextCommand();
         break;
-      case command === '/stop':
+
+      case '/stop':
         autoMode = false;
         await notify('Automatic mode stopped. Decisions and bot commands will not be sent.');
         break;
-      case command === '/status':
+
+      case '/status':
         await sendStatus();
         break;
-      case command === '/undos':
-        await handleUndosCommand();
-        break;
-      case command.startsWith('/time '):
-        const newDelay = parseInt(command.split(' ')[1]);
-        if (!isNaN(newDelay) && newDelay >= 0) {
-          COMMAND_DELAY = newDelay;
-          await notify(`Command delay updated to ${COMMAND_DELAY} ms`);
+
+      case '/undos':
+        if (commandParts.length === 3) {
+          await handleUndosCommand(commandParts[1], commandParts[2]);
         } else {
-          await notify('Invalid delay value. Please provide a non-negative integer.');
+          await notify('Invalid undos command. Usage: /undos startReportId endReportId');
         }
         break;
-      case command === '/reset':
+
+      case '/time':
+        if (commandParts.length === 2) {
+          const newDelay = parseInt(commandParts[1]);
+          if (!isNaN(newDelay) && newDelay >= 0) {
+            COMMAND_DELAY = newDelay;
+            await notify(`Command delay updated to ${COMMAND_DELAY} ms`);
+          } else {
+            await notify('Invalid delay value. Please provide a non-negative integer.');
+          }
+        } else {
+          await notify('Invalid time command. Usage: /time [value]');
+        }
+        break;
+
+      case '/reset':
         await resetRedisCache();
         break;
-      case command === '/db':
+
+      case '/db':
         await handleDbCommand();
         break;
-      case command === '/cache':
+
+      case '/cache':
         await handleCacheCommand();
         break;
+
       default:
         log(`Unrecognized admin command: ${command}`, 'debug');
-        await notify(`Unrecognized command: ${command}`);
+        await notify(`Unrecognized command: ${command}. Available commands are:
+        /start - Start automatic mode
+        /stop - Stop automatic mode
+        /status - Get current status
+        /undos [startReportId] [endReportId] - Undo and recheck reports in range
+        /time [value] - Set command delay in milliseconds
+        /reset - Clear Redis and LRU caches
+        /db - Perform database operations and generate report
+        /cache - Get cache info and generate report`);
     }
   }
 }
 
 async function sendStatus() {
   const cacheSize = await getCacheSize();
-  const cacheItemCount = await redis.dbsize();
+  const cacheItemCount = lruCache.size;
+  const redisItemCount = await redis.dbsize();
   const status = `
 Current status:
 Auto mode: ${autoMode ? 'On (decisions and bot commands will be sent)' : 'Off (decisions and bot commands will not be sent)'}
 Processing delay: ${COMMAND_DELAY} ms
 Database connection: ${await checkDB() ? 'Connected' : 'Disconnected'}
-Cache size: ${cacheSize.toFixed(2)} MB
-Cache items: ${cacheItemCount}
+LRU Cache size: ${cacheSize.toFixed(2)} MB
+LRU Cache items: ${cacheItemCount}
+Redis items: ${redisItemCount}
   `;
   await notify(status);
 }
@@ -1390,11 +1522,12 @@ async function resetRedisCache(): Promise<void> {
   try {
     log('Attempting to clear Redis cache...', 'debug');
     await redis.flushdb();
-    log('Redis cache cleared successfully', 'debug');
-    await notify('Redis cache has been cleared successfully');
+    lruCache.clear();
+    log('Redis and LRU caches cleared successfully', 'debug');
+    await notify('Redis and LRU caches have been cleared successfully');
   } catch (error) {
     logErr('resetRedisCache', error);
-    await notify(`Error clearing Redis cache: ${error instanceof Error ? error.message : String(error)}`);
+    await notify(`Error clearing caches: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -1428,9 +1561,15 @@ async function handleCacheCommand() {
 }
 
 async function getCacheContent(): Promise<Report[]> {
-  const keys = await redis.keys('report:*');
   const reports: Report[] = [];
 
+  // Get reports from LRU cache
+  for (const report of lruCache.values()) {
+    reports.push(report);
+  }
+
+  // Get reports from Redis
+  const keys = await redis.keys('report:*');
   for (const key of keys) {
     const reportData = await redis.get(key);
     if (reportData) {
@@ -1754,14 +1893,23 @@ async function cleanupOldData() {
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
+  // Cleanup LRU Cache
+  for (const [key, report] of lruCache.entries()) {
+    if (new Date(report.timestamp) < oneMonthAgo) {
+      lruCache.delete(key);
+    }
+  }
+
   // Cleanup Redis
   const keys = await redis.keys('report:*');
+  const pipeline = redis.pipeline();
   for (const key of keys) {
     const report = JSON.parse(await redis.get(key) || '{}') as Report;
     if (new Date(report.timestamp) < oneMonthAgo) {
-      await redis.del(key);
+      pipeline.del(key);
     }
   }
+  await pipeline.exec();
 
   // Cleanup PostgreSQL
   const client = await pool.connect();
@@ -1789,11 +1937,20 @@ async function cleanupOldData() {
 }
 
 // Graceful shutdown
-async function gracefulShutdown() {
-  log('Starting graceful shutdown...', 'info');
+async function gracefulShutdown(restart: boolean = false) {
+  log(`Starting graceful shutdown... ${restart ? '(Restarting)' : ''}`, 'info');
 
   autoMode = false;
-  await notify('Automatic mode stopped due to application shutdown.');
+  await notify(`Automatic mode stopped due to application ${restart ? 'restart' : 'shutdown'}.`);
+
+  // Очистка всех таймеров
+  if (nextCommandTimeout) clearTimeout(nextCommandTimeout);
+  if (checkNewReportsTimeout) clearTimeout(checkNewReportsTimeout);
+  if (bufferTimeout) clearTimeout(bufferTimeout);
+  if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
+
+  // Сохранение оставшихся отчетов из пакетной обработки
+  await saveRedisBatch();
 
   try {
     await pool.end();
@@ -1818,9 +1975,14 @@ async function gracefulShutdown() {
     logErr('gracefulShutdown - closing Redis connection', error);
   }
 
-  log('Graceful shutdown completed', 'info');
-  await notify('Application has been shut down gracefully.');
-  process.exit(0);
+  log(`Graceful shutdown completed${restart ? ' (Restarting)' : ''}`, 'info');
+  await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
+
+  if (restart) {
+    process.exit(1); // Код выхода 1 вызовет перезапуск на Heroku
+  } else {
+    process.exit(0);
+  }
 }
 
 // Main function
@@ -1872,13 +2034,13 @@ async function main() {
     process.on('uncaughtException', async (error) => {
       logErr('Uncaught Exception', error);
       await notify(`Uncaught Exception: ${error.message}. Attempting to recover...`);
-      await gracefulShutdown();
+      await gracefulShutdown(true);
     });
 
     process.on('unhandledRejection', async (reason, promise) => {
       logErr('Unhandled Rejection', reason);
       await notify(`Unhandled Rejection: ${reason}. Attempting to recover...`);
-      await gracefulShutdown();
+      await gracefulShutdown(true);
     });
 
     process.on('SIGINT', async () => {
