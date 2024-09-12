@@ -591,7 +591,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   2. Medium Priority (Suspicious, requires context):
      - Self-promotion of unrelated channels/groups
      - Cryptocurrency/airdrop mentions, especially with urgent calls to action
-     - Job offers, especially those promising quick or easy money
+     - Any job offers, vacancies, or job postings
      - Excessive use of emojis, especially at line starts
      - Presence of multiple links, especially to bots or channels
      - Non-Latin script used out of cultural context
