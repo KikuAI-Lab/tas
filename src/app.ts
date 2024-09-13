@@ -1246,28 +1246,43 @@ async function getCacheSize(): Promise<number> {
   try {
     let totalSize = 0;
 
+    // Подсчет размера LRU кэша
     for (const [key, value] of lruCache.entries()) {
       totalSize += JSON.stringify(value).length + key.length;
     }
 
-    const redisKeys = await redis.keys('report:*');
-    for (const key of redisKeys) {
-      const size = await redis.memory('USAGE', key);
-      if (size !== null) {
-        totalSize += size;
-      } else {
-        log(`Unable to get memory usage for key: ${key}`, 'warn');
+    // Подсчет размера Redis кэша только если соединение активно
+    if (redis.status === 'ready') {
+      const redisKeys = await redis.keys('report:*');
+      for (const key of redisKeys) {
+        const size = await redis.memory('USAGE', key);
+        if (size !== null) {
+          totalSize += size;
+        } else {
+          log(`Unable to get memory usage for key: ${key}`, 'warn');
+        }
       }
+    } else {
+      log('Redis connection is not ready, skipping Redis cache size calculation', 'warn');
     }
 
     return totalSize / (1024 * 1024); // Convert to MB
   } catch (error) {
+    if (isShuttingDown) {
+      log('getCacheSize: Application is shutting down, cache size calculation skipped', 'debug');
+      return 0;
+    }
     logErr('getCacheSize', error);
     return 0;
   }
 }
 
 async function limitCacheSize() {
+  if (isShuttingDown) {
+    log('limitCacheSize: Application is shutting down, cache size limitation skipped', 'debug');
+    return;
+  }
+
   try {
     const currentSize = await getCacheSize();
     log(`Current cache size: ${currentSize.toFixed(2)} MB`, 'debug');
@@ -1277,12 +1292,16 @@ async function limitCacheSize() {
       const lruKeys = Array.from(lruCache.keys()).slice(0, keysToRemove);
       lruKeys.forEach(key => lruCache.delete(key));
       
-      const redisKeys = await redis.keys('report:*');
-      const oldestKeys = redisKeys.sort().slice(0, keysToRemove);
-      
-      if (oldestKeys.length > 0) {
-        await redis.del(...oldestKeys);
-        log(`Removed ${oldestKeys.length} oldest keys from Redis cache`, 'info');
+      if (redis.status === 'ready') {
+        const redisKeys = await redis.keys('report:*');
+        const oldestKeys = redisKeys.sort().slice(0, keysToRemove);
+        
+        if (oldestKeys.length > 0) {
+          await redis.del(...oldestKeys);
+          log(`Removed ${oldestKeys.length} oldest keys from Redis cache`, 'info');
+        }
+      } else {
+        log('Redis connection is not ready, skipping Redis cache cleanup', 'warn');
       }
     }
   } catch (error) {
