@@ -16,6 +16,8 @@ import { join } from 'path';
 import pkg from 'pg';
 import { LRUCache } from 'lru-cache';
 import { createHash } from 'crypto';
+import os from 'os';
+import { APIError } from 'openai';
 
 dotenv.config();
 
@@ -46,6 +48,8 @@ const MIN_BUFFER_DELAY = 100;
 const MAX_BUFFER_DELAY = 500;
 let currentBufferDelay = MIN_BUFFER_DELAY;
 let isShuttingDown = false;
+let apiRequestsCount = 0;
+let apiTokensUsed = 0;
 
 // Initialize Express app
 const app = express();
@@ -714,12 +718,14 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
     // Проверка на наличие текстового содержания или только метаданных
     if (report.messageContent.some(content => content.trim() !== '') || (report.sender && report.complaintCount > 0)) {
       const textResponse = await retryGptRequest(async () => {
-        return openai.chat.completions.create({
+        const response = await openai.chat.completions.create({
           model: "gpt-4o-mini",
           messages: textMessages,
-          max_tokens: 1,
+          max_tokens: 10,
           temperature: 0.1,
         });
+        updateApiUsage(response.usage?.total_tokens || 0);
+        return response;
       });
       
       const textContent = textResponse.choices[0]?.message?.content?.trim();
@@ -736,7 +742,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
           return openai.chat.completions.create({
             model: "gpt-4o-2024-08-06",
             messages: textMessages,
-            max_tokens: 1,
+            max_tokens: 10,
             temperature: 0.1,
           });
         });
@@ -771,8 +777,8 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
               return openai.chat.completions.create({
                 model: "gpt-4o",
                 messages: mediaMessages,
-                max_tokens: 1,
-                temperature: 0.2,
+                max_tokens: 10,
+                temperature: 0.1,
               });
             });
 
@@ -1587,20 +1593,68 @@ async function handleAdmin(event: NewMessageEvent) {
   }
 }
 
+function updateApiUsage(tokensUsed: number) {
+  apiRequestsCount++;
+  apiTokensUsed += tokensUsed;
+}
+
 async function sendStatus() {
-  log('Generating simplified status report', 'debug');
+  log('Generating enhanced status report', 'debug');
   try {
-    const status = `
+    let statusMessage = `
 Current status:
 Auto mode: ${autoMode ? 'On (decisions and bot commands will be sent)' : 'Off (decisions and bot commands will not be sent)'}
 Command delay: ${COMMAND_DELAY} ms
-    `;
-    log('Simplified status report generated', 'debug');
-    await notify(status);
-    log('Simplified status report sent', 'debug');
+
+Server Resources:
+`;
+
+    // Check server resources
+    const totalMemory = os.totalmem();
+    const freeMemory = os.freemem();
+    const usedMemory = totalMemory - freeMemory;
+
+    statusMessage += `CPU Usage: ${os.loadavg()[0].toFixed(2)}%
+Memory Usage: ${((usedMemory / totalMemory) * 100).toFixed(2)}%
+Free Memory: ${(freeMemory / 1024 / 1024 / 1024).toFixed(2)} GB
+Total Memory: ${(totalMemory / 1024 / 1024 / 1024).toFixed(2)} GB
+
+`;
+
+    // Check OpenAI API latency
+    const start = Date.now();
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "Test" }],
+        max_tokens: 1
+      });
+      const end = Date.now();
+      updateApiUsage(response.usage?.total_tokens || 0);
+      statusMessage += `OpenAI API latency: ${end - start}ms
+
+`;
+    } catch (error) {
+      statusMessage += `Error checking OpenAI latency: ${error instanceof Error ? error.message : String(error)}
+
+`;
+    }
+
+    // Report API usage
+    statusMessage += `OpenAI API Usage:
+Requests made: ${apiRequestsCount}
+Tokens used: ${apiTokensUsed}
+
+Note: These are cumulative values since the last restart. 
+Actual rate limits depend on your OpenAI plan and should be monitored in your OpenAI dashboard.
+`;
+
+    log('Enhanced status report generated', 'debug');
+    await notify(statusMessage);
+    log('Enhanced status report sent', 'debug');
   } catch (error) {
-    logErr('Error generating simplified status report', error);
-    await notify('Error generating status report. Please check the logs.');
+    logErr('Error generating enhanced status report', error);
+    await notify('Error generating enhanced status report. Please check the logs.');
   }
 }
 
