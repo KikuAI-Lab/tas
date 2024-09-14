@@ -38,7 +38,7 @@ let COMMAND_DELAY = 50;
 let PROCESSING_DELAY = 0;
 const DB_SCHEMA_VERSION = '1.0';
 const MEDIA_EXPIRY = 30; // 30 seconds
-const ENABLE_GPT_MEDIA_ANALYSIS = true;
+const ENABLE_GPT_MEDIA_ANALYSIS: boolean = true;
 const MAX_CACHE_SIZE_MB = 100; // 100 MB
 const GPT_RETRY_DELAY = 10000; // 10 seconds
 const MAX_PROCESSING_TIME = 55000; // 55 seconds
@@ -692,7 +692,6 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   **REMINDER:** Respond ONLY with 1 or 0. No explanations.
   
   Your analysis:`;
-  
 
   const mediaPrompt = `You are an AI specialized in detecting commercial spam in Telegram groups by analyzing images or media content. Evaluate based on visual elements, embedded text, and context within the group. Respond with only:
   1 for spam
@@ -729,7 +728,6 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   **REMINDER:** Respond ONLY with 1 or 0. No explanations.
   
   Your analysis:`;
-  
 
   const userPrompt = generateUserPrompt(report);
 
@@ -809,7 +807,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
 
             const mediaResponse = await retryGptRequest(async () => {
               return openai.chat.completions.create({
-                model: "gpt-4-vision-preview",
+                model: "gpt-4o",
                 messages: mediaMessages,
                 max_tokens: 1,
                 temperature: 0.1,
@@ -905,9 +903,15 @@ async function retryGptRequest<T>(request: () => Promise<T>, maxRetries: number 
     try {
       return await request();
     } catch (error) {
-      if (i === maxRetries - 1) throw error;
-      log(`GPT request failed, retrying in ${GPT_RETRY_DELAY}ms (${i + 1}/${maxRetries})`, 'warn');
-      await new Promise(resolve => setTimeout(resolve, GPT_RETRY_DELAY));
+      if (error instanceof APIError && error.status === 429) {
+        // Rate limit error, wait longer before retry
+        await new Promise(resolve => setTimeout(resolve, (i + 1) * 5000));
+      } else if (i === maxRetries - 1) {
+        throw error;
+      } else {
+        log(`GPT request failed, retrying in ${GPT_RETRY_DELAY}ms (${i + 1}/${maxRetries})`, 'warn');
+        await new Promise(resolve => setTimeout(resolve, GPT_RETRY_DELAY));
+      }
     }
   }
   throw new Error('Max retries reached for GPT request');
