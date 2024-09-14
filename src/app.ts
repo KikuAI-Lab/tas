@@ -550,9 +550,10 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   );
   
   const dangerousFileExtensions = ['apk', 'exe', 'js', 'bat', 'cmd', 'vbs', 'ps1', 'jar', 'msi', 'com', 'scr', 'pif'];
-  const hasDangerousFile = report.mediaHashes.some(hash => 
-    dangerousFileExtensions.some(ext => hash.toLowerCase().endsWith(`.${ext}`))
-  );
+  const hasDangerousFile = report.mediaHashes.some(hash => {
+    const fileType = getFileTypeFromHash(hash);
+    return dangerousFileExtensions.includes(fileType.toLowerCase());
+  });
   
   const hasInlineKeyboard = report.mediaHashes.some(hash => 
     hash.startsWith('url_button:') || hash.startsWith('callback_button:') || hash === 'inline_keyboard:generic'
@@ -584,6 +585,16 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
 
   log(`Fast check did not detect spam for report ${report.reportId}`, 'debug');
   return null;
+}
+
+function getFileTypeFromHash(hash: string): string {
+  const [mediaType, fileId] = hash.split(':');
+  if (mediaType === 'document') {
+    // Извлекаем расширение файла из fileId
+    const extensionMatch = fileId.match(/\.([^.]+)$/);
+    return extensionMatch ? extensionMatch[1] : '';
+  }
+  return mediaType;
 }
 
 async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMedia | null> {
