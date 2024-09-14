@@ -1,7 +1,9 @@
 import dotenv from 'dotenv';
-import { Pool } from 'pg';
+import pkg from 'pg';
+const { Pool } = pkg;
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import OpenAI from 'openai';
 import { ChatCompletionCreateParams } from 'openai/resources/chat/completions';
@@ -188,7 +190,10 @@ async function handleFineCommand(): Promise<string[]> {
 export { handleFineCommand };
 
 // For testing purposes
-if (require.main === module) {
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   handleFineCommand()
     .then(filePaths => {
       console.log('JSONL files created:');
