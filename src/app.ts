@@ -55,6 +55,10 @@ let currentBufferDelay = MIN_BUFFER_DELAY;
 let isShuttingDown = false;
 let apiRequestsCount = 0;
 let apiTokensUsed = 0;
+let consecutiveErrorCount = 0;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const SUSPEND_DURATION = 5 * 60 * 1000; // 5 минут в миллисекундах
+let suspendedUntil: number | null = null;
 
 // Initialize Express app
 const app = express();
@@ -406,22 +410,40 @@ async function handleAdd(event: NewMessageEvent) {
     message.senderId?.toString() === botEntity.userId.toString()
   ) {
     const messageContent = message.message || '';
+    
+    // Проверяем, не находится ли система в состоянии приостановки
+    if (suspendedUntil !== null && Date.now() < suspendedUntil) {
+      log(`System is suspended until ${new Date(suspendedUntil).toISOString()}. Skipping message processing.`, 'warn');
+      return;
+    }
+
     if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
-        messageContent.includes("Send /next for a new spam report.") ||
-        messageContent.includes("Sorry, this action can no longer be undone.")) {
+        messageContent.includes("Send /next for a new spam report.")) {
       if (autoMode && !processingReports.has('undos')) {
         await sendToBot("/next 1");
       }
+      consecutiveErrorCount = 0; // Сбрасываем счетчик ошибок при успешном сообщении
     }
     else if (messageContent.includes("Please select 😡 BAN or 😌 NO.") ||
              messageContent.includes("Sorry, an error has occurred during your request. Please try again later.") ||
              messageContent.includes("No reports found.")) {
+      consecutiveErrorCount++;
+      log(`Consecutive error count: ${consecutiveErrorCount}`, 'warn');
+      
+      if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
+        suspendedUntil = Date.now() + SUSPEND_DURATION;
+        log(`System suspended until ${new Date(suspendedUntil).toISOString()} due to consecutive errors`, 'error');
+        await notify(`System suspended for ${SUSPEND_DURATION / 60000} minutes due to ${consecutiveErrorCount} consecutive errors.`);
+        return;
+      }
+
       if (!processingReports.has('undos')) {
         const undoSuccess = await undo();
         if (!undoSuccess) {
           log('Undo process did not successfully process any reports', 'warn');
-          // Здесь мы больше не отправляем "/undo"
           await scheduleNextCommand();
+        } else {
+          consecutiveErrorCount = 0; // Сбрасываем счетчик ошибок при успешном undo
         }
       }
     } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
@@ -443,6 +465,7 @@ async function handleAdd(event: NewMessageEvent) {
           log(`Ignoring report ${reportId} as it's outside the undo range`, 'debug');
         }
       }
+      consecutiveErrorCount = 0; // Сбрасываем счетчик ошибок при успешной обработке отчета
     }
   }
 }
@@ -1509,6 +1532,12 @@ async function scheduleNextCommand() {
   
   if (messageBuffer.size > 0 || processingReports.size > 0) {
     log('Skipping next command as there are unprocessed reports', 'debug');
+    return;
+  }
+
+  // Проверяем, не находится ли система в состоянии приостановки
+  if (suspendedUntil !== null && Date.now() < suspendedUntil) {
+    log(`System is suspended until ${new Date(suspendedUntil).toISOString()}. Skipping next command scheduling.`, 'warn');
     return;
   }
 
