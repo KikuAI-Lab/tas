@@ -20,7 +20,6 @@ import os from 'os';
 import { handleFineCommand } from './finetune.js';
 import fs from 'fs';
 
-
 dotenv.config();
 
 // Environment variables
@@ -83,7 +82,6 @@ const gptCheckCache = new LRUCache<string, SpamDecision>({
   max: 1000, // Максимальное количество кэшированных результатов
   ttl: 1000 * 60 * 60, // Время жизни кэша - 1 час
 });
-
 
 // Initialize logger
 const logger = winston.createLogger({
@@ -419,9 +417,8 @@ async function handleAdd(event: NewMessageEvent) {
 
     if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
         messageContent.includes("Send /next for a new spam report.")) {
-      if (autoMode && !processingReports.has('undos') && !isProcessingReports) {
-        log('Sending "/next 5" command', 'debug');
-        await sendToBot("/next 5");
+      if (autoMode && !processingReports.has('undos')) {
+        await sendToBot("/next 1");
       }
       consecutiveErrorCount = 0; // Сбрасываем счетчик ошибок при успешном сообщении
     }
@@ -435,10 +432,12 @@ async function handleAdd(event: NewMessageEvent) {
         suspendedUntil = Date.now() + SUSPEND_DURATION;
         log(`System suspended until ${new Date(suspendedUntil).toISOString()} due to consecutive errors`, 'error');
         await notify(`System suspended for ${SUSPEND_DURATION / 60000} minutes due to ${consecutiveErrorCount} consecutive errors.`);
+        // Очистка существующих таймеров при установке состояния приостановки
+        clearExistingTimers();
         return;
       }
 
-      if (!processingReports.has('undos') && !isProcessingReports) {
+      if (!processingReports.has('undos')) {
         const undoSuccess = await undo();
         if (!undoSuccess) {
           log('Undo process did not successfully process any reports', 'warn');
@@ -538,7 +537,6 @@ async function processReport(report: Report): Promise<void> {
     const processingStartTime = await redis.get(`processing_start:${report.reportId}`);
     if (processingStartTime && Date.now() - parseInt(processingStartTime) < MAX_PROCESSING_TIME) {
       log(`Skipping report ${report.reportId}. It's been processing for ${Date.now() - parseInt(processingStartTime)}ms`, 'debug');
-      isProcessingReports = false;
       return;
     }
     log(`Report ${report.reportId} processing timeout. Reprocessing.`, 'warn');
@@ -1544,7 +1542,7 @@ async function scheduleNextCommand() {
   }
 
   nextCommandTimeout = setTimeout(async () => {
-    if (autoMode && !isProcessingReports && !processingReports.has('undos')) {
+    if (autoMode && !isProcessingReports) {
       try {
         log('Initiating undo process before next command', 'debug');
         const undoSuccess = await undo();
@@ -1559,7 +1557,7 @@ async function scheduleNextCommand() {
         await gracefulShutdown();
       }
     } else {
-      log('Skipping next command as reports are being processed, auto mode is off, or undo is in progress', 'debug');
+      log('Skipping next command as reports are being processed or auto mode is off', 'debug');
     }
   }, 5000);
 }
@@ -1589,68 +1587,58 @@ function resetNextCommandTimer() {
 }
 
 async function undo(reportId?: string): Promise<boolean> {
-  if (processingReports.has('undos')) {
-    log('Undo process is already running', 'warn');
-    return false;
-  }
-
-  processingReports.add('undos');
   log(`Starting undo process${reportId ? ` for report ${reportId}` : ''}`, 'debug');
   
   const recentReportIds = reportId ? [reportId] : await getRecentReportIds();
   let successfulUndo = false;
   
-  try {
-    for (const id of recentReportIds) {
-      const report = await getFromCache(id);
-      if (!report) {
-        log(`Report ${id} not found in cache, skipping`, 'debug');
-        continue;
-      }
-
-      if (!report.decisionSent) {
-        log(`Decision not sent for report ${id}, skipping undo`, 'debug');
-        continue;
-      }
-
-      const undoCommand = `/undo${id}`;
-      log(`Sending undo command for report ${id}`, 'debug');
-      await sendToBot(undoCommand);
-
-      const undoResponse = await waitForUndoResponse(id);
-      
-      if (undoResponse === 'success') {
-        log(`Successful undo for report ${id}`, 'debug');
-        report.decisionSent = false;
-        report.isOpen = true;
-        await saveCache(report);
-        
-        try {
-          await processReport(report);
-          successfulUndo = true;
-          log(`Successfully processed undone report ${id}`, 'debug');
-          
-          if (reportId) {
-            // Если был указан конкретный reportId и он успешно обработан, завершаем функцию
-            return true;
-          }
-          // Если конкретный reportId не был указан, продолжаем перебор
-        } catch (error) {
-          logErr(`Error processing undone report ${id}`, error);
-          // Продолжаем перебор, даже если не удалось обработать этот отчет
-        }
-      } else if (undoResponse === 'toolate') {
-        log(`Undo action no longer possible for report ${id}`, 'warn');
-      } else {
-        log(`Unexpected response for undo of report ${id}`, 'warn');
-      }
+  for (const id of recentReportIds) {
+    const report = await getFromCache(id);
+    if (!report) {
+      log(`Report ${id} not found in cache, skipping`, 'debug');
+      continue;
     }
 
-    return successfulUndo;
-  } finally {
-    processingReports.delete('undos');
-    log(`Undo process completed. Successfully undone and processed: ${successfulUndo}`, 'debug');
+    if (!report.decisionSent) {
+      log(`Decision not sent for report ${id}, skipping undo`, 'debug');
+      continue;
+    }
+
+    const undoCommand = `/undo${id}`;
+    log(`Sending undo command for report ${id}`, 'debug');
+    await sendToBot(undoCommand);
+
+    const undoResponse = await waitForUndoResponse(id);
+    
+    if (undoResponse === 'success') {
+      log(`Successful undo for report ${id}`, 'debug');
+      report.decisionSent = false;
+      report.isOpen = true;
+      await saveCache(report);
+      
+      try {
+        await processReport(report);
+        successfulUndo = true;
+        log(`Successfully processed undone report ${id}`, 'debug');
+        
+        if (reportId) {
+          // Если был указан конкретный reportId и он успешно обработан, завершаем функцию
+          return true;
+        }
+        // Если конкретный reportId не был указан, продолжаем перебор
+      } catch (error) {
+        logErr(`Error processing undone report ${id}`, error);
+        // Продолжаем перебор, даже если не удалось обработать этот отчет
+      }
+    } else if (undoResponse === 'toolate') {
+      log(`Undo action no longer possible for report ${id}`, 'warn');
+    } else {
+      log(`Unexpected response for undo of report ${id}`, 'warn');
+    }
   }
+
+  log(`Undo process completed. Successfully undone and processed: ${successfulUndo}`, 'debug');
+  return successfulUndo;
 }
 
 async function getFromCache(reportId: string): Promise<Report | null> {
@@ -2285,9 +2273,7 @@ async function gracefulShutdown(restart: boolean = false) {
   await notify(`Automatic mode stopped due to application ${restart ? 'restart' : 'shutdown'}.`);
 
   // Очистка всех таймеров
-  if (nextCommandTimeout) clearTimeout(nextCommandTimeout);
-  if (checkNewReportsTimeout) clearTimeout(checkNewReportsTimeout);
-  if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
+  clearExistingTimers();
 
   // Флаг для отслеживания состояния shutdown
   isShuttingDown = true;
@@ -2395,6 +2381,12 @@ function manageRestarts(): { shouldDelay: boolean; isAnomalous: boolean } {
   }
 }
 
+function clearExistingTimers() {
+  if (nextCommandTimeout) clearTimeout(nextCommandTimeout);
+  if (checkNewReportsTimeout) clearTimeout(checkNewReportsTimeout);
+  if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
+}
+
 // Main function
 async function main() {
   try {
@@ -2481,4 +2473,31 @@ async function main() {
 main().catch(error => {
   logErr('main function', error);
   process.exit(1);
+});
+
+// Handle uncaught exceptions and unhandled rejections
+process.on('uncaughtException', async (error) => {
+  logErr('Uncaught Exception', error);
+  await notify('Uncaught Exception occurred. Application will restart.');
+  await gracefulShutdown(true);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  logErr('Unhandled Rejection', reason);
+  await notify('Unhandled Rejection occurred. Application will restart.');
+  await gracefulShutdown(true);
+});
+
+// Handle SIGTERM signal for graceful shutdown
+process.on('SIGTERM', async () => {
+  log('SIGTERM signal received', 'info');
+  await notify('SIGTERM signal received. Application will shut down gracefully.');
+  await gracefulShutdown();
+});
+
+// Handle SIGINT signal for graceful shutdown (e.g., when pressing Ctrl+C)
+process.on('SIGINT', async () => {
+  log('SIGINT signal received', 'info');
+  await notify('SIGINT signal received. Application will shut down gracefully.');
+  await gracefulShutdown();
 });
