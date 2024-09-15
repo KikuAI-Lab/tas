@@ -794,7 +794,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
         // If GPT-4o-mini gives an inconclusive response, try with GPT-4o
         const gpt4Response = await retryGptRequest(async () => {
           return openai.chat.completions.create({
-            model: "gpt-4-turbo",
+            model: "gpt-4o",
             messages: textMessages,
             max_tokens: 10,
             temperature: 0.1,
@@ -922,7 +922,7 @@ Respond ONLY with 1 or 0.`;
 
   try {
     const gptResponse = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-4o-mini",
       messages: [
         { role: "system", content: gptPrompt },
         { role: "user", content: `Analyze for spam:\nSender: ${report.sender}\nSource: ${report.source}\nComplaint count: ${report.complaintCount}` }
