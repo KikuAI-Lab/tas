@@ -419,8 +419,9 @@ async function handleAdd(event: NewMessageEvent) {
 
     if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
         messageContent.includes("Send /next for a new spam report.")) {
-      if (autoMode && !processingReports.has('undos')) {
-        await sendToBot("/next 1");
+      if (autoMode && !processingReports.has('undos') && !isProcessingReports) {
+        log('Sending "/next 5" command', 'debug');
+        await sendToBot("/next 5");
       }
       consecutiveErrorCount = 0; // Сбрасываем счетчик ошибок при успешном сообщении
     }
@@ -437,7 +438,7 @@ async function handleAdd(event: NewMessageEvent) {
         return;
       }
 
-      if (!processingReports.has('undos')) {
+      if (!processingReports.has('undos') && !isProcessingReports) {
         const undoSuccess = await undo();
         if (!undoSuccess) {
           log('Undo process did not successfully process any reports', 'warn');
@@ -537,6 +538,7 @@ async function processReport(report: Report): Promise<void> {
     const processingStartTime = await redis.get(`processing_start:${report.reportId}`);
     if (processingStartTime && Date.now() - parseInt(processingStartTime) < MAX_PROCESSING_TIME) {
       log(`Skipping report ${report.reportId}. It's been processing for ${Date.now() - parseInt(processingStartTime)}ms`, 'debug');
+      isProcessingReports = false;
       return;
     }
     log(`Report ${report.reportId} processing timeout. Reprocessing.`, 'warn');
@@ -1542,7 +1544,7 @@ async function scheduleNextCommand() {
   }
 
   nextCommandTimeout = setTimeout(async () => {
-    if (autoMode && !isProcessingReports) {
+    if (autoMode && !isProcessingReports && !processingReports.has('undos')) {
       try {
         log('Initiating undo process before next command', 'debug');
         const undoSuccess = await undo();
@@ -1557,7 +1559,7 @@ async function scheduleNextCommand() {
         await gracefulShutdown();
       }
     } else {
-      log('Skipping next command as reports are being processed or auto mode is off', 'debug');
+      log('Skipping next command as reports are being processed, auto mode is off, or undo is in progress', 'debug');
     }
   }, 5000);
 }
@@ -1587,58 +1589,68 @@ function resetNextCommandTimer() {
 }
 
 async function undo(reportId?: string): Promise<boolean> {
+  if (processingReports.has('undos')) {
+    log('Undo process is already running', 'warn');
+    return false;
+  }
+
+  processingReports.add('undos');
   log(`Starting undo process${reportId ? ` for report ${reportId}` : ''}`, 'debug');
   
   const recentReportIds = reportId ? [reportId] : await getRecentReportIds();
   let successfulUndo = false;
   
-  for (const id of recentReportIds) {
-    const report = await getFromCache(id);
-    if (!report) {
-      log(`Report ${id} not found in cache, skipping`, 'debug');
-      continue;
-    }
-
-    if (!report.decisionSent) {
-      log(`Decision not sent for report ${id}, skipping undo`, 'debug');
-      continue;
-    }
-
-    const undoCommand = `/undo${id}`;
-    log(`Sending undo command for report ${id}`, 'debug');
-    await sendToBot(undoCommand);
-
-    const undoResponse = await waitForUndoResponse(id);
-    
-    if (undoResponse === 'success') {
-      log(`Successful undo for report ${id}`, 'debug');
-      report.decisionSent = false;
-      report.isOpen = true;
-      await saveCache(report);
-      
-      try {
-        await processReport(report);
-        successfulUndo = true;
-        log(`Successfully processed undone report ${id}`, 'debug');
-        
-        if (reportId) {
-          // Если был указан конкретный reportId и он успешно обработан, завершаем функцию
-          return true;
-        }
-        // Если конкретный reportId не был указан, продолжаем перебор
-      } catch (error) {
-        logErr(`Error processing undone report ${id}`, error);
-        // Продолжаем перебор, даже если не удалось обработать этот отчет
+  try {
+    for (const id of recentReportIds) {
+      const report = await getFromCache(id);
+      if (!report) {
+        log(`Report ${id} not found in cache, skipping`, 'debug');
+        continue;
       }
-    } else if (undoResponse === 'toolate') {
-      log(`Undo action no longer possible for report ${id}`, 'warn');
-    } else {
-      log(`Unexpected response for undo of report ${id}`, 'warn');
-    }
-  }
 
-  log(`Undo process completed. Successfully undone and processed: ${successfulUndo}`, 'debug');
-  return successfulUndo;
+      if (!report.decisionSent) {
+        log(`Decision not sent for report ${id}, skipping undo`, 'debug');
+        continue;
+      }
+
+      const undoCommand = `/undo${id}`;
+      log(`Sending undo command for report ${id}`, 'debug');
+      await sendToBot(undoCommand);
+
+      const undoResponse = await waitForUndoResponse(id);
+      
+      if (undoResponse === 'success') {
+        log(`Successful undo for report ${id}`, 'debug');
+        report.decisionSent = false;
+        report.isOpen = true;
+        await saveCache(report);
+        
+        try {
+          await processReport(report);
+          successfulUndo = true;
+          log(`Successfully processed undone report ${id}`, 'debug');
+          
+          if (reportId) {
+            // Если был указан конкретный reportId и он успешно обработан, завершаем функцию
+            return true;
+          }
+          // Если конкретный reportId не был указан, продолжаем перебор
+        } catch (error) {
+          logErr(`Error processing undone report ${id}`, error);
+          // Продолжаем перебор, даже если не удалось обработать этот отчет
+        }
+      } else if (undoResponse === 'toolate') {
+        log(`Undo action no longer possible for report ${id}`, 'warn');
+      } else {
+        log(`Unexpected response for undo of report ${id}`, 'warn');
+      }
+    }
+
+    return successfulUndo;
+  } finally {
+    processingReports.delete('undos');
+    log(`Undo process completed. Successfully undone and processed: ${successfulUndo}`, 'debug');
+  }
 }
 
 async function getFromCache(reportId: string): Promise<Report | null> {
