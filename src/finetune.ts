@@ -57,6 +57,78 @@ async function prepareData(): Promise<Report[]> {
   }
 }
 
+function createChatFineTuningExample(report: Report): { messages: ChatCompletionMessageParam[] } {
+  const systemMessage: ChatCompletionMessageParam = {
+    role: "system",
+    content: `You are an AI specialized in detecting commercial spam in Telegram groups across any language. Analyze the provided message based on content, context and metadata. Respond with only:
+1 for spam
+0 for not spam
+
+Spam Indicators:
+- Unsolicited commercial content or subtle marketing
+- Phishing, fake giveaways, unrealistic financial promises
+- Explicit sexual content or coded invitations for sexual services
+- Attempts to move conversations to private channels or other platforms
+- Sharing personal information without consent
+- >500 identical symbols or emojis
+- Self-promotion of unrelated channels/groups
+- Cryptocurrency/airdrop mentions with urgent calls to action
+- Any job offers, vacancies, or job postings
+- Multiple links, especially to bots or channels
+- Encrypted or coded messages resembling adult content sales
+- Requests to write in private messages
+- Common spam keywords
+- Sender names containing links or solicitations
+
+Not Spam Indicators:
+- Normal interactions, casual conversations, jokes
+- Legitimate information sharing, news, educational content
+- Expressive language, including aggressive profanity
+- Cultural content, local slang, region-specific discussions
+- Political discussions or criticisms (especially in Russian or Ukrainian)
+- Bot commands (starting with "/"), unless misused
+- Warnings about scams or spam
+- Short messages part of ongoing conversations
+- Satirical or ironic content
+- Controversial opinions without incitement
+- Single-word greetings or short phrases
+- Emotional expressions or outbursts
+
+Context Considerations:
+- Semantic analysis of meaning and intent
+- Conversation flow and group theme
+- Cultural and linguistic context, sender's country
+- Relevance to ongoing discussions or group activities
+- Complaint counts (not solely relied upon)
+- 'Source' field used for context, not spam evaluation
+
+REMINDER: Respond ONLY with 1 or 0. No explanations.`
+  };
+
+  const userMessage: ChatCompletionMessageParam = {
+    role: "user",
+    content: `Context:
+- Complaint count: ${report.complaint_count}
+- Source: ${report.source}
+- Sender: ${report.sender}
+${report.media_hashes.length > 0 ? `- Media types present: ${report.media_hashes.map(hash => hash.split(':')[0]).join(', ')}` : ''}
+
+Message content:
+"""
+${report.message_content.join('\n')}
+"""
+
+Analyze for spam:`
+  };
+
+  const assistantMessage: ChatCompletionMessageParam = {
+    role: "assistant",
+    content: report.is_spam.toString()
+  };
+
+  return { messages: [systemMessage, userMessage, assistantMessage] };
+}
+
 // Function to create fine-tuning examples
 function createFineTuningExample(report: Report): { prompt: string; completion: string } {
   const systemMessage = `Classify Telegram multilingual messages as spam (1) or not spam (0). Analyze:
@@ -129,16 +201,10 @@ function estimateContentPartLength(part: unknown): number {
   }
 }
 
-function estimateTokenCount(example: { prompt: string; completion: string }): number {
-  const totalCharacters = example.prompt.length + example.completion.length;
-  return Math.ceil(totalCharacters / 4); // Грубая оценка: 1 токен ≈ 4 символа
-}
-
-// Function to split data into chunks of approximately 1 million tokens
-function splitDataIntoChunks(data: { prompt: string; completion: string }[]): { prompt: string; completion: string }[][] {
+function splitDataIntoChunks(data: { messages: ChatCompletionMessageParam[] }[]): { messages: ChatCompletionMessageParam[] }[][] {
   console.log(`Starting to split ${data.length} examples into chunks...`);
-  const chunks: { prompt: string; completion: string }[][] = [];
-  let currentChunk: { prompt: string; completion: string }[] = [];
+  const chunks: { messages: ChatCompletionMessageParam[] }[][] = [];
+  let currentChunk: { messages: ChatCompletionMessageParam[] }[] = [];
   let currentTokenCount = 0;
   const TARGET_CHUNK_SIZE = 1000000; // 1 million tokens
 
@@ -163,8 +229,12 @@ function splitDataIntoChunks(data: { prompt: string; completion: string }[]): { 
   return chunks;
 }
 
+function estimateTokenCount(example: { messages: ChatCompletionMessageParam[] }): number {
+  return example.messages.reduce((sum, message) => sum + estimateMessageLength(message), 0);
+}
+
 // Function to export data to JSONL files
-function exportDataToJSONL(data: { prompt: string; completion: string }[][]): string[] {
+function exportDataToJSONL(data: { messages: ChatCompletionMessageParam[] }[][]): string[] {
   const filePaths: string[] = [];
 
   for (let i = 0; i < data.length; i++) {
@@ -172,8 +242,7 @@ function exportDataToJSONL(data: { prompt: string; completion: string }[][]): st
     const filePath = path.join(tmpdir(), `fine_tuning_data_${i + 1}.jsonl`);
     
     const jsonlContent = chunk.map(example => JSON.stringify({
-      prompt: example.prompt,
-      completion: example.completion
+      messages: example.messages
     })).join('\n');
     
     fs.writeFileSync(filePath, jsonlContent);
@@ -196,7 +265,7 @@ async function handleFineCommand(): Promise<string[]> {
     
     console.log('Creating fine-tuning examples...');
     const startCreate = Date.now();
-    const fineTuningData = rawData.map(createFineTuningExample);
+    const fineTuningData = rawData.map(createChatFineTuningExample);
     console.log(`Fine-tuning examples created. Time taken: ${(Date.now() - startCreate) / 1000} seconds. Examples created: ${fineTuningData.length}`);
     
     console.log('Splitting data into chunks...');
