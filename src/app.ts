@@ -205,8 +205,29 @@ async function notify(msg: string) {
     if (!client || !client.connected) {
       await reconnect();
     }
-    await client.sendMessage(ADMIN_ID, { message: msg });
-    if (DEEP_LOG) log(`Admin notified: ${msg}`, 'debug');
+    
+    const MAX_MESSAGE_LENGTH = 4096; // Максимальная длина сообщения в Telegram
+    
+    if (msg.length <= MAX_MESSAGE_LENGTH) {
+      await client.sendMessage(ADMIN_ID, { message: msg });
+    } else {
+      // Разбиваем сообщение на части
+      const parts = [];
+      for (let i = 0; i < msg.length; i += MAX_MESSAGE_LENGTH) {
+        parts.push(msg.slice(i, i + MAX_MESSAGE_LENGTH));
+      }
+      
+      // Отправляем каждую часть отдельно
+      for (let i = 0; i < parts.length; i++) {
+        await client.sendMessage(ADMIN_ID, { 
+          message: `Part ${i + 1}/${parts.length}:\n${parts[i]}`
+        });
+        // Добавляем небольшую задержку между отправкой частей
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    
+    if (DEEP_LOG) log(`Admin notified: ${msg.substring(0, 100)}...`, 'debug');
   } catch (error) {
     logErr('notify', error);
   }
