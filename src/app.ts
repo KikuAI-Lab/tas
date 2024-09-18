@@ -804,7 +804,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   - Short, casual greetings are typically not spam, but consider the full context, especially if the source or sender name suggests spam-related activities.
   - Messages promoting social media services, especially with promises of quick gains and urgent calls to action, are very likely to be spam.
   
-  **Respond ONLY with number 1 (for spam) or 0 (for not spam) without any explanations.**
+  **Respond ONLY with number 1 (for spam) or 0 (for not spam), without any explanations.**
   **Your analysis:**
   `;
 
