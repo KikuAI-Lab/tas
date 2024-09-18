@@ -690,61 +690,123 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
 
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
-  const gptPrompt = `You are an AI specialized in detecting commercial spam in Telegram groups across any language. Analyze the provided message based on content, context, and metadata. Respond ONLY with:
+  const gptPrompt = `You are an advanced AI specialized in detecting commercial spam in Telegram groups across any language. Your task is to analyze the provided message along with its metadata and context to determine whether it is spam. Respond ONLY with:
   1 for spam
   0 for not spam
   
-**Spam Indicators:**
-  - Unsolicited commercial content or subtle marketing
-  - Phishing, fake giveaways, unrealistic financial promises
-  - Explicit sexual content or coded invitations for sexual services (e.g., "aviliable", "avaible", "свободна", "Скучно? Пиши")
-  - Attempts to move conversations to private channels or other platforms
-  - Sharing personal information without consent
-  - >500 identical symbols or emojis
-  - Self-promotion of unrelated channels/groups
-  - Cryptocurrency/airdrop mentions with urgent calls to action
-  - Any job offers, vacancies, or job postings
-  - Multiple links, especially to bots or channels (e.g., "https://t.me/channel", "https://t.me/botbot")
-  - Encrypted or coded messages resembling adult content sales (e.g., "CP", "TN", "GV", "TF", "SL", "ID")
-  - Requests to write in private messages (e.g., "write + in private")
-  - Common spam keywords
-  - Sender names containing links or solicitations
+  **Input Structure:**
+  - **Message:** The content of the message to analyze.
+  - **Source:** The name of the group where the message was sent.
+  - **Sender:** The name or nickname of the sender. Emoji flags indicate the sender's country.
+  - **Complaints:** The number of complaints the message has received.
   
-  **Not Spam Indicators:**
-  - Normal interactions, casual conversations, jokes (e.g., "haha", "lol", "lmao", "😂")
-  - Legitimate information sharing, news, educational content
-  - Expressive language, including agressive profanity, even if it appears provocative at first glance or very offensive
-  - Cultural content, local slang, region-specific discussions
-  - Political discussions or criticisms (ecpecially in Russian or Ukrainian)
-  - Bot commands (starting with "/"), unless misused (e.g., "/start" or "/help")
-  - Warnings about scams or spam (e.g., "Scam", "scamer ni" or similar warnings)
-  - Short messages part of ongoing conversations (e.g., short symbols, numbers, emoticons, or phrases - even if they have a high complaint count)
-  - Satirical or ironic content (even if it appears provocative at first glance)
-  - Controversial opinions without incitement
-  - Single-word greetings or short phrases (e.g., "Hi", "Hello", "How are you?")
-  - Emotional expressions or outbursts (even if they include profanity or offensive language)
+  **Spam Classification Criteria:**
   
-  **Context Considerations:**
-  - Semantic analysis of meaning and intent
-  - Conversation flow and group theme
-  - Cultural and linguistic context, sender's country
-  - Relevance to ongoing discussions or group activities
-  - Complaint counts (not solely relied upon)
-  - 'Source' field used for context, not spam evaluation
+  1. **Content-Based Indicators:**
+     - **Commercial and Financial Offers:**
+       - ANY job offers, vacancies, or employment postings.
+       - Unsolicited marketing or promotional content.
+       - Investment opportunities, especially those promising high returns.
+       - Phishing attempts, fake giveaways, or unrealistic financial promises.
+       - Mentions of cryptocurrencies, airdrops, or similar financial schemes.
+       - Offers of work-from-home or remote job opportunities with high earnings potential.
+       - Specific earnings claims (e.g., "earn $1000 daily").
+       - Mentions of financial incentives tied to minimal effort.
+       - Suspicious percentage returns (e.g., "23.450% за сутки").
+       - Claims of "free" services combined with financial or investment themes.
+     - **Sexual Content:**
+       - Explicit sexual content or coded invitations for sexual services (e.g., "available", "avaible", "свободна", "Скучно? Пиши").
+       - Offers of adult or escort services, even if indirect (e.g. "проведем эту ночь вместе", "ищу мужчину").
+     - **Excessive Links and URLs:**
+       - Presence of multiple links (more than 2) in a single message.
+       - Use of URL shorteners or suspicious domains.
+       - Referral links containing parameters like "ref_" or "startapp=".
+     - **Obfuscated Text and Symbols:**
+       - Use of numbers or symbols to replace letters (e.g., "h3ll0" instead of "hello").
+       - Excessive use of emojis or repetitive symbols (>10).
+       - Obfuscated or intentionally misspelled keywords related to spam.
+     - **Urgency and Incentives:**
+       - Phrases that create a sense of urgency (e.g., "hurry", "limited time offer").
+       - Promises of bonuses, gifts, or free items as incentives.
+     - **Legitimacy Claims:**
+       - Unverified claims of official partnerships or endorsements.
+       - References to support or admins to legitimize the offer.
+       - Phrases like "no bugs", "legit", or "trusted" to appear legitimate.
+     - **Repetitive Content:**
+       - Repetition of the same message or key phrases.
+       - Numbered lists of steps for joining or investing.
+       - Many spam emojis or symbols (e.g., "🔥", "✅", "💰", "📌")
+     - **Group or Channel Promotion:**
+       - Repeated mentions of Telegram channels or groups, especially if combined with financial themes.
+       - Invitations to join other groups or channels for financial opportunities.
+     - **Social Media Promotion Services:**
+       - Offers to boost OnlyFans, Fansly, or other social media accounts.
+       - Promises of increased traffic or followers.
+       - Mentions of "guaranteed gains" or similar phrases.
+     - **Urgency and Exclusivity:**
+       - Phrases like "LIMITED SPOTS", "Limited Availability", "SECURE YOUR SPOT".
+       - Claims of time-sensitive offers or deals.
+     - **Excessive Use of Emojis and Capital Letters:**
+       - Messages with an unusually high number of emojis (>5 per sentence).
+       - Extensive use of capital letters for emphasis.
   
-  **Example Spam Message:**
-"""
-🔥 Limited time offer! Earn $1000 daily by joining our crypto scheme. Click here: https://t.me/crypto_bot 🔥
-"""
-
-**Example Not Spam Message:**
-"""
-@username Thanks for sharing the update! Really insightful.
-"""
-
-**REMINDER:** Respond ONLY with 1 or 0. No explanations.
-
-Your analysis:`;
+  2. **Context-Based Indicators:**
+     - **Sender Analysis:**
+       - Sender names or nicknames containing spam-specific patterns or keywords (e.g., "DM", "BIO").
+       - For very short messages, pay extra attention to the sender's name for spam indicators.
+     - **Complaint Counts:**
+       - Messages with an extremely high number of complaints (e.g., >50) should be closely evaluated, but not automatically classified as spam.
+       - Consider the overall context and content of the message, regardless of complaint count.
+     - **Message Length:**
+       - Very short messages (less than 5 words) without spam indicators are typically not spam.
+       - Messages that combine excessive emojis with financial offers are more likely to be spam.
+       - For 1-2 word messages, consider the broader context, including the source group name and any previous message patterns from the same sender.
+     - **Relevance to Group:**
+       - Messages that are out of context with the group's theme or ongoing discussions.
+       - Messages that abruptly change the topic to financial offers or job postings.
+     - **Source Group Analysis:**
+       - Consider the nature of the group where the message was posted. Groups with names suggesting spam, hacking, or illicit activities should increase suspicion.
+     - **Multiple Indicators:**
+       - Messages that combine commercial offers, promises of quick gains, and calls for urgent action are highly likely to be spam.
+  
+  3. **Not Spam Indicators:**
+     - **Normal Communication:**
+       - Casual conversations, jokes, memes, and personal interactions.
+       - Short expressions of gratitude (e.g., "Thanks!", "Great job").
+       - Legitimate information sharing, news, or educational content.
+     - **Expressive Language:**
+       - Use of profanity, insults, or offensive language, even if aggressive or vulgar.
+       - Emotional expressions or outbursts. 
+     - **Cultural and Contextual Content:**
+       - Local slang, cultural references, or region-specific discussions.
+       - Political discussions or criticisms, even if controversial or using strong language.
+     - **Functional Messages:**
+       - Bot commands (starting with "/") unless misused.
+       - Warnings about scams or spam.
+       - Satirical, ironic, or controversial opinions without commercial intent.
+     - **Greetings and Updates:**
+       - Greetings or short phrases in any language (e.g., "Hello", "Привет", "Yoo").
+       - Short informational updates about group activities or moderation.
+       - Messages referring to previous conversations or ongoing discussions.
+  
+  **Instructions:**
+  - Analyze the message based on the above spam and not spam indicators.
+  - Consider the sender's name for any spam-related patterns (spam @usernames in sender's name are not considered spam).
+  - Ensure multi-language support by recognizing spam indicators across different languages and scripts.
+  - For very short messages (1-2 words), consider the full context, especially the source group name and sender information.
+  - Be cautious with financial-related content, especially when combined with promises of easy money or high returns.
+  - Pay extra attention to messages that combine multiple spam indicators, especially those related to social media promotion and urgency.
+  
+  **REMINDER:** 
+  - Do not consider the 'Source' field as definitive; it is only for contextual information.
+  - Ignore the sender's nickname unless it contains spam-specific patterns.
+  - High complaint counts alone do not automatically indicate spam. Always consider the full context and content of the message.
+  - Short, casual greetings are typically not spam, but consider the full context, especially if the source or sender name suggests spam-related activities.
+  - Messages promoting social media services, especially with promises of quick gains and urgent calls to action, are very likely to be spam.
+  
+  **Respond ONLY with number 1 (for spam) or 0 (for not spam) without any explanations.**
+  **Your analysis:**
+  `;
 
 const mediaPrompt = `You are an AI specialized in detecting commercial spam in Telegram groups by analyzing images or media content. Evaluate based on visual elements, embedded text, and context within the group. Respond ONLY with:
 1 for spam
