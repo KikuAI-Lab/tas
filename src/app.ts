@@ -664,7 +664,7 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   
   const hasStory = report.mediaHashes.some(hash => hash.startsWith('story:'));
   
-  const hasMediaWithComplaints = report.mediaHashes.length > 0 && report.complaintCount > 2;
+  const hasMediaWithComplaints = report.mediaHashes.length > 0 && report.complaintCount > 1;
 
   if (hasLinksOrContacts || 
       hasDangerousFile || 
@@ -676,7 +676,7 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
     if (hasDangerousFile) reason += " Dangerous file detected";
     if (hasInlineKeyboard) reason += " Inline keyboard detected";
     if (hasStory) reason += " Story detected";
-    if (hasMediaWithComplaints) reason += " Media with >2 complaints";
+    if (hasMediaWithComplaints) reason += " Media with >1 complaints";
 
     log(`Fast check detected spam for report ${report.reportId}: ${reason}`, 'debug');
     return { 
