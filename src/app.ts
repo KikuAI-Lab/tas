@@ -794,9 +794,11 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Suspicious percentage returns (e.g., "23.450% за сутки").
        - Claims of "free" services combined with financial or investment themes.
        - Contetsts (e.g. "100+400-134+200=? кто первый напишет получит приз")
-      - Asks to write in private messages (e.g., "lmk if interested", "Gm" "ЛС", "Dm me", "write + in private").
-      - Any part-time work, especially if it is not related to the topic of the group. (e.g. "нужны люди", "есть подработка", "есть темка на 10к в день").
-      - Offers to borrow money (e.g., "займу деньги", "помогу разобраться с долгами").
+       - Asks to write in private messages (e.g., "lmk if interested", "Gm" "ЛС", "Dm me", "write + in private").
+       - Any part-time work, especially if it is not related to the topic of the group. (e.g. "нужны люди", "есть подработка", "есть темка на 10к в день").
+       - Offers to borrow money (e.g., "займу деньги", "помогу разобраться с долгами").
+       - Any offers of services (even household ones).
+       - Any invitations to join some activity.
      - **Sexual Content:**
        - Explicit sexual content or coded invitations for sexual services (e.g., "available", "avaible", "свободна", "Скучно? Пиши").
        - Offers of adult or escort services, even if indirect (e.g. "проведем эту ночь вместе", "ищу мужчину").
