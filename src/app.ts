@@ -1509,6 +1509,11 @@ function cleanupLRUCache(): void {
 
 
 async function cleanupCache() {
+  if (isShuttingDown) {
+    log('cleanupCache: Application is shutting down, cache cleanup skipped', 'debug');
+    return;
+  }
+
   try {
     const now = Date.now();
     let deletedCount = 0;
@@ -1520,20 +1525,28 @@ async function cleanupCache() {
       }
     }
 
-    const redisKeys = await redis.keys('report:*');
-    const pipeline = redis.pipeline();
-    for (const key of redisKeys) {
-      const report = JSON.parse(await redis.get(key) || '{}') as Report;
-      if (now - report.timestamp > 24 * 60 * 60 * 1000) {
-        pipeline.del(key);
-        deletedCount++;
+    if (redis.status === 'ready') {
+      const redisKeys = await redis.keys('report:*');
+      const pipeline = redis.pipeline();
+      for (const key of redisKeys) {
+        const report = JSON.parse(await redis.get(key) || '{}') as Report;
+        if (now - report.timestamp > 24 * 60 * 60 * 1000) {
+          pipeline.del(key);
+          deletedCount++;
+        }
       }
+      await pipeline.exec();
+    } else {
+      log('Redis connection is not ready, skipping Redis cache cleanup', 'warn');
     }
-    await pipeline.exec();
 
     log(`Cleaned up ${deletedCount} old reports from cache`, 'info');
   } catch (error) {
-    logErr('cleanupCache', error);
+    if (isShuttingDown) {
+      log('cleanupCache: Application is shutting down, error ignored', 'debug');
+    } else {
+      logErr('cleanupCache', error);
+    }
   }
 }
 
