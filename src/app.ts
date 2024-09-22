@@ -792,6 +792,12 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
      - **Excessive Use of Emojis and Capital Letters:**
        - Messages with an unusually high number of emojis (>5 per sentence).
        - Extensive use of capital letters for emphasis.
+     - **Fake Official Notifications:**
+       - Messages imitating official notifications from banks, government agencies, Telegram system message, or other organizations.
+       - Unusual formatting with excessive use of emojis, numbers as substitutes for text, or strange time formats.
+       - Requests for urgent action or personal information updates related to accounts or services.
+       - Mentioning of system upgrades, maintenance, or service interruptions with specific time frames.
+       - Use of official-sounding language combined with unprofessional formatting or excessive emoji use.
   
   2. **Context-Based Indicators:**
      - **Sender Analysis:**
