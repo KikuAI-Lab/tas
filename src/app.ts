@@ -2488,7 +2488,7 @@ async function resetRestartCounter(): Promise<void> {
   try {
     await redis.del('app_restart_count');
     await redis.del('app_last_restart');
-    log('Restart counter reset after successful decision', 'info');
+    log('Restart counter reset after successful decision', 'debug');
   } catch (error) {
     logErr('resetRestartCounter', error);
   }
