@@ -440,7 +440,7 @@ async function handleAdd(event: NewMessageEvent) {
         }
       }, 180000);
       
-      setTimeout(() => sendToBot("/next 3"), 500);
+      setTimeout(() => sendToBot("/next 3"), 100);
     } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.")) {
       noReportsFoundCount = 0;
       lastReportProcessTime = Date.now();
@@ -754,6 +754,13 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Offers to borrow money (e.g., "займу деньги", "помогу разобраться с долгами").
        - Any offers of services (even household ones).
        - Any invitations to join some activity.
+     - **E-commerce and Social Media Promotion:**
+       - Offers for SEO services, advertising setup, or product analytics.
+       - Promises to increase sales or visibility on platforms like WB, Ozon, Amazon, etc.
+       - Offers for account management or "full maintenance" of online stores.
+       - Claims of expertise in e-commerce platforms or social media marketing.
+       - Mentions of "cases" or "portfolios" in profile descriptions.
+       - Unsolicited offers to improve search rankings or "get to the top".
      - **Sexual Content:**
        - Explicit sexual content or coded invitations for sexual services (e.g., "Meet up", "встречусь", "available", "avaible", "свободна", "Скучно? Пиши").
        - Offers of adult or escort services, even if indirect (e.g. "проведем эту ночь вместе", "ищу мужчину").
