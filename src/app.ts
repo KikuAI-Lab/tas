@@ -738,8 +738,9 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   
   1. **Content-Based Indicators:**
      - **Commercial and Financial Offers:**
+       - ANY sale or promotion of goods or services, regardless of the context or group theme.
        - ANY job offers, vacancies, or employment postings.
-       - Unsolicited marketing or promotional content.
+       - Unsolicited marketing or promotional content for any product or service.
        - Investment opportunities, especially those promising high returns.
        - Phishing attempts, fake giveaways, or unrealistic financial promises.
        - Mentions of cryptocurrencies, airdrops, or similar financial schemes.
@@ -748,12 +749,11 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Mentions of financial incentives tied to minimal effort.
        - Suspicious percentage returns (e.g., "23.450% за сутки").
        - Claims of "free" services combined with financial or investment themes.
-       - Contetsts (e.g. "100+400-134+200=? кто первый напишет получит приз")
-       - Asks to write in private messages (e.g., "lmk if interested", "Gm" "ЛС", "Dm me", "write + in private").
-       - Any part-time work, especially if it is not related to the topic of the group. (e.g. "нужны люди", "есть подработка", "есть темка на 10к в день").
-       - Offers to borrow money (e.g., "займу деньги", "помогу разобраться с долгами").
-       - Any offers of services (even household ones).
-       - Any invitations to join some activity.
+       - Contests or giveaways promoting products or services.
+       - Asks to write in private messages for product inquiries or purchases.
+       - Offers to borrow money or financial assistance.
+       - Any offers of services or part-time work, even for everyday tasks or household chores.
+       - Invitations to join some activities.
      - **E-commerce and Social Media Promotion:**
        - Offers for SEO services, advertising setup, or product analytics.
        - Promises to increase sales or visibility on platforms like WB, Ozon, Amazon, etc.
@@ -761,116 +761,110 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Claims of expertise in e-commerce platforms or social media marketing.
        - Mentions of "cases" or "portfolios" in profile descriptions.
        - Unsolicited offers to improve search rankings or "get to the top".
+     - **Product Descriptions and Catalogs:**
+       - Detailed product descriptions with prices.
+       - Links or references to online catalogs or marketplaces.
+       - Use of common e-commerce terms like "in stock", "limited quantity", or "order now".
+     - **Discount and Sale Announcements:**
+       - Messages primarily focused on announcing sales, discounts, or special offers.
+       - Time-limited promotional offers for any products or services.
+     - **Referral and Affiliate Marketing:**
+       - Encouragement to use referral codes or links for purchases.
+       - Affiliate marketing messages for any products or platforms.
      - **Sexual Content:**
-       - Explicit sexual content or coded invitations for sexual services (e.g., "Open vcs", "Meet up", "встречусь", "available", "avaible", "свободна", "Скучно? Пиши").
-       - Offers of adult or escort services, even if indirect (e.g. "проведем эту ночь вместе", "ищу мужчину").
-       - Encrypted or coded messages resembling adult content sales (e.g., "Ready vc,,s full face pc aja", "CP", "TN", "GV", "TF", "SL", "ID" - in any register)
-       - If there is any type of media and attraction write in PM, (e.g. "message: 'hii dmm' media type: 'video'")
+       - Explicit sexual content or coded invitations for sexual services. (e.g., "Open vcs", "Meet up", "встречусь", "available", "avaible", "свободна", "Скучно? Пиши")
+       - Offers of adult or escort services, even if indirect. (e.g. "проведем эту ночь вместе", "ищу мужчину")
+       - Encrypted or coded messages resembling adult content sales. (e.g. "Ready vcs", "CP", "TN", "GV", "TF", "SL", "ID" - in any register)
      - **Excessive Links and URLs:**
        - Presence of multiple links (more than 2) in a single message.
        - Use of URL shorteners or suspicious domains.
        - Referral links containing parameters like "ref_" or "startapp=".
-       - Many contact numbers (or if they have more than 2 complaints)
      - **Obfuscated Text and Symbols:**
        - Use of numbers or symbols to replace letters (e.g., "h3ll0" instead of "hello").
        - Excessive use of emojis or repetitive symbols (>10).
-       - Obfuscated or intentionally misspelled keywords related to spam.
+       - Obfuscated or intentionally misspelled keywords related to spam or sales.
      - **Urgency and Incentives:**
        - Phrases that create a sense of urgency (e.g., "hurry", "limited time offer").
-       - Promises of bonuses, gifts, or free items as incentives.
+       - Promises of bonuses, gifts, or free items as incentives for purchases.
      - **Legitimacy Claims:**
        - Unverified claims of official partnerships or endorsements.
-       - References to support or admins to legitimize the offer.
+       - References to support or admins to legitimize offers.
        - Phrases like "no bugs", "legit", or "trusted" to appear legitimate.
-     - **Repetitive Content:**
-       - Repetition of the same message or key phrases.
-       - Numbered lists of steps for joining or investing.
-       - Many spam emojis or symbols (e.g., "🔥", "✅", "💰", "📌")
      - **Group or Channel Promotion:**
-       - Repeated mentions of Telegram channels or groups, especially if combined with financial themes.
-       - Invitations to join other groups or channels for financial opportunities.
+       - Repeated mentions of Telegram channels or groups, especially if combined with commercial themes.
+       - Invitations to join other groups or channels for shopping or financial opportunities.
      - **Social Media Promotion Services:**
        - Offers to boost OnlyFans, Fansly, or other social media accounts.
-       - Promises of increased traffic or followers.
-       - Mentions of "guaranteed gains" or similar phrases.
+       - Promises of increased traffic or followers for commercial purposes.
      - **Urgency and Exclusivity:**
-       - Phrases like "LIMITED SPOTS", "Limited Availability", "SECURE YOUR SPOT".
+       - Phrases like "LIMITED SPOTS", "Limited Availability", "SECURE YOUR SPOT" related to product sales.
        - Claims of time-sensitive offers or deals.
      - **Excessive Use of Emojis and Capital Letters:**
-       - Messages with an unusually high number of emojis (>5 per sentence).
-       - Extensive use of capital letters for emphasis.
+       - Messages with an unusually high number of emojis (>5 per sentence), especially in product descriptions.
+       - Extensive use of capital letters for emphasis in promotional content.
      - **Fake Official Notifications:**
-       - Messages imitating official notifications from banks, government agencies, Telegram system message, or other organizations.
-       - Unusual formatting with excessive use of emojis, numbers as substitutes for text, or strange time formats.
-       - Requests for urgent action or personal information updates related to accounts or services.
-       - Mentioning of system upgrades, maintenance, or service interruptions with specific time frames.
-       - Use of official-sounding language combined with unprofessional formatting or excessive emoji use.
+       - Messages imitating official notifications from banks, government agencies, or other organizations, especially if they involve transactions or purchases.
      - **Pattern-Based Spam:**
-       - Messages consisting primarily of repetitive patterns of emojis or symbols.
-       - ASCII art or emoji art that forms shapes or patterns, especially when combined with promotional content.
-       - Messages that use a large number of Unicode characters to create visual patterns.
+       - Messages consisting primarily of repetitive patterns of emojis or symbols, often used in product listings.
+       - Repetition of the same message or key phrases related to sales or promotions.
+       - Numbered lists of steps for joining, investing, or purchasing.
      - **Illegal Services and Documents:**
-       - Offers to provide or assist in obtaining official documents through unofficial means (e.g., driver's licenses, passports, certificates).
-       - Mentions of bypassing official procedures or databases (e.g., "с внесением в базу").
-       - Offers to help with exams, tests, or qualifications without proper study (e.g., "помощь на экзаменах").
-       - Any services that suggest circumventing legal processes or regulations.
-       - Offers related to fake or forged documents.
+       - Offers to provide or assist in obtaining official documents through unofficial means.
+       - Mentions of bypassing official procedures or databases for commercial gain.
+       - Offers related to fake or forged documents, especially if tied to financial transactions.
   
   2. **Context-Based Indicators:**
      - **Sender Analysis:**
-       - Sender names or nicknames containing spam-specific patterns or keywords (e.g., "DM", "BIO").
-       - For very short messages, pay extra attention to the sender's name for spam indicators.
+       - Sender names or nicknames containing spam-specific patterns or keywords related to sales or marketing.
+       - For very short messages, pay extra attention to the sender's name for commercial indicators.
      - **Complaint Counts:**
        - Messages with an extremely high number of complaints (e.g., >50) should be closely evaluated, but not automatically classified as spam.
        - Consider the overall context and content of the message, regardless of complaint count.
      - **Message Length:**
        - Very short messages (less than 5 words) without spam indicators are typically not spam.
-       - Messages that combine excessive emojis with financial offers are more likely to be spam.
-       - For 1-2 word messages, consider the broader context, including the source group name and any previous message patterns from the same sender.
+       - Messages that combine excessive emojis with commercial offers are more likely to be spam.
      - **Relevance to Group:**
-       - Messages that are out of context with the group's theme or ongoing discussions.
-       - Messages that abruptly change the topic to financial offers or job postings.
+       - Messages that are out of context with the group's theme or ongoing discussions, especially if they introduce commercial content.
+       - Messages that abruptly change the topic to product offers or job postings.
      - **Source Group Analysis:**
-       - Consider the nature of the group where the message was posted. Groups with names suggesting spam, hacking, or illicit activities should increase suspicion.
+       - Consider the nature of the group where the message was posted. Groups with names suggesting spam, hacking, or illicit activities should increase suspicion of commercial spam.
      - **Multiple Indicators:**
        - Messages that combine commercial offers, promises of quick gains, and calls for urgent action are highly likely to be spam.
   
   3. **Not Spam Indicators:**
      - **Normal Communication:**
-       - Casual conversations, jokes, memes, and personal interactions.
+       - Casual conversations, jokes, memes, and personal interactions without commercial intent.
        - Short expressions of gratitude (e.g., "Thanks!", "Great job").
-       - Legitimate information sharing, news, or educational content.
+       - Legitimate information sharing, news, or educational content without promotional elements.
      - **Expressive Language:**
-       - Use of profanity, insults, or offensive language, even if aggressive or vulgar.
-       - Emotional expressions or outbursts. 
+       - Use of profanity, insults, or offensive language, even if aggressive or vulgar, unless combined with commercial content.
+       - Emotional expressions or outbursts without sales pitches. 
      - **Cultural and Contextual Content:**
-       - Local slang, cultural references, or region-specific discussions.
+       - Local slang, cultural references, or region-specific discussions without commercial elements.
        - Political discussions or criticisms, even if controversial or using strong language.
      - **Functional Messages:**
-       - Bot commands (starting with "/", e.g., "/start", "/help", /start@AdmiinLyLy_bot) - if they have less than 3 complaints.
+       - Bot commands (starting with "/", e.g., "/start", "/help" or "/start@AdmiinLyLy_bot") - if they have less than 3 complaints.
        - Warnings about scams or spam.
        - Satirical, ironic, or controversial opinions without commercial intent.
      - **Greetings and Updates:**
-       - Greetings or short phrases in any language (e.g., "Hello", "Привет", "Yoo").
+       - Simple greetings or short phrases in any language (e.g., "Hello", "Привет", "Yoo").
        - Short informational updates about group activities or moderation.
-       - Messages referring to previous conversations or ongoing discussions.
+       - Messages referring to previous conversations or ongoing discussions without sales elements.
   
   **Instructions:**
   - Analyze the message based on the above spam and not spam indicators.
   - Consider the sender's name for any spam-related patterns (spam @usernames in sender's name are not considered spam).
   - Ensure multi-language support by recognizing spam indicators across different languages and scripts.
   - For very short messages (1-2 words), consider the full context, especially the source group name and sender information.
-  - Be cautious with financial-related content, especially when combined with promises of easy money or high returns.
-  - Pay extra attention to messages that combine multiple spam indicators, especially those related to social media promotion and urgency.
-  - Be particularly vigilant of messages consisting primarily of repetitive emoji or symbol patterns, especially when combined with promotional content in the sender's name or other context.
+  - Be particularly vigilant of messages that combine multiple spam indicators, especially those related to product sales and promotions.
+  - ANY message primarily focused on selling goods or services should be classified as spam, regardless of the product's nature or the group's theme.
   
   **REMINDER:** 
   - Do not consider the 'Source' field as definitive; it is only for contextual information.
   - Ignore the sender's nickname unless it contains spam-specific patterns.
   - High complaint counts alone do not automatically indicate spam. Always consider the full context and content of the message.
   - Short, casual greetings are typically not spam, but consider the full context, especially if the source or sender name suggests spam-related activities.
-  - Messages promoting social media services, especially with promises of quick gains and urgent calls to action, are very likely to be spam.
-  - Messages consisting primarily of repetitive emoji patterns or ASCII/emoji art, especially when combined with promotional content, are likely to be spam.
+  - Messages promoting social media services or any kind of product, especially with promises of quick gains and urgent calls to action, are very likely to be spam.
   
   **Respond ONLY with number 1 (for spam) or 0 (for not spam), without any explanations.**
   **Your analysis:**
@@ -881,40 +875,41 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
 0 for not spam
 
 **High Priority Indicators:**
-- Unrelated promotional content or advertisements
-- Visuals with unrealistic financial promises or get-rich-quick schemes
-- Sexually explicit or suggestive imagery inappropriate for the group
-- Excessive branding or watermarks from unrelated sources
-- Encouragement to join other groups, channels, or external websites
-- Screenshots promoting specific services or products
-- Images of official documents or cards that could be related to illegal services
+- ANY promotional content or advertisements for goods or services
+- Visuals with product displays, price tags, or catalog-like presentations
+- Images containing logos, branding, or watermarks from commercial entities
+- Screenshots of online marketplaces or e-commerce platforms
+- Product packaging or labeled merchandise
+- Before/after images typically used in product promotions
+- Infographics or charts about products, services, or financial opportunities
+- Images with multiple QR codes or links
+- Visuals encouraging joining other groups, channels, or external websites for purchases
 
 **Medium Priority Indicators:**
-- Infographics or charts about cryptocurrency or financial opportunities
-- Images with multiple QR codes or links
-- Visuals out of place with the group's usual content
-- Stock photos or generic imagery commonly used in spam
+- Stock photos or generic imagery commonly used in spam or advertising
 - Screenshots of promotional social media posts
+- Images of official documents or cards that could be related to commercial services
+- Visuals out of place with the group's usual content, especially if they look commercial
 
 **Low Priority Indicators:**
-- Text in a different language than the group's primary language
-- Memes or humorous images potentially masking promotional content
-- Significantly lower or higher quality than typical group content
+- Text in a different language than the group's primary language, if it appears commercial
+- Professional-looking photos that seem out of place in the conversation
 
 **Not Spam Indicators:**
-- Legitimate news images or infographics related to the group's theme
+- Legitimate news images or infographics related to the group's theme without commercial intent
 - Personal photos or images consistent with normal interactions
-- Memes, jokes, or satirical content, even if provocative
-- Images with strong language or provocative content relevant to discussions
-- Political or activist imagery, unless violating group rules
-- Artistic or creative content, even if unconventional or shocking
+- Memes, jokes, or satirical content, even if provocative, unless clearly promoting a product
+- Images with strong language or provocative content relevant to discussions, without sales elements
+- Political or activist imagery, unless violating group rules or promoting products
+- Artistic or creative content, even if unconventional or shocking, without commercial elements
 
 **Example Spam Image:**
-- An image promoting a fake investment scheme with excessive branding.
-- A photo of a driver's license or passport with an offer to provide similar documents.
+- A collage of products with prices and "Buy Now" text
+- A screenshot of an online store's product page
 
 **Example Not Spam Image:**
-- A meme related to the ongoing conversation in the group.
+- A meme related to the ongoing conversation in the group
+- A personal photo shared in the context of a discussion
 
 **REMINDER:** Respond ONLY with 1 or 0. No explanations.
 
