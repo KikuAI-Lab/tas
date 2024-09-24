@@ -57,6 +57,7 @@ let apiRequestsCount = 0;
 let PROCESSING_DELAY = 0;
 let client: TelegramClient;
 let isShuttingDown = false;
+let lastDecisionSentTime = 0;
 let redisBatch: Report[] = [];
 let consecutiveErrorCount = 0;
 let isProcessingReports = false;
@@ -1243,18 +1244,18 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
     await new Promise(resolve => setTimeout(resolve, COMMAND_DELAY));
   }
 
-  const startTime = Date.now();
+  const currentTime = Date.now();
+  const timeSinceLastDecision = currentTime - lastDecisionSentTime;
+
+  if (timeSinceLastDecision < 20) {
+    log(`Decision sent too quickly (${timeSinceLastDecision}ms) after previous decision for report ${report.reportId}. Stopping application.`, 'error');
+    await notify(`Critical error: Decision sent too quickly (${timeSinceLastDecision}ms) after previous decision for report ${report.reportId}. Application stopped.`);
+    process.exit(1);
+  }
 
   try {
     await sendToBot(decision.isSpam ? '😡 SPAM' : '😌 NO');
-    const endTime = Date.now();
-    const executionTime = endTime - startTime;
-
-    if (executionTime < 20) {
-      log(`Decision sent too quickly (${executionTime}ms) for report ${report.reportId}. Stopping application.`, 'error');
-      await notify(`Critical error: Decision sent too quickly (${executionTime}ms) for report ${report.reportId}. Application stopped.`);
-      process.exit(1);
-    }
+    lastDecisionSentTime = Date.now();
 
     log(`Sent decision: ${decision.isSpam ? 'SPAM' : 'NOT SPAM'}`, 'info');
     report.decisionSent = true;
