@@ -426,22 +426,9 @@ async function handleAdd(event: NewMessageEvent) {
       
       idleTimeout = setTimeout(async () => {
         if (Date.now() - lastReportProcessTime > 180000) {
-          log('No reports processed for 3 minutes. Entering idle mode.', 'warn');
-          await notify('Application entered idle mode due to lack of reports.');
-          
-          if (idleResumeTimeout) {
-            clearTimeout(idleResumeTimeout);
-          }
-          
-          idleResumeTimeout = setTimeout(async () => {
-            log('Resuming from idle mode', 'info');
-            await notify('Application resuming from idle mode.');
-            await sendToBot("/next 4");
-          }, 3600000);
+          await enterIdleMode();
         }
       }, 180000);
-      
-      setTimeout(() => sendToBot("/next"), 100);
     } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.")) {
       noReportsFoundCount = 0;
       lastReportProcessTime = Date.now();
@@ -449,11 +436,6 @@ async function handleAdd(event: NewMessageEvent) {
       if (idleTimeout) {
         clearTimeout(idleTimeout);
         idleTimeout = null;
-      }
-      
-      if (idleResumeTimeout) {
-        clearTimeout(idleResumeTimeout);
-        idleResumeTimeout = null;
       }
     } else if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
                messageContent.includes("Send /next for a new spam report.")) {
@@ -2329,6 +2311,24 @@ async function checkSystemHealth() {
     await notify(`System health check failed: ${error instanceof Error ? error.message : String(error)}. Attempting restart...`);
     process.exit(1);
   }
+}
+
+async function enterIdleMode() {
+  log('Entering idle mode due to lack of reports', 'warn');
+  await notify('Application entered idle mode due to lack of reports. Will restart in 30 minutes.');
+  
+  // Остановка автоматического режима
+  autoMode = false;
+  
+  // Очистка всех существующих таймеров
+  clearExistingTimers();
+  
+  // Планирование перезапуска через 30 минут
+  setTimeout(async () => {
+    log('Idle mode timeout reached. Restarting application.', 'info');
+    await notify('Idle mode timeout reached. Restarting application.');
+    await gracefulShutdown(true);
+  }, 30 * 60 * 1000); // 30 минут
 }
 
 // Cleanup function for old data
