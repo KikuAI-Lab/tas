@@ -91,11 +91,6 @@ const pool = new Pool({
 // Initialize OpenAI
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-const gptCheckCache = new LRUCache<string, SpamDecision>({
-  max: 1000,
-  ttl: 1000 * 60 * 60,
-});
-
 // Initialize logger
 const logger = winston.createLogger({
   level: DEEP_LOG ? 'debug' : 'info',
@@ -118,8 +113,16 @@ const logger = winston.createLogger({
 });
 
 // Initialize LRU Cache
-const lruCache = new LRUCache<string, Report>({
+interface CachedDecision {
+  isSpam: number;
+  reason: string;
+  checkType: 'default' | 'fast' | 'gpt' | 'gpt4';
+  timestamp: number;
+}
+
+const lruCache = new LRUCache<string, CachedDecision>({
   max: 10000,
+  ttl: 24 * 60 * 60 * 1000, // 24 hours
   maxSize: MAX_CACHE_SIZE_MB * 1024 * 1024,
   sizeCalculation: (value, key) => JSON.stringify(value).length + key.length,
 });
@@ -153,6 +156,7 @@ interface Report {
   decisionSent?: boolean;
   isOpen?: boolean;
   replyTo?: number;
+  checkType?: 'default' | 'fast' | 'gpt' | 'gpt4';
 }
 
 type SpamDecision = {
@@ -276,12 +280,6 @@ async function sendToBot(message: string) {
 
   if (!botEntity) throw new Error('Bot entity not initialized');
 
-  // Проверяем, является ли команда /next или /undo
-  if ((message.startsWith('/next') || message === '/undo') && processingReports.size > 0) {
-    log(`Command ${message} not sent because there are reports being processed`, 'debug');
-    return;
-  }
-
   log(`Attempting to send message to bot: ${message}`, 'debug');
   const startTime = Date.now();
   try {
@@ -325,8 +323,8 @@ async function reconnect() {
   }
 }
 
-function getMessageHash(message: string, mediaHashes: string[]): string {
-  const content = message + mediaHashes.join(',');
+function getMessageHash(messageContent: string[], sender: string): string {
+  const content = messageContent.join('\n') + sender;
   return createHash('md5').update(content).digest('hex');
 }
 
@@ -433,8 +431,7 @@ async function handleAdd(event: NewMessageEvent) {
       idleTimeout = setTimeout(async () => {
         if (Date.now() - lastReportProcessTime > 180000) {
           log('No reports processed for 3 minutes. Entering idle mode.', 'warn');
-          autoMode = false;
-          await notify('Application entered idle mode due to lack of reports. Automatic mode is now OFF.');
+          await notify('Application entered idle mode due to lack of reports.');
           
           if (idleResumeTimeout) {
             clearTimeout(idleResumeTimeout);
@@ -442,18 +439,13 @@ async function handleAdd(event: NewMessageEvent) {
           
           idleResumeTimeout = setTimeout(async () => {
             log('Resuming from idle mode', 'info');
-            autoMode = true;
-            await notify('Application resuming from idle mode. Automatic mode is now ON.');
-            if (autoMode && processingReports.size === 0) {
-              await sendToBot("/next 1");
-            }
-          }, 180000);
+            await notify('Application resuming from idle mode.');
+            await sendToBot("/next 4");
+          }, 3600000);
         }
       }, 180000);
       
-      if (autoMode && processingReports.size === 0) {
-        setTimeout(() => sendToBot("/next"), 100);
-      }
+      setTimeout(() => sendToBot("/next"), 100);
     } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.")) {
       noReportsFoundCount = 0;
       lastReportProcessTime = Date.now();
@@ -469,8 +461,8 @@ async function handleAdd(event: NewMessageEvent) {
       }
     } else if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
                messageContent.includes("Send /next for a new spam report.")) {
-      if (autoMode && processingReports.size === 0) {
-        await sendToBot("/next 1");
+      if (autoMode) {
+        await sendToBot("/next 5");
       }
       consecutiveErrorCount = 0;
     } else if (messageContent.includes("Sorry, an error has occurred during your request. Please try again later.")) {
@@ -485,12 +477,8 @@ async function handleAdd(event: NewMessageEvent) {
         return;
       }
 
-      if (processingReports.size === 0) {
-        await sendToBot("/undo");
-        log('Sent /undo command due to error', 'debug');
-      } else {
-        log('Skipped sending /undo command due to ongoing report processing', 'debug');
-      }
+      // Instead of sending "/undo", we'll try to undo recent reports
+      await undoRecentReports();
     } else if (messageContent.includes("marked as spam 😡") || messageContent.includes("marked as not spam 😌")) {
       lastReportProcessTime = Date.now();
       
@@ -499,11 +487,11 @@ async function handleAdd(event: NewMessageEvent) {
         const reportId = reportIdMatch[1];
         if (undoRange && isReportInUndoRange(reportId)) {
           processingReports.delete(reportId);
-          const cachedReport = lruCache.get(`report:${reportId}`);
-          if (cachedReport) {
+          const cachedDecision = lruCache.get(getMessageHash([messageContent], reportId));
+          if (cachedDecision) {
             const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
-            if (cachedReport.isSpam !== expectedDecision) {
-              const mismatchMessage = `Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${cachedReport.isSpam}`;
+            if (cachedDecision.isSpam !== expectedDecision) {
+              const mismatchMessage = `Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${cachedDecision.isSpam}`;
               log(mismatchMessage, 'warn');
               await notify(mismatchMessage);
             }
@@ -512,6 +500,22 @@ async function handleAdd(event: NewMessageEvent) {
       }
       consecutiveErrorCount = 0;
     }
+  }
+}
+
+async function undoRecentReports() {
+  const recentReportIds = await getRecentReportIds();
+  for (const reportId of recentReportIds) {
+    log(`Attempting to undo report ${reportId}`, 'debug');
+    await sendToBot(`/undo${reportId}`);
+    const undoResponse = await waitForUndoResponse(reportId);
+    if (undoResponse === 'success') {
+      log(`Successfully undone report ${reportId}`, 'debug');
+      break; // Exit the loop if undo is successful
+    } else if (undoResponse === 'toolate') {
+      log(`Undo action no longer possible for report ${reportId}`, 'warn');
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between undo attempts
   }
 }
 
@@ -594,15 +598,15 @@ async function processReport(report: Report): Promise<void> {
     let decision: SpamDecision | null = null;
 
     if (!undoRange) {
-      const cachedDecision = await checkCache(report.reportId);
-      if (cachedDecision && (Date.now() - report.timestamp) < 24 * 60 * 60 * 1000) {
-        decision = cachedDecision;
+      decision = await checkCache(report);
+      if (decision) {
+        log(`Using cached decision for report ${report.reportId}`, 'debug');
+        await applyDecision(report, decision);
+        return;
       }
     }
 
-    if (!decision) {
-      decision = await fastCheck(report) || await gptCheck(report);
-    }
+    decision = await fastCheck(report) || await gptCheck(report);
 
     if (!decision) {
       log(`All checks returned null for report ${report.reportId}. Marking as spam.`, 'warn');
@@ -610,6 +614,7 @@ async function processReport(report: Report): Promise<void> {
     }
 
     await applyDecision(report, decision);
+    await saveCache(report, decision);
 
   } catch (error) {
     logErr(`processReport for ${report.reportId}`, error);
@@ -625,7 +630,7 @@ async function processReport(report: Report): Promise<void> {
     isProcessingReports = false;
     
     if (processingReports.size === 0 && messageBuffer.size === 0 && autoMode) {
-      // Здесь может быть дополнительная логика, если необходимо
+      // Here you can add additional logic if needed
     }
   }
 }
@@ -720,7 +725,7 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
 
     if (message && message instanceof Api.Message && message.media) {
       log(`Retrieved media from message ${messageId}`, 'debug');
-      return message.media;
+      return message.media
     }
   } catch (error) {
     if (error instanceof Error && error.message.includes('FLOOD_WAIT')) {
@@ -736,15 +741,6 @@ async function getMediaFromMessage(messageId: number): Promise<Api.TypeMessageMe
 }
 
 async function gptCheck(report: Report): Promise<SpamDecision | null> {
-  const messageContent = report.messageContent.join('\n');
-  const messageHash = getMessageHash(messageContent, report.mediaHashes);
-  const cachedDecision = gptCheckCache.get(messageHash);
-
-  if (cachedDecision) {
-    log(`Using cached GPT decision for report ${report.reportId}`, 'debug');
-    return cachedDecision;
-  }
-
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
   const gptPrompt = `You are an advanced AI specialized in detecting commercial spam in Telegram groups across any language. Your task is to analyze the provided message along with its metadata and context to determine whether it is spam. Respond ONLY with:
@@ -1053,8 +1049,7 @@ Your analysis:`;
     }
 
     if (finalDecision) {
-      gptCheckCache.set(messageHash, finalDecision);
-      log(`Cached GPT decision for report ${report.reportId}`, 'debug');
+      log(`GPT check decision for report ${report.reportId}: ${JSON.stringify(finalDecision)}`, 'debug');
       return finalDecision;
     }
 
@@ -1246,8 +1241,8 @@ async function applyDecision(report: Report, decision: SpamDecision): Promise<vo
     decisionSent: true
   };
   
-  await saveCache(updatedReport);
-  log(`Updated report saved to cache: ${report.reportId}`, 'debug');
+  await saveReportToRedis(updatedReport);
+  log(`Updated report saved to Redis: ${report.reportId}`, 'debug');
 }
 
 async function sendDecision(report: Report, decision: SpamDecision): Promise<void> {
@@ -1275,7 +1270,7 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
 
     log(`Sent decision: ${decision.isSpam ? 'SPAM' : 'NOT SPAM'}`, 'info');
     report.decisionSent = true;
-    await saveCache(report);
+    await saveReportToRedis(report);
     log(`Decision sent for report ${report.reportId}`, 'debug');
 
     resetRestartCounter();
@@ -1286,18 +1281,31 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
 }
 
 // Optimized caching functions
-async function saveCache(report: Report): Promise<void> {
+async function saveCache(report: Report, decision: SpamDecision): Promise<void> {
+  if (isShuttingDown) return;
+
+  const messageHash = getMessageHash(report.messageContent, report.sender);
+  const cachedDecision: CachedDecision = {
+    isSpam: decision.isSpam,
+    reason: decision.reason,
+    checkType: decision.checkType,
+    timestamp: Date.now()
+  };
+  lruCache.set(messageHash, cachedDecision);
+  log(`Decision cached for report ${report.reportId}`, 'debug');
+}
+
+async function saveReportToRedis(report: Report): Promise<void> {
   if (isShuttingDown) return;
 
   const key = `report:${report.reportId}`;
-  lruCache.set(key, report);
   redisBatch.push(report);
   
   if (redisBatch.length >= 100) {
     await saveRedisBatch();
   }
   
-  log(`Report ${report.reportId} saved to cache`, 'debug');
+  log(`Report ${report.reportId} saved to Redis batch`, 'debug');
 }
 
 async function saveRedisBatch(): Promise<void> {
@@ -1329,35 +1337,19 @@ async function saveRedisBatch(): Promise<void> {
   }
 }
 
-async function checkCache(reportId: string): Promise<SpamDecision | null> {
+async function checkCache(report: Report): Promise<SpamDecision | null> {
   if (isShuttingDown) return null;
 
   try {
-    const key = `report:${reportId}`;
-    const cachedReport = lruCache.get(key);
-    if (cachedReport && cachedReport.isSpam !== -1) {
-      log(`LRU cache hit for report ${reportId}`, 'debug');
+    const messageHash = getMessageHash(report.messageContent, report.sender);
+    const cachedDecision = lruCache.get(messageHash);
+    if (cachedDecision) {
+      log(`LRU cache hit for report ${report.reportId}`, 'debug');
       return {
-        isSpam: cachedReport.isSpam,
-        reason: cachedReport.reason || 'Cached decision',
-        checkType: 'default'
+        isSpam: cachedDecision.isSpam,
+        reason: cachedDecision.reason,
+        checkType: cachedDecision.checkType
       };
-    }
-
-    if (redis.status === 'ready') {
-      const redisReport = await redis.get(key);
-      if (redisReport) {
-        const parsedReport = JSON.parse(redisReport) as Report;
-        if (parsedReport.isSpam !== -1) {
-          log(`Redis cache hit for report ${reportId}`, 'debug');
-          lruCache.set(key, parsedReport);
-          return {
-            isSpam: parsedReport.isSpam,
-            reason: parsedReport.reason || 'Cached decision',
-            checkType: 'default'
-          };
-        }
-      }
     }
   } catch (error) {
     if (!isShuttingDown) {
@@ -1481,11 +1473,12 @@ async function waitForReport(reportId: string): Promise<Report | null> {
 
 async function getCachedReport(reportId: string): Promise<Report | null> {
   try {
-    const cachedReport = lruCache.get(`report:${reportId}`) || JSON.parse(await redis.get(`report:${reportId}`) || 'null');
-    if (cachedReport) {
-      cachedReport.isSpam = -1;
-      cachedReport.reason = undefined;
-      return cachedReport;
+    const reportData = await redis.get(`report:${reportId}`);
+    if (reportData) {
+      const report = JSON.parse(reportData) as Report;
+      report.isSpam = -1;
+      report.reason = undefined;
+      return report;
     }
   } catch (error) {
     logErr('getCachedReport', error);
@@ -1516,8 +1509,8 @@ async function cleanupCache() {
     const now = Date.now();
     let deletedCount = 0;
 
-    for (const [key, report] of lruCache.entries()) {
-      if (now - report.timestamp > 24 * 60 * 60 * 1000) {
+    for (const [key, value] of lruCache.entries()) {
+      if (now - value.timestamp > 24 * 60 * 60 * 1000) {
         lruCache.delete(key);
         deletedCount++;
       }
@@ -1552,15 +1545,15 @@ async function getCacheSize(): Promise<number> {
   try {
     let totalSize = 0;
 
-    // Размер LRU кэша
+    // LRU cache size
     for (const [key, value] of lruCache.entries()) {
       totalSize += JSON.stringify(value).length + key.length;
     }
 
-    // Оценка размера Redis кэша
+    // Redis cache size estimation
     if (redis.status === 'ready') {
       const redisKeys = await redis.keys('report:*');
-      const sampleSize = Math.min(100, redisKeys.length); // Берем выборку из 100 ключей или меньше
+      const sampleSize = Math.min(100, redisKeys.length);
       let sampleTotalSize = 0;
 
       for (let i = 0; i < sampleSize; i++) {
@@ -1576,14 +1569,13 @@ async function getCacheSize(): Promise<number> {
         }
       }
 
-      // Экстраполируем размер на весь кэш
       const estimatedRedisSize = (sampleTotalSize / sampleSize) * redisKeys.length;
       totalSize += estimatedRedisSize;
     } else {
       log('Redis connection is not ready, skipping Redis cache size calculation', 'warn');
     }
 
-    return totalSize / (1024 * 1024); // Возвращаем размер в МБ
+    return totalSize / (1024 * 1024); // Return size in MB
   } catch (error) {
     if (isShuttingDown) {
       log('getCacheSize: Application is shutting down, cache size calculation skipped', 'debug');
@@ -1608,7 +1600,7 @@ async function limitCacheSize() {
       const excessSize = currentSize - MAX_CACHE_SIZE_MB;
       const removalRatio = excessSize / currentSize;
 
-      // Удаляем часть ключей из LRU кэша
+      // Remove part of LRU cache
       const lruKeysToRemove = Math.ceil(lruCache.size * removalRatio);
       const lruKeys = Array.from(lruCache.keys()).slice(0, lruKeysToRemove);
       lruKeys.forEach(key => lruCache.delete(key));
@@ -1724,7 +1716,7 @@ async function undo(reportId?: string): Promise<boolean> {
   let successfulUndo = false;
   
   for (const id of recentReportIds) {
-    const report = await getFromCache(id);
+    const report = await getCachedReport(id);
     if (!report) {
       log(`Report ${id} not found in cache, skipping`, 'debug');
       continue;
@@ -1745,7 +1737,7 @@ async function undo(reportId?: string): Promise<boolean> {
       log(`Successful undo for report ${id}`, 'debug');
       report.decisionSent = false;
       report.isOpen = true;
-      await saveCache(report);
+      await saveReportToRedis(report);
       
       try {
         await processReport(report);
@@ -1767,29 +1759,6 @@ async function undo(reportId?: string): Promise<boolean> {
 
   log(`Undo process completed. Successfully undone and processed: ${successfulUndo}`, 'debug');
   return successfulUndo;
-}
-
-async function getFromCache(reportId: string): Promise<Report | null> {
-  const key = `report:${reportId}`;
-  
-  const lruCachedReport = lruCache.get(key);
-  if (lruCachedReport) {
-    log(`Retrieved report ${reportId} from LRU cache`, 'debug');
-    return lruCachedReport;
-  }
-
-  if (redis.status === 'ready') {
-    const redisCachedReport = await redis.get(key);
-    if (redisCachedReport) {
-      const parsedReport = JSON.parse(redisCachedReport) as Report;
-      log(`Retrieved report ${reportId} from Redis cache`, 'debug');
-      lruCache.set(key, parsedReport);
-      return parsedReport;
-    }
-  }
-
-  log(`Report ${reportId} not found in cache`, 'debug');
-  return null;
 }
 
 async function getRecentReportIds(): Promise<string[]> {
@@ -1972,14 +1941,17 @@ Tokens used: ${apiTokensUsed}
 
 async function resetRedisCache(): Promise<void> {
   try {
+    log('Attempting to transfer Redis data to PostgreSQL before clearing...', 'debug');
+    await saveRedisToPostgres();
+
     log('Attempting to clear Redis cache...', 'debug');
     await redis.flushdb();
     lruCache.clear();
     log('Redis and LRU caches cleared successfully', 'debug');
-    await notify('Redis and LRU caches have been cleared successfully');
+    await notify('Redis data transferred to PostgreSQL and caches have been cleared successfully');
   } catch (error) {
     logErr('resetRedisCache', error);
-    await notify(`Error clearing caches: ${error instanceof Error ? error.message : String(error)}`);
+    await notify(`Error in resetRedisCache: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -2015,8 +1987,19 @@ async function handleCacheCommand() {
 async function getCacheContent(): Promise<Report[]> {
   const reports: Report[] = [];
 
-  for (const report of lruCache.values()) {
-    reports.push(report);
+  for (const [key, value] of lruCache) {
+    reports.push({
+      reportId: key,
+      messageContent: [],
+      mediaHashes: [],
+      complaintCount: 0,
+      source: '',
+      sender: '',
+      isSpam: value.isSpam,
+      reason: value.reason,
+      timestamp: Date.now(),
+      checkType: value.checkType
+    });
   }
 
   const keys = await redis.keys('report:*');
@@ -2170,20 +2153,23 @@ async function saveRedisToPostgres() {
           ];
         });
 
-        const query = `
-          INSERT INTO reports (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, created_at)
-          VALUES ${values.map((_, index) => `($${index * 9 + 1}, $${index * 9 + 2}, $${index * 9 + 3}, $${index * 9 + 4}, $${index * 9 + 5}, $${index * 9 + 6}, $${index * 9 + 7}, $${index * 9 + 8}, $${index * 9 + 9})`).join(', ')}
-          ON CONFLICT (report_id, created_at) DO UPDATE SET
-          message_content = EXCLUDED.message_content,
-          media_hashes = EXCLUDED.media_hashes,
-          complaint_count = EXCLUDED.complaint_count,
-          source = EXCLUDED.source,
-          sender = EXCLUDED.sender,
-          is_spam = EXCLUDED.is_spam,
-          reason = EXCLUDED.reason
-        `;
+        if (values.length > 0) {
+          const query = `
+            INSERT INTO reports 
+            (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, created_at)
+            VALUES ${values.map((_, index) => `($${index * 9 + 1}, $${index * 9 + 2}, $${index * 9 + 3}, $${index * 9 + 4}, $${index * 9 + 5}, $${index * 9 + 6}, $${index * 9 + 7}, $${index * 9 + 8}, $${index * 9 + 9})`).join(', ')}
+            ON CONFLICT (report_id, created_at) DO UPDATE SET
+            message_content = EXCLUDED.message_content,
+            media_hashes = EXCLUDED.media_hashes,
+            complaint_count = EXCLUDED.complaint_count,
+            source = EXCLUDED.source,
+            sender = EXCLUDED.sender,
+            is_spam = EXCLUDED.is_spam,
+            reason = EXCLUDED.reason
+          `;
 
-        await client.query(query, values.flat());
+          await client.query(query, values.flat());
+        }
       }
 
       await client.query('COMMIT');
@@ -2195,7 +2181,12 @@ async function saveRedisToPostgres() {
       client.release();
     }
   } catch (error) {
-    logErr('saveRedisToPostgres', error);
+    if (error instanceof Error) {
+      logErr('saveRedisToPostgres', `${error.message}\n${error.stack}`);
+    } else {
+      logErr('saveRedisToPostgres', String(error));
+    }
+    await notify(`Error in saveRedisToPostgres: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -2328,14 +2319,14 @@ async function checkSystemHealth() {
       throw new Error('Telegram client is not connected');
     }
 
-    // Проверка обработки отчетов
+    // Check report processing
     const currentTime = Date.now();
     const timeSinceLastReport = currentTime - lastReportProcessTime;
     
-    if (timeSinceLastReport > 5 * 60 * 1000 && timeSinceLastReport <= 10 * 60 * 1000) { // 5-10 минут
+    if (timeSinceLastReport > 5 * 60 * 1000 && timeSinceLastReport <= 10 * 60 * 1000) { // 5-10 minutes
       log('No reports processed in the last 5 minutes. Sending "/next 7" command.', 'warn');
       await sendToBot("/next 7");
-    } else if (timeSinceLastReport > 10 * 60 * 1000) { // более 10 минут
+    } else if (timeSinceLastReport > 10 * 60 * 1000) { // more than 10 minutes
       throw new Error('No reports processed in the last 10 minutes');
     }
 
@@ -2379,8 +2370,8 @@ async function cleanupOldData() {
     oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
     let lruDeletedCount = 0;
-    for (const [key, report] of lruCache.entries()) {
-      if (new Date(report.timestamp) < oneMonthAgo) {
+    for (const [key, value] of lruCache.entries()) {
+      if (value.timestamp < oneMonthAgo.getTime()) {
         lruCache.delete(key);
         lruDeletedCount++;
       }
@@ -2692,3 +2683,144 @@ process.on('SIGINT', async () => {
   await notify('SIGINT signal received. Application will shut down gracefully.');
   await gracefulShutdown();
 });
+
+// Express routes
+app.get('/health', async (req, res) => {
+  try {
+    await checkSystemHealth();
+    res.status(200).json({ status: 'healthy' });
+  } catch (error) {
+    res.status(500).json({ status: 'unhealthy', error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get('/status', async (req, res) => {
+  try {
+    const cacheSize = await getCacheSize();
+    const dbStatus = await checkDB();
+    const redisStatus = redis.status === 'ready';
+    const telegramStatus = client && client.connected;
+
+    const status = {
+      autoMode,
+      cacheSize: `${cacheSize.toFixed(2)} MB`,
+      dbStatus,
+      redisStatus,
+      telegramStatus,
+      apiRequestsCount,
+      apiTokensUsed,
+      lastReportProcessTime: new Date(lastReportProcessTime).toISOString(),
+      processingReportsCount: processingReports.size,
+    };
+
+    res.status(200).json(status);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Helper function to get media content
+async function getMediaContent(mediaKey: string): Promise<Buffer | null> {
+  try {
+    const mediaBase64 = await redis.get(mediaKey);
+    if (mediaBase64) {
+      return Buffer.from(mediaBase64, 'base64');
+    }
+  } catch (error) {
+    logErr('getMediaContent', error);
+  }
+  return null;
+}
+
+// Helper function to determine media type
+function getMediaType(mediaHash: string): string {
+  const mediaType = mediaHash.split(':')[0];
+  switch (mediaType) {
+    case 'photo':
+      return 'image/jpeg';
+    case 'video':
+    case 'videonote':
+      return 'video/mp4';
+    case 'gif':
+      return 'image/gif';
+    case 'sticker':
+      return 'image/webp';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+// Route to serve media content
+app.get('/media/:reportId/:mediaIndex', async (req, res) => {
+  const { reportId, mediaIndex } = req.params;
+  try {
+    const report = await getCachedReport(reportId);
+    if (!report) {
+      return res.status(404).send('Report not found');
+    }
+
+    const mediaHash = report.mediaHashes[parseInt(mediaIndex)];
+    if (!mediaHash) {
+      return res.status(404).send('Media not found');
+    }
+
+    const mediaKey = `media:${mediaHash.split(':')[1]}`;
+    const mediaContent = await getMediaContent(mediaKey);
+    if (!mediaContent) {
+      return res.status(404).send('Media content not found');
+    }
+
+    const mediaType = getMediaType(mediaHash);
+    res.contentType(mediaType);
+    res.send(mediaContent);
+  } catch (error) {
+    logErr(`Error serving media for report ${reportId}`, error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Route to get report details
+app.get('/report/:reportId', async (req, res) => {
+  const { reportId } = req.params;
+  try {
+    const report = await getCachedReport(reportId);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    // Remove sensitive information
+    const safeReport = {
+      ...report,
+      mediaHashes: report.mediaHashes.map((_, index) => `/media/${reportId}/${index}`),
+    };
+
+    res.json(safeReport);
+  } catch (error) {
+    logErr(`Error fetching report ${reportId}`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Route to manually trigger undo for a specific report
+app.post('/undo/:reportId', async (req, res) => {
+  const { reportId } = req.params;
+  try {
+    const success = await undo(reportId);
+    if (success) {
+      res.json({ message: `Successfully undone report ${reportId}` });
+    } else {
+      res.status(400).json({ error: `Failed to undo report ${reportId}` });
+    }
+  } catch (error) {
+    logErr(`Error undoing report ${reportId}`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Error handling middleware
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  logErr('Express error', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+export { app, client, redis, pool, openai, lruCache };
