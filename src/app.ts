@@ -71,6 +71,8 @@ let lastReportProcessTime: number = Date.now();
 let redisBatchTimeout: NodeJS.Timeout | null = null;
 let idleResumeTimeout: NodeJS.Timeout | null = null;
 let undoRange: { start: string; end: string } | null = null;
+let lastCommandSentTime = 0;
+
 
 // Initialize Express app
 const app = express();
@@ -281,6 +283,16 @@ async function sendToBot(message: string) {
 
   if (!botEntity) throw new Error('Bot entity not initialized');
 
+  const currentTime = Date.now();
+  const timeSinceLastCommand = currentTime - lastCommandSentTime;
+
+  if (timeSinceLastCommand < 30) {
+    log(`Command sent too quickly (${timeSinceLastCommand}ms) after previous command: ${message}. Stopping application.`, 'error');
+    await notify(`Critical error: Command sent too quickly (${timeSinceLastCommand}ms) after previous command: ${message}. Application stopped.`);
+    await gracefulShutdown(true);
+    return;
+  }
+
   log(`Attempting to send message to bot: ${message}`, 'debug');
   const startTime = Date.now();
   try {
@@ -301,6 +313,7 @@ async function sendToBot(message: string) {
       COMMAND_DELAY += 10;
     }
 
+    lastCommandSentTime = endTime;
     log(`Successfully sent message to bot: ${message}. Actual delay: ${actualDelay}ms`, 'debug');
   } catch (error) {
     logErr(`Failed to send message to bot: ${message}`, error);
@@ -1300,10 +1313,11 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
   const currentTime = Date.now();
   const timeSinceLastDecision = currentTime - lastDecisionSentTime;
 
-  if (timeSinceLastDecision < 20) {
+  if (timeSinceLastDecision < 30) {
     log(`Decision sent too quickly (${timeSinceLastDecision}ms) after previous decision for report ${report.reportId}. Stopping application.`, 'error');
     await notify(`Critical error: Decision sent too quickly (${timeSinceLastDecision}ms) after previous decision for report ${report.reportId}. Application stopped.`);
-    process.exit(1);
+    await gracefulShutdown(true);
+    return;
   }
 
   try {
@@ -2727,10 +2741,16 @@ async function gracefulShutdown(restart: boolean = false) {
   await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
 
   if (restart) {
-    process.exit(1);
-  } else {
-    process.exit(0);
+    // Здесь можно добавить логику для перезапуска приложения
+    // Например, использовать child_process для запуска нового экземпляра
+    const { spawn } = require('child_process');
+    spawn(process.argv[0], process.argv.slice(1), {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'ignore']
+    }).unref();
   }
+
+  process.exit(restart ? 1 : 0);
 }
 
 async function resetRestartCounter(): Promise<void> {
