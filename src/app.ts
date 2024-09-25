@@ -117,6 +117,7 @@ interface CachedDecision {
   isSpam: number;
   reason: string;
   checkType: 'default' | 'fast' | 'gpt' | 'gpt4';
+  reportId: string;
   timestamp: number;
 }
 
@@ -504,19 +505,49 @@ async function handleAdd(event: NewMessageEvent) {
 }
 
 async function undoRecentReports() {
-  const recentReportIds = await getRecentReportIds();
+  const MAX_UNDO_ATTEMPTS = 100;
+  let undoCount = 0;
+  const recentReportIds = await getRecentReportIds(MAX_UNDO_ATTEMPTS);
+
   for (const reportId of recentReportIds) {
     log(`Attempting to undo report ${reportId}`, 'debug');
     await sendToBot(`/undo${reportId}`);
     const undoResponse = await waitForUndoResponse(reportId);
+
     if (undoResponse === 'success') {
       log(`Successfully undone report ${reportId}`, 'debug');
-      break; // Exit the loop if undo is successful
+      const report = await getReportFromCaches(reportId);
+      if (report) {
+        await processReport(report);
+      } else {
+        log(`Failed to retrieve report ${reportId} from caches`, 'warn');
+      }
+      return; // Exit the function if undo is successful and processing continues
     } else if (undoResponse === 'toolate') {
       log(`Undo action no longer possible for report ${reportId}`, 'warn');
     }
+
+    undoCount++;
+    if (undoCount >= MAX_UNDO_ATTEMPTS) {
+      log(`Reached maximum undo attempts (${MAX_UNDO_ATTEMPTS}). Stopping bot for 30 minutes.`, 'warn');
+      await stopBotTemporarily();
+      return;
+    }
+
     await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between undo attempts
   }
+}
+
+async function stopBotTemporarily() {
+  autoMode = false;
+  await notify('Bot stopped due to reaching maximum undo attempts. Will restart in 30 minutes.');
+
+  // Schedule restart after 30 minutes
+  const restartTime = new Date(Date.now() + 30 * 60 * 1000);
+  schedule.scheduleJob(restartTime, async () => {
+    log('Restarting application after 30 minutes pause', 'info');
+    await gracefulShutdown(true);
+  });
 }
 
 function isReportInUndoRange(reportId: string): boolean {
@@ -606,6 +637,17 @@ async function processReport(report: Report): Promise<void> {
       }
     }
 
+    // Если отчет неполный (из LRU кэша), дополняем его данными из Redis
+    if (report.messageContent.length === 0) {
+      const fullReport = await getReportFromCaches(report.reportId);
+      if (fullReport) {
+        report = fullReport;
+      } else {
+        log(`Unable to retrieve full report data for ${report.reportId}`, 'warn');
+        return;
+      }
+    }
+
     decision = await fastCheck(report) || await gptCheck(report);
 
     if (!decision) {
@@ -630,7 +672,7 @@ async function processReport(report: Report): Promise<void> {
     isProcessingReports = false;
     
     if (processingReports.size === 0 && messageBuffer.size === 0 && autoMode) {
-      // Here you can add additional logic if needed
+      // Здесь может быть дополнительная логика, если необходимо
     }
   }
 }
@@ -1280,7 +1322,6 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
   }
 }
 
-// Optimized caching functions
 async function saveCache(report: Report, decision: SpamDecision): Promise<void> {
   if (isShuttingDown) return;
 
@@ -1289,6 +1330,7 @@ async function saveCache(report: Report, decision: SpamDecision): Promise<void> 
     isSpam: decision.isSpam,
     reason: decision.reason,
     checkType: decision.checkType,
+    reportId: report.reportId,
     timestamp: Date.now()
   };
   lruCache.set(messageHash, cachedDecision);
@@ -1406,23 +1448,87 @@ async function handleUndosCommand(startReportId?: string, endReportId?: string) 
 }
 
 async function getReportsBetween(startReportId: string, endReportId: string): Promise<string[]> {
-  const allKeys = await redis.keys('report:*');
-  const sortedKeys = allKeys.sort((a, b) => {
-    const aId = BigInt(a.split(':')[1]);
-    const bId = BigInt(b.split(':')[1]);
-    if (aId < bId) return -1;
-    if (aId > bId) return 1;
-    return 0;
+  const startId = BigInt(startReportId);
+  const endId = BigInt(endReportId);
+
+  // Получаем отчеты из LRU кэша
+  const lruReports = Array.from(lruCache.values())
+    .filter(decision => {
+      const reportId = BigInt(decision.reportId);
+      return reportId >= startId && reportId <= endId;
+    })
+    .map(decision => decision.reportId);
+
+  // Получаем отчеты из Redis, исключая те, которые уже есть в LRU кэше
+  const redisKeys = await redis.keys('report:*');
+  const redisReports = (await Promise.all(redisKeys.map(async key => {
+    const reportId = key.split(':')[1];
+    if (lruReports.includes(reportId)) {
+      return null; // Пропускаем отчеты, которые уже есть в LRU кэше
+    }
+    const report = JSON.parse(await redis.get(key) || '{}') as Report;
+    const id = BigInt(report.reportId);
+    return (id >= startId && id <= endId) ? report.reportId : null;
+  }))).filter((id): id is string => id !== null);
+
+  // Объединяем и сортируем результаты
+  return [...new Set([...lruReports, ...redisReports])].sort((a, b) => {
+    const aId = BigInt(a);
+    const bId = BigInt(b);
+    return aId < bId ? -1 : aId > bId ? 1 : 0;
+  });
+}
+
+async function handleRedisCommand() {
+  try {
+    log('Handling /redis command', 'debug');
+    const redisContent = await getRedisContent();
+    const csvFilePath = await generateRedisCsvReport(redisContent);
+    await sendCsvToAdmin(csvFilePath);
+    log('Redis command executed successfully', 'debug');
+    await notify(`Redis content report sent. Total reports: ${redisContent.length}`);
+  } catch (error) {
+    logErr('handleRedisCommand', error);
+    await notify(`Error executing Redis command: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handleLruCommand() {
+  try {
+    log('Handling /lru command', 'debug');
+    const lruContent = getLruContent();
+    const csvFilePath = await generateLruCsvReport(lruContent);
+    await sendCsvToAdmin(csvFilePath);
+    log('LRU command executed successfully', 'debug');
+    await notify('LRU content report sent.');
+  } catch (error) {
+    logErr('handleLruCommand', error);
+    await notify(`Error executing LRU command: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// Функция для получения содержимого LRU кэша
+function getLruContent(): CachedDecision[] {
+  return Array.from(lruCache.values());
+}
+
+// Функция для генерации CSV-отчета о содержимом LRU кэша
+async function generateLruCsvReport(lruContent: CachedDecision[]): Promise<string> {
+  const csvFilePath = join(tmpdir(), 'lru_report.csv');
+  const csvWriter = createObjectCsvWriter({
+    path: csvFilePath,
+    header: [
+      {id: 'reportId', title: 'Report ID'},
+      {id: 'isSpam', title: 'Is Spam'},
+      {id: 'reason', title: 'Reason'},
+      {id: 'checkType', title: 'Check Type'},
+      {id: 'timestamp', title: 'Timestamp'},
+    ]
   });
 
-  const startIndex = sortedKeys.findIndex(key => key.endsWith(`:${startReportId}`));
-  const endIndex = sortedKeys.findIndex(key => key.endsWith(`:${endReportId}`));
-
-  if (startIndex === -1 || endIndex === -1) {
-    throw new Error(`Could not find start or end report in cache`);
-  }
-
-  return sortedKeys.slice(startIndex, endIndex + 1).map(key => key.split(':')[1]);
+  await csvWriter.writeRecords(lruContent);
+  log(`LRU CSV report generated: ${csvFilePath}`, 'debug');
+  return csvFilePath;
 }
 
 async function waitForUndoResponse(reportId: string): Promise<'success' | 'toolate'> {
@@ -1712,7 +1818,7 @@ function processInlineMarkup(markup: Api.ReplyInlineMarkup): string {
 async function undo(reportId?: string): Promise<boolean> {
   log(`Starting undo process${reportId ? ` for report ${reportId}` : ''}`, 'debug');
   
-  const recentReportIds = reportId ? [reportId] : await getRecentReportIds();
+  const recentReportIds = reportId ? [reportId] : await getRecentReportIds(10); // Используем лимит 10 для последних отчетов
   let successfulUndo = false;
   
   for (const id of recentReportIds) {
@@ -1761,8 +1867,108 @@ async function undo(reportId?: string): Promise<boolean> {
   return successfulUndo;
 }
 
-async function getRecentReportIds(): Promise<string[]> {
-  return redis.lrange('recent_report_ids', 0, 9);
+async function getRecentReportIds(limit: number): Promise<string[]> {
+  // Получаем последние отчеты из LRU кэша
+  const lruReports = Array.from(lruCache.values())
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, limit)
+    .map(decision => decision.reportId);
+
+  // Если в LRU кэше недостаточно отчетов, добираем из Redis
+  if (lruReports.length < limit) {
+    const redisKeys = await redis.keys('report:*');
+    const redisReports = await Promise.all(
+      redisKeys.map(async key => {
+        const report = JSON.parse(await redis.get(key) || '{}') as Report;
+        return { id: report.reportId, timestamp: report.timestamp };
+      })
+    );
+    
+    // Сортируем и фильтруем отчеты из Redis, исключая те, которые уже есть в LRU кэше
+    const additionalReports = redisReports
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .filter(report => !lruReports.includes(report.id))
+      .map(report => report.id)
+      .slice(0, limit - lruReports.length);
+
+    return [...lruReports, ...additionalReports];
+  }
+
+  return lruReports;
+}
+
+async function getRedisContent(): Promise<Report[]> {
+  const reports: Report[] = [];
+  const keys = await redis.keys('report:*');
+
+  for (const key of keys) {
+    const reportData = await redis.get(key);
+    if (reportData) {
+      try {
+        const report = JSON.parse(reportData) as Report;
+        reports.push(report);
+      } catch (error) {
+        log(`Error parsing report data for key ${key}: ${error}`, 'error');
+      }
+    }
+  }
+
+  return reports;
+}
+
+async function generateRedisCsvReport(redisContent: Report[]): Promise<string> {
+  const csvFilePath = join(tmpdir(), 'redis_report.csv');
+  const csvWriter = createObjectCsvWriter({
+    path: csvFilePath,
+    header: [
+      {id: 'reportId', title: 'Report ID'},
+      {id: 'isSpam', title: 'Is Spam'},
+      {id: 'reason', title: 'Reason'},
+      {id: 'timestamp', title: 'Timestamp'},
+      {id: 'source', title: 'Source'},
+      {id: 'sender', title: 'Sender'},
+      {id: 'complaintCount', title: 'Complaint Count'},
+      {id: 'messageContent', title: 'Message Content'},
+      {id: 'mediaHashes', title: 'Media Hashes'}
+    ]
+  });
+
+  const reportData = redisContent.map(report => ({
+    ...report,
+    messageContent: report.messageContent.join('\n'),
+    mediaHashes: report.mediaHashes.join(', ')
+  }));
+
+  await csvWriter.writeRecords(reportData);
+  log(`Redis CSV report generated: ${csvFilePath}`, 'debug');
+  return csvFilePath;
+}
+
+async function getReportFromCaches(reportId: string): Promise<Report | null> {
+  // Сначала проверяем LRU кэш
+  const lruDecision = Array.from(lruCache.values()).find(decision => decision.reportId === reportId);
+  if (lruDecision) {
+    return {
+      reportId: lruDecision.reportId,
+      isSpam: lruDecision.isSpam,
+      reason: lruDecision.reason,
+      timestamp: lruDecision.timestamp,
+      messageContent: [], // Эти поля нужно будет заполнить из Redis
+      mediaHashes: [],
+      complaintCount: 0,
+      source: '',
+      sender: ''
+    };
+  }
+
+  // Если не найдено в LRU, проверяем Redis
+  const redisKey = `report:${reportId}`;
+  const redisReport = await redis.get(redisKey);
+  if (redisReport) {
+    return JSON.parse(redisReport) as Report;
+  }
+
+  return null;
 }
 
 async function addToRecentReportIds(reportId: string): Promise<void> {
@@ -1837,9 +2043,13 @@ async function handleAdmin(event: NewMessageEvent) {
           await handleDbCommand();
           break;
 
-        case '/cache':
-          await handleCacheCommand();
-          break;
+          case '/redis':
+            await handleRedisCommand();
+            break;
+      
+          case '/lru':
+            await handleLruCommand();
+            break;
 
         case '/fine':
           try {
