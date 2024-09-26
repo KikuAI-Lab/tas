@@ -747,7 +747,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Unsolicited marketing or promotional content for any product or service.
        - Investment opportunities, especially those promising high returns.
        - Phishing attempts, fake giveaways, or unrealistic financial promises.
-       - Mentions of cryptocurrencies, airdrops, or similar financial schemes.
+       - Mentions of cryptocurrencies, airdrops, or similar financial schemes. (e.g., "0.1trx转账一次", "$100usdt兑换")
        - Offers of work-from-home or remote job opportunities with high earnings potential.
        - Specific earnings claims (e.g., "earn $1000 daily", "100$ в день").
        - Mentions of financial incentives tied to minimal effort.
@@ -866,7 +866,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Messages referring to previous conversations or ongoing discussions without sales elements.
      - **Cryptocurrency and Financial Discussions:**
        - Legitimate discussions about cryptocurrency prices, market trends, or trading strategies without promotional content.
-       - Sharing of cryptocurrency wallet addresses without accompanying promotional or sales messages. (e.g. "0x123456789...", "UQA-aBE6_uNKRUCXdsh...")
+       - Sharing of cryptocurrency wallet addresses without spam indicators. (e.g., "0x123456789...", "UQA-aBE6_uNKRUCXdsh...")
      - **Numerical Formats:**
        - Standard numerical formats like "$500,000.00" are not inherently spam unless accompanied by suspicious claims or offers.
   
