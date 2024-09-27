@@ -1898,7 +1898,7 @@ async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null)
         log('Media type: Sticker', 'debug');
         return `sticker:${document.id}`;
       }
-      if (attribute instanceof Api.DocumentAttributeAnimated) {
+      if (attribute instanceof Api.DocumentAttributeAnimated || document.mimeType === 'image/gif') {
         log('Media type: GIF', 'debug');
         return `gif:${document.id}`;
       }
@@ -3148,6 +3148,7 @@ function getMediaType(mediaHash: string): string {
     case 'photo':
       return 'image/jpeg';
     case 'video':
+      return 'video/mp4';
     case 'videonote':
       return 'video/mp4';
     case 'gif':
