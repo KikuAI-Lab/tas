@@ -1286,22 +1286,26 @@ async function applyDecision(report: Report, decision: SpamDecision): Promise<vo
     return;
   }
   
-  await sendDecision(report, decision);
-  
   const updatedReport: Report = {
     ...report,
     isSpam: decision.isSpam,
     reason: decision.reason,
     isOpen: false,
-    decisionSent: true
+    decisionSent: autoMode // Устанавливаем decisionSent в true только если autoMode включен
   };
+  
+  if (autoMode) {
+    await sendDecision(updatedReport, decision);
+  } else {
+    log(`Decision for report ${report.reportId} processed but not sent (autoMode off): ${decision.isSpam ? 'SPAM' : 'NOT SPAM'}`, 'info');
+  }
   
   await saveReportToRedis(updatedReport);
   log(`Updated report saved to Redis: ${report.reportId}`, 'debug');
 
-  // Очищаем буфер после отправки решения
+  // Очищаем буфер после обработки решения
   messageBuffer.length = 0;
-  log('Buffer cleared after decision sent', 'debug');
+  log('Buffer cleared after decision processed', 'debug');
 }
 
 async function sendDecision(report: Report, decision: SpamDecision): Promise<void> {
