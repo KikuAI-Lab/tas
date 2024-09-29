@@ -782,6 +782,8 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Offers to borrow money or financial assistance.
        - Any offers of services or part-time work, even for everyday tasks or household chores.
        - Invitations to join some activities.
+       - ANY requests to top up a phone balance.
+       - ANY requests for donations for medical treatment.
      - **E-commerce and Social Media Promotion:**
        - Offers for SEO services, advertising setup, or product analytics.
        - Promises to increase sales or visibility on platforms like WB, Ozon, Amazon, etc.
