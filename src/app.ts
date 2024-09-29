@@ -1,4 +1,4 @@
-import { ChatCompletionContentPart, ChatCompletionMessageParam } from 'openai/resources/chat/completions.js';
+import { ChatCompletionMessageParam } from 'openai/resources/chat/completions.js';
 import { NewMessage, NewMessageEvent } from 'telegram/events/NewMessage.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { TelegramClient } from 'telegram/index.js';
@@ -38,7 +38,6 @@ const BOT_ACCESS_HASH = process.env.BOT_ACCESS_HASH!;
 
 // Constants
 const REDIS_BATCH_INTERVAL = 10 * 60 * 1000;
-const ENABLE_GPT_MEDIA_ANALYSIS = true;
 const SUSPEND_DURATION = 5 * 60 * 1000;
 const MAX_PROCESSING_TIME = 55000;
 const MAX_CONSECUTIVE_ERRORS = 5;
@@ -48,6 +47,7 @@ const GPT_RETRY_DELAY = 10000;
 const MAX_BUFFER_DELAY = 500;
 const MIN_BUFFER_DELAY = 100;
 const IDLE_UNDO_DELAY = 45000; // 45 seconds
+const MIN_COMMAND_DELAY = 50; // Минимальная задержка между командами в миллисекундах
 
 // Global variables
 let autoMode = true;
@@ -284,6 +284,9 @@ async function sendToBot(message: string) {
   const currentTime = Date.now();
   const timeSinceLastCommand = currentTime - lastCommandSentTime;
 
+  // Адаптивная задержка
+  let adaptiveDelay = Math.max(MIN_COMMAND_DELAY - timeSinceLastCommand, 0);
+
   if (timeSinceLastCommand < 30) {
     log(`Command sent too quickly (${timeSinceLastCommand}ms) after previous command: ${message}. Stopping application.`, 'error');
     await notify(`Critical error: Command sent too quickly (${timeSinceLastCommand}ms) after previous command: ${message}. Application stopped.`);
@@ -299,15 +302,15 @@ async function sendToBot(message: string) {
         setTimeout(() => {
           client.sendMessage(botEntity!, { message });
           resolve();
-        }, COMMAND_DELAY);
+        }, adaptiveDelay);
       });
     });
     const endTime = Date.now();
     const actualDelay = endTime - startTime;
 
-    if (actualDelay < COMMAND_DELAY) {
-      COMMAND_DELAY = Math.max(COMMAND_DELAY - 10, 50);
-    } else if (actualDelay > COMMAND_DELAY + 100) {
+    if (actualDelay < adaptiveDelay) {
+      COMMAND_DELAY = Math.max(COMMAND_DELAY - 10, MIN_COMMAND_DELAY);
+    } else if (actualDelay > adaptiveDelay + 100) {
       COMMAND_DELAY += 10;
     }
 
@@ -572,17 +575,6 @@ async function processBuffer() {
             new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
           ]);
           log(`Processed full report ${sysMsg.reportId} from buffer`, 'debug');
-        } else {
-          await Promise.race([
-            processSysMsgOnly({
-              type: 'sys',
-              content: sysMsg.content,
-              reportId: sysMsg.reportId,
-              timestamp: sysMsg.timestamp
-            }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
-          ]);
-          log(`Processed sys-only report ${sysMsg.reportId} from buffer`, 'debug');
         }
       } catch (error) {
         if (error instanceof Error && error.message === 'Processing timeout') {
@@ -681,10 +673,10 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
     return emojiCount > 50;
   });
   
-  const dangerousFileExtensions = ['apk', 'exe', 'js', 'bat', 'cmd', 'vbs', 'ps1', 'jar', 'msi', 'com', 'scr', 'pif'];
+  const dangerousFileTypes = ['application/x-msdownload', 'application/x-executable', 'application/javascript', 'application/x-bat', 'application/x-msdos-program', 'application/x-vbs', 'application/x-powershell', 'application/java-archive', 'application/x-ms-installer', 'application/x-ms-shortcut', 'application/x-ms-dos-executable'];
   const hasDangerousFile = report.mediaHashes.some(hash => {
     const fileType = getFileTypeFromHash(hash);
-    return dangerousFileExtensions.includes(fileType.toLowerCase());
+    return dangerousFileTypes.includes(fileType.toLowerCase());
   });
   
   const hasInlineKeyboard = report.mediaHashes.some(hash => 
@@ -752,8 +744,7 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
 function getFileTypeFromHash(hash: string): string {
   const [mediaType, fileId] = hash.split(':');
   if (mediaType === 'document') {
-    const extensionMatch = fileId.match(/\.([^.]+)$/);
-    return extensionMatch ? extensionMatch[1] : '';
+    return fileId.split('.').pop() || '';
   }
   return mediaType;
 }
@@ -936,51 +927,6 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   **Your analysis:**
   `;
 
-  const mediaPrompt = `You are an AI specialized in detecting commercial spam in Telegram groups by analyzing images or media content. Evaluate based on visual elements, embedded text, and context within the group. Respond ONLY with:
-1 for spam
-0 for not spam
-
-**High Priority Indicators:**
-- ANY promotional content or advertisements for goods or services
-- Visuals with product displays, price tags, or catalog-like presentations
-- Images containing logos, branding, or watermarks from commercial entities
-- Screenshots of online marketplaces or e-commerce platforms
-- Product packaging or labeled merchandise
-- Before/after images typically used in product promotions
-- Infographics or charts about products, services, or financial opportunities
-- Images with multiple QR codes or links
-- Visuals encouraging joining other groups, channels, or external websites for purchases
-
-**Medium Priority Indicators:**
-- Stock photos or generic imagery commonly used in spam or advertising
-- Screenshots of promotional social media posts
-- Images of official documents or cards that could be related to commercial services
-- Visuals out of place with the group's usual content, especially if they look commercial
-
-**Low Priority Indicators:**
-- Text in a different language than the group's primary language, if it appears commercial
-- Professional-looking photos that seem out of place in the conversation
-
-**Not Spam Indicators:**
-- Legitimate news images or infographics related to the group's theme without commercial intent
-- Personal photos or images consistent with normal interactions
-- Memes, jokes, or satirical content, even if provocative, unless clearly promoting a product
-- Images with strong language or provocative content relevant to discussions, without sales elements
-- Political or activist imagery, unless violating group rules or promoting products
-- Artistic or creative content, even if unconventional or shocking, without commercial elements
-
-**Example Spam Image:**
-- A collage of products with prices and "Buy Now" text
-- A screenshot of an online store's product page
-
-**Example Not Spam Image:**
-- A meme related to the ongoing conversation in the group
-- A personal photo shared in the context of a discussion
-
-**REMINDER:** Respond ONLY with 1 or 0. No explanations.
-
-Your analysis:`;
-
   const userPrompt = generateUserPrompt(report);
 
   const textMessages: Array<ChatCompletionMessageParam> = [
@@ -988,116 +934,54 @@ Your analysis:`;
     { role: "user", content: userPrompt }
   ];
 
-  const mediaMessages: Array<ChatCompletionMessageParam> = [
-    { role: "system", content: mediaPrompt },
-  ];
-
   log(`GPT userPrompt for report ${report.reportId}:
   ${userPrompt}`, 'debug');
 
   try {
     let textDecision: SpamDecision | null = null;
-    let mediaDecision: SpamDecision | null = null;
 
-    if (report.messageContent.some(content => content.trim() !== '') || (report.sender && report.complaintCount > 0)) {
-      const textResponse = await retryGptRequest(async () => {
-        const response = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
+    const textResponse = await retryGptRequest(async () => {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: textMessages,
+        max_tokens: 10,
+        temperature: 0.1,
+      });
+      updateApiUsage(response.usage?.total_tokens || 0);
+      return response;
+    });
+    
+    const textContent = textResponse.choices[0]?.message?.content?.trim();
+    if (textContent === '0' || textContent === '1') {
+      textDecision = {
+        isSpam: Number(textContent),
+        reason: Number(textContent) === 1 ? "GPT: spam" : "GPT: not spam",
+        checkType: 'gpt'
+      };
+    } else {
+      log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
+      const gpt4Response = await retryGptRequest(async () => {
+        return openai.chat.completions.create({
+          model: "gpt-4o",
           messages: textMessages,
           max_tokens: 10,
           temperature: 0.1,
         });
-        updateApiUsage(response.usage?.total_tokens || 0);
-        return response;
       });
-      
-      const textContent = textResponse.choices[0]?.message?.content?.trim();
-      if (textContent === '0' || textContent === '1') {
+
+      const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
+      if (gpt4Content === '0' || gpt4Content === '1') {
         textDecision = {
-          isSpam: Number(textContent),
-          reason: Number(textContent) === 1 ? "GPT: spam" : "GPT: not spam",
-          checkType: 'gpt'
+          isSpam: Number(gpt4Content),
+          reason: Number(gpt4Content) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
+          checkType: 'gpt4'
         };
-      } else {
-        log(`Unexpected GPT response format for report ${report.reportId}: ${textContent}`, 'warn');
-        const gpt4Response = await retryGptRequest(async () => {
-          return openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: textMessages,
-            max_tokens: 10,
-            temperature: 0.1,
-          });
-        });
-
-        const gpt4Content = gpt4Response.choices[0]?.message?.content?.trim();
-        if (gpt4Content === '0' || gpt4Content === '1') {
-          textDecision = {
-            isSpam: Number(gpt4Content),
-            reason: Number(gpt4Content) === 1 ? "GPT-4o: spam" : "GPT-4o: not spam",
-            checkType: 'gpt4'
-          };
-        }
       }
     }
 
-    if (ENABLE_GPT_MEDIA_ANALYSIS && report.mediaHashes.length > 0) {
-      for (const mediaHash of report.mediaHashes) {
-        if (await isGPT4VisionCompatible(mediaHash)) {
-          const mediaKey = `media:${mediaHash.split(':')[1]}`;
-          const mediaBuffer = await getMediaFromRedis(mediaKey);
-          if (mediaBuffer) {
-            log(`Sending media content to GPT for report ${report.reportId}, media hash: ${mediaHash}`, 'debug');
-            const base64Image = mediaBuffer.toString('base64');
-            mediaMessages.push({
-              role: "user",
-              content: [
-                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-              ] as ChatCompletionContentPart[]
-            });
-
-            const mediaResponse = await retryGptRequest(async () => {
-              return openai.chat.completions.create({
-                model: "gpt-4o",
-                messages: mediaMessages,
-                max_tokens: 1,
-                temperature: 0.1,
-              });
-            });
-
-            const mediaContent = mediaResponse.choices[0]?.message?.content?.trim();
-            log(`GPT media response for report ${report.reportId}, media hash ${mediaHash}: ${mediaContent}`, 'debug');
-            if (mediaContent === '0' || mediaContent === '1') {
-              mediaDecision = {
-                isSpam: Number(mediaContent),
-                reason: `GPT media: ${Number(mediaContent) === 1 ? 'spam' : 'not spam'}`,
-                checkType: 'gpt'
-              };
-              if (mediaDecision.isSpam === 1) {
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    let finalDecision: SpamDecision | null = null;
-
-    if (textDecision && mediaDecision) {
-      finalDecision = textDecision.isSpam === 1 || mediaDecision.isSpam === 1 ? 
-        (textDecision.isSpam === 1 ? textDecision : mediaDecision) : 
-        (textDecision.isSpam === 0 ? textDecision : mediaDecision);
-    } else if (textDecision) {
-      finalDecision = textDecision;
-      log(`GPT text check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
-    } else if (mediaDecision) {
-      finalDecision = mediaDecision;
-      log(`GPT media check decision for report ${report.reportId}: ${JSON.stringify(mediaDecision)}`, 'debug');
-    }
-
-    if (finalDecision) {
-      log(`GPT check decision for report ${report.reportId}: ${JSON.stringify(finalDecision)}`, 'debug');
-      return finalDecision;
+    if (textDecision) {
+      log(`GPT check decision for report ${report.reportId}: ${JSON.stringify(textDecision)}`, 'debug');
+      return textDecision;
     }
 
     log(`GPT check did not make a decision for report ${report.reportId}`, 'warn');
@@ -1107,68 +991,6 @@ Your analysis:`;
     logErr('gptCheck', error);
     log(`GPT check failed for report ${report.reportId}`, 'error');
     throw error;
-  }
-}
-
-async function processSysMsgOnly(sysMsg: BufferItem): Promise<void> {
-  if (!sysMsg.reportId) {
-    log('System message without reportId, skipping', 'warn');
-    return;
-  }
-
-  const report: Report = {
-    reportId: sysMsg.reportId,
-    messageContent: [],
-    mediaHashes: [],
-    complaintCount: 0,
-    source: '',
-    sender: '',
-    isSpam: -1,
-    timestamp: sysMsg.timestamp,
-    ...parseSysMessage(sysMsg.content[0])
-  };
-
-  const gptPrompt = `Analyze the following Telegram message metadata for potential spam, even without the actual message content:
-
-Sender: ${report.sender}
-Source: ${report.source}
-Complaint count: ${report.complaintCount}
-
-Consider:
-1. Sender's name for spam indicators (unusual characters, numbers, promotional content)
-2. Source information for context
-3. Complaint count as a general indicator, not definitive proof
-
-Classify as:
-1 for likely spam
-0 for likely not spam
-
-Respond ONLY with 1 or 0.`;
-
-  try {
-    const gptResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: gptPrompt },
-        { role: "user", content: `Analyze for spam:\nSender: ${report.sender}\nSource: ${report.source}\nComplaint count: ${report.complaintCount}` }
-      ],
-      max_tokens: 1,
-      temperature: 0.1
-    });
-
-    const decision = gptResponse.choices[0]?.message?.content?.trim();
-    if (decision === '0' || decision === '1') {
-      report.isSpam = Number(decision);
-      report.reason = `GPT-4 analysis based on metadata: ${Number(decision) === 1 ? 'likely spam' : 'likely not spam'}`;
-    } else {
-      log(`Unexpected GPT-4 response for report ${report.reportId}: ${decision}`, 'warn');
-      report.isSpam = 0;
-      report.reason = "Unable to classify based on metadata alone";
-    }
-
-    await processReport(report);
-  } catch (error) {
-    logErr(`Error processing system message only for report ${report.reportId}`, error);
   }
 }
 
@@ -1183,31 +1005,6 @@ async function retryGptRequest<T>(request: () => Promise<T>, maxRetries: number 
     }
   }
   throw new Error('Max retries reached for GPT request');
-}
-
-async function isGPT4VisionCompatible(mediaHash: string): Promise<boolean> {
-  const GPT4VisionCompatibleMedia = ['photo', 'sticker', 'gif', 'video', 'videonote'];
-  const mediaType = mediaHash.split(':')[0];
-  return GPT4VisionCompatibleMedia.includes(mediaType);
-}
-
-async function getMediaFromRedis(mediaKey: string): Promise<Buffer | null> {
-  const exists = await redis.exists(mediaKey);
-  if (!exists) {
-    log(`No media found in Redis for key: ${mediaKey}`, 'debug');
-    return null;
-  }
-
-  try {
-    const mediaBase64 = await redis.get(mediaKey);
-    if (mediaBase64) {
-      log(`Retrieved media from Redis for key: ${mediaKey}`, 'debug');
-      return Buffer.from(mediaBase64, 'base64');
-    }
-  } catch (error) {
-    logErr('getMediaFromRedis', error);
-  }
-  return null;
 }
 
 // Helper functions
@@ -1306,10 +1103,6 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
   if (!autoMode && !undoRange) {
     log(`Decision not sent due to automatic mode being off. Report: ${report.reportId}, Decision: ${decision.isSpam ? 'SPAM' : 'NOT SPAM'}`, 'debug');
     return;
-  }
-
-  if (decision.checkType !== 'gpt' && decision.checkType !== 'gpt4') {
-    await new Promise(resolve => setTimeout(resolve, COMMAND_DELAY));
   }
 
   const currentTime = Date.now();
@@ -2139,1007 +1932,1007 @@ async function handleAdmin(event: NewMessageEvent) {
           await notify('Automatic mode stopped. Decisions and bot commands will not be sent.');
           break;
 
-          case '/status':
-            log('Processing /status command', 'debug');
-            await sendStatus();
-            log('/status command processed', 'debug');
-            break;
-  
-          case '/undos':
-            if (commandParts.length === 3) {
-              await handleUndosCommand(commandParts[1], commandParts[2]);
+        case '/status':
+          log('Processing /status command', 'debug');
+          await sendStatus();
+          log('/status command processed', 'debug');
+          break;
+
+        case '/undos':
+          if (commandParts.length === 3) {
+            await handleUndosCommand(commandParts[1], commandParts[2]);
+          } else {
+            await notify('Invalid undos command. Usage: /undos startReportId endReportId');
+          }
+          break;
+
+        case '/delay':
+          if (commandParts.length === 2) {
+            const newDelay = parseInt(commandParts[1]);
+            if (!isNaN(newDelay) && newDelay >= 0) {
+              COMMAND_DELAY = newDelay;
+              await notify(`Command delay updated to ${COMMAND_DELAY} ms`);
             } else {
-              await notify('Invalid undos command. Usage: /undos startReportId endReportId');
+              await notify('Invalid delay value. Please provide a non-negative integer.');
             }
-            break;
-  
-          case '/delay':
-            if (commandParts.length === 2) {
-              const newDelay = parseInt(commandParts[1]);
-              if (!isNaN(newDelay) && newDelay >= 0) {
-                PROCESSING_DELAY = newDelay;
-                await notify(`Processing delay updated to ${PROCESSING_DELAY} ms`);
-              } else {
-                await notify('Invalid delay value. Please provide a non-negative integer.');
-              }
-            } else {
-              await notify('Invalid delay command. Usage: /delay [value]');
+          } else {
+            await notify('Invalid delay command. Usage: /delay [value]');
+          }
+          break;
+
+        case '/reset':
+          await resetRedisCache();
+          break;
+
+        case '/db':
+          await handleDbCommand();
+          break;
+
+        case '/redis':
+          await handleRedisCommand();
+          break;
+      
+        case '/lru':
+          await handleLruCommand();
+          break;
+
+        case '/fine':
+          try {
+            const filePaths = await handleFineCommand();
+            for (const filePath of filePaths) {
+              await client.sendFile(ADMIN_ID, {
+                file: filePath,
+                caption: 'Fine-tuning data file',
+                attributes: [
+                  new Api.DocumentAttributeFilename({ fileName: path.basename(filePath) })
+                ]
+              });
             }
-            break;
-  
-          case '/reset':
-            await resetRedisCache();
-            break;
-  
-          case '/db':
-            await handleDbCommand();
-            break;
-  
-          case '/redis':
-            await handleRedisCommand();
-            break;
-        
-          case '/lru':
-            await handleLruCommand();
-            break;
-  
-          case '/fine':
-            try {
-              const filePaths = await handleFineCommand();
-              for (const filePath of filePaths) {
-                await client.sendFile(ADMIN_ID, {
-                  file: filePath,
-                  caption: 'Fine-tuning data file',
-                  attributes: [
-                    new Api.DocumentAttributeFilename({ fileName: path.basename(filePath) })
-                  ]
-                });
-              }
-              await notify('Fine-tuning data files have been generated and sent.');
-            } catch (error) {
-              logErr('Error generating fine-tuning data', error);
-              await notify('Error generating fine-tuning data. Please check the logs.');
-            }
-            break;
-  
-          case '/fix':
-            if (commandParts.length === 2) {
-              await handleFixCommand(commandParts[1]);
-            } else {
-              await notify('Invalid fix command. Usage: /fix [reportId]');
-            }
-            break;
-  
-          default:
-            log(`Unrecognized admin command: ${command}`, 'debug');
-            await notify(`Unrecognized command: ${command}. Available commands are:
-            /start - Start automatic mode
-            /stop - Stop automatic mode
-            /status - Get current status
-            /undos [startReportId] [endReportId] - Undo and recheck reports in range
-            /delay [value] - Set processing delay in milliseconds
-            /reset - Clear Redis and LRU caches
-            /db - Perform database operations and generate report
-            /redis - Get cache info and generate report
-            /lru - Get cache info and generate report
-            /fine - Generate fine-tuning data
-            /fix [reportId] - Fix and reassess a specific report`);
-        }
-      } catch (error) {
-        logErr(`Error processing admin command: ${command}`, error);
-        await notify(`Error processing command ${command}: ${error instanceof Error ? error.message : String(error)}`);
+            await notify('Fine-tuning data files have been generated and sent.');
+          } catch (error) {
+            logErr('Error generating fine-tuning data', error);
+            await notify('Error generating fine-tuning data. Please check the logs.');
+          }
+          break;
+
+        case '/fix':
+          if (commandParts.length === 2) {
+            await handleFixCommand(commandParts[1]);
+          } else {
+            await notify('Invalid fix command. Usage: /fix [reportId]');
+          }
+          break;
+
+        default:
+          log(`Unrecognized admin command: ${command}`, 'debug');
+          await notify(`Unrecognized command: ${command}. Available commands are:
+          /start - Start automatic mode
+          /stop - Stop automatic mode
+          /status - Get current status
+          /undos [startReportId] [endReportId] - Undo and recheck reports in range
+          /delay [value] - Set command delay in milliseconds
+          /reset - Clear Redis and LRU caches
+          /db - Perform database operations and generate report
+          /redis - Get cache info and generate report
+          /lru - Get cache info and generate report
+          /fine - Generate fine-tuning data
+          /fix [reportId] - Fix and reassess a specific report`);
       }
-    }
-  }
-  
-  async function handleFixCommand(reportId: string): Promise<void> {
-    log(`Handling fix command for report ${reportId}`, 'debug');
-    try {
-      const report = await getReportFromCaches(reportId);
-      if (!report) {
-        await notify(`Report ${reportId} not found in caches.`);
-        return;
-      }
-  
-      report.isSpam = report.isSpam === 1 ? 0 : 1;
-      report.reason = `Manual fix: ${report.isSpam === 1 ? 'marked as spam' : 'marked as not spam'}`;
-  
-      await saveReportToRedis(report);
-      await saveCache(report, {
-        isSpam: report.isSpam,
-        reason: report.reason,
-        checkType: 'manual'
-      });
-  
-      const client = await pool.connect();
-      try {
-        await client.query(
-          'UPDATE reports SET is_spam = $1, reason = $2 WHERE report_id = $3',
-          [report.isSpam, report.reason, report.reportId]
-        );
-      } finally {
-        client.release();
-      }
-  
-      await notify(`Report ${reportId} has been fixed. New status: ${report.isSpam === 1 ? 'spam' : 'not spam'}`);
     } catch (error) {
-      logErr(`Error fixing report ${reportId}`, error);
-      await notify(`Error fixing report ${reportId}: ${error instanceof Error ? error.message : String(error)}`);
+      logErr(`Error processing admin command: ${command}`, error);
+      await notify(`Error processing command ${command}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  
-  async function stopBotTemporarily() {
-    autoMode = false;
-    await notify('Bot stopped due to reaching maximum undo attempts. Will restart in 30 minutes.');
-  
-    const restartTime = new Date(Date.now() + 30 * 60 * 1000);
-    schedule.scheduleJob(restartTime, async () => {
-      log('Restarting application after 30 minutes pause', 'info');
-      await gracefulShutdown(true);
+}
+
+async function handleFixCommand(reportId: string): Promise<void> {
+  log(`Handling fix command for report ${reportId}`, 'debug');
+  try {
+    const report = await getReportFromCaches(reportId);
+    if (!report) {
+      await notify(`Report ${reportId} not found in caches.`);
+      return;
+    }
+
+    report.isSpam = report.isSpam === 1 ? 0 : 1;
+    report.reason = `Manual fix: ${report.isSpam === 1 ? 'marked as spam' : 'marked as not spam'}`;
+
+    await saveReportToRedis(report);
+    await saveCache(report, {
+      isSpam: report.isSpam,
+      reason: report.reason,
+      checkType: 'manual'
+    });
+
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE reports SET is_spam = $1, reason = $2 WHERE report_id = $3',
+        [report.isSpam, report.reason, report.reportId]
+      );
+    } finally {
+      client.release();
+    }
+
+    await notify(`Report ${reportId} has been fixed. New status: ${report.isSpam === 1 ? 'spam' : 'not spam'}`);
+  } catch (error) {
+    logErr(`Error fixing report ${reportId}`, error);
+    await notify(`Error fixing report ${reportId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function stopBotTemporarily() {
+  autoMode = false;
+  await notify('Bot stopped due to reaching maximum undo attempts. Will restart in 30 minutes.');
+
+  const restartTime = new Date(Date.now() + 30 * 60 * 1000);
+  schedule.scheduleJob(restartTime, async () => {
+    log('Restarting application after 30 minutes pause', 'info');
+    await gracefulShutdown(true);
+  });
+}
+
+function updateApiUsage(tokensUsed: number) {
+  apiRequestsCount++;
+  apiTokensUsed += tokensUsed;
+}
+
+async function sendStatus() {
+  log('Generating enhanced status report', 'debug');
+  try {
+    let statusMessage = `
+Current status:
+Auto mode: ${autoMode ? 'On (decisions and bot commands will be sent)' : 'Off (decisions and bot commands will not be sent)'}
+Command delay: ${COMMAND_DELAY} ms
+
+Server Resources:
+`;
+
+    const totalMemory = os.totalmem();
+    const freeMemory = os.freemem();
+    const usedMemory = totalMemory - freeMemory;
+
+    statusMessage += `CPU Usage: ${os.loadavg()[0].toFixed(2)}%
+Memory Usage: ${((usedMemory / totalMemory) * 100).toFixed(2)}%
+Free Memory: ${(freeMemory / 1024 / 1024 / 1024).toFixed(2)} GB
+Total Memory: ${(totalMemory / 1024 / 1024 / 1024).toFixed(2)} GB
+
+`;
+
+    const start = Date.now();
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "Test" }],
+        max_tokens: 1
+      });
+      const end = Date.now();
+      updateApiUsage(response.usage?.total_tokens || 0);
+      statusMessage += `OpenAI API latency: ${end - start}ms
+
+`;
+    } catch (error) {
+      statusMessage += `Error checking OpenAI latency: ${error instanceof Error ? error.message : String(error)}
+
+`;
+    }
+
+    statusMessage += `OpenAI API Usage:
+Requests made: ${apiRequestsCount}
+Tokens used: ${apiTokensUsed}
+`;
+
+    log('Enhanced status report generated', 'debug');
+    await notify(statusMessage);
+    log('Enhanced status report sent', 'debug');
+  } catch (error) {
+    logErr('Error generating enhanced status report', error);
+    await notify('Error generating enhanced status report. Please check the logs.');
+  }
+}
+
+async function resetRedisCache(): Promise<void> {
+  try {
+    log('Attempting to clear Redis and LRU caches...', 'debug');
+    
+    await redis.flushdb();
+    
+    lruCache.clear();
+    
+    log('Redis and LRU caches cleared successfully', 'debug');
+    await notify('Redis and LRU caches have been cleared successfully');
+  } catch (error) {
+    logErr('resetRedisCache', error);
+    await notify(`Error in resetRedisCache: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handleDbCommand() {
+  try {
+    log('Handling /db command', 'debug');
+    await saveRedisToPostgres();
+    const cacheContent = await getCacheContent();
+    const csvFilePath = await generateCacheCsvReport(cacheContent);
+    await sendCsvToAdmin(csvFilePath);
+    log('DB command executed successfully', 'debug');
+    await notify('Database operations completed. CSV report sent.');
+  } catch (error) {
+    logErr('handleDbCommand', error);
+    await notify(`Error executing DB command: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function getCacheContent(): Promise<Report[]> {
+  const reports: Report[] = [];
+
+  for (const [key, value] of lruCache) {
+    reports.push({
+      reportId: key,
+      messageContent: [],
+      mediaHashes: [],
+      complaintCount: 0,
+      source: '',
+      sender: '',
+      isSpam: value.isSpam,
+      reason: value.reason,
+      timestamp: Date.now(),
+      checkType: value.checkType
     });
   }
-  
-  function updateApiUsage(tokensUsed: number) {
-    apiRequestsCount++;
-    apiTokensUsed += tokensUsed;
+
+  const keys = await redis.keys('report:*');
+  for (const key of keys) {
+    const reportData = await redis.get(key);
+    if (reportData) {
+      reports.push(JSON.parse(reportData) as Report);
+    }
   }
-  
-  async function sendStatus() {
-    log('Generating enhanced status report', 'debug');
-    try {
-      let statusMessage = `
-  Current status:
-  Auto mode: ${autoMode ? 'On (decisions and bot commands will be sent)' : 'Off (decisions and bot commands will not be sent)'}
-  Command delay: ${COMMAND_DELAY} ms
-  
-  Server Resources:
-  `;
-  
-      const totalMemory = os.totalmem();
-      const freeMemory = os.freemem();
-      const usedMemory = totalMemory - freeMemory;
-  
-      statusMessage += `CPU Usage: ${os.loadavg()[0].toFixed(2)}%
-  Memory Usage: ${((usedMemory / totalMemory) * 100).toFixed(2)}%
-  Free Memory: ${(freeMemory / 1024 / 1024 / 1024).toFixed(2)} GB
-  Total Memory: ${(totalMemory / 1024 / 1024 / 1024).toFixed(2)} GB
-  
-  `;
-  
-      const start = Date.now();
-      try {
-        const response = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: "Test" }],
-          max_tokens: 1
-        });
-        const end = Date.now();
-        updateApiUsage(response.usage?.total_tokens || 0);
-        statusMessage += `OpenAI API latency: ${end - start}ms
-  
-  `;
-      } catch (error) {
-        statusMessage += `Error checking OpenAI latency: ${error instanceof Error ? error.message : String(error)}
-  
-  `;
+
+  return reports;
+}
+
+async function generateCacheCsvReport(reports: Report[]): Promise<string> {
+  const csvFilePath = join(tmpdir(), 'cache_report.csv');
+  const csvWriter = createObjectCsvWriter({
+    path: csvFilePath,
+    header: [
+      {id: 'reportId', title: 'Report ID'},
+      {id: 'isSpam', title: 'Is Spam'},
+      {id: 'reason', title: 'Reason'},
+      {id: 'timestamp', title: 'Timestamp'},
+      {id: 'source', title: 'Source'},
+      {id: 'sender', title: 'Sender'},
+      {id: 'complaintCount', title: 'Complaint Count'},
+      {id: 'messageContent', title: 'Message Content'}
+    ]
+  });
+
+  const reportData = reports.map(report => ({
+    ...report,
+    messageContent: report.messageContent.join('\n'),
+  }));
+
+  await csvWriter.writeRecords(reportData);
+  log(`Cache CSV report generated: ${csvFilePath}`, 'debug');
+  return csvFilePath;
+}
+
+// Database functions
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id SERIAL,
+        report_id TEXT NOT NULL,
+        message_content TEXT[],
+        media_hashes TEXT[],
+        complaint_count INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        is_spam INTEGER,
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) PARTITION BY RANGE (created_at);
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'unique_report_id_created_at'
+        ) THEN
+          ALTER TABLE reports ADD CONSTRAINT unique_report_id_created_at UNIQUE (report_id, created_at);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reports_is_spam_created_at ON reports (is_spam, created_at);
+      CREATE INDEX IF NOT EXISTS idx_reports_report_id ON reports (report_id);
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        id SERIAL PRIMARY KEY,
+        version TEXT NOT NULL,
+        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      INSERT INTO schema_version (version)
+      SELECT $1
+      WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+    `, [DB_SCHEMA_VERSION]);
+
+    const now = new Date();
+    for (let i = 0; i < 12; i++) {
+      const startDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const endDate = new Date(now.getFullYear(), now.getMonth() + i + 1, 1);
+      const partitionName = `reports_y${startDate.getFullYear()}_m${String(startDate.getMonth() + 1).padStart(2, '0')}`;
+      
+      const partitionExists = await client.query(`
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = $1 AND n.nspname = 'public'
+      `, [partitionName]);
+
+      if (partitionExists.rows.length === 0) {
+        const createPartitionQuery = `
+          CREATE TABLE IF NOT EXISTS ${partitionName}
+          PARTITION OF reports
+          FOR VALUES FROM ('${startDate.toISOString()}') TO ('${endDate.toISOString()}');
+        `;
+        await client.query(createPartitionQuery);
       }
-  
-      statusMessage += `OpenAI API Usage:
-  Requests made: ${apiRequestsCount}
-  Tokens used: ${apiTokensUsed}
-  `;
-  
-      log('Enhanced status report generated', 'debug');
-      await notify(statusMessage);
-      log('Enhanced status report sent', 'debug');
-    } catch (error) {
-      logErr('Error generating enhanced status report', error);
-      await notify('Error generating enhanced status report. Please check the logs.');
     }
+
+    await client.query('COMMIT');
+    log('Database structure updated', 'info');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logErr('initDB', error);
+    throw error;
+  } finally {
+    client.release();
   }
-  
-  async function resetRedisCache(): Promise<void> {
-    try {
-      log('Attempting to clear Redis and LRU caches...', 'debug');
-      
-      await redis.flushdb();
-      
-      lruCache.clear();
-      
-      log('Redis and LRU caches cleared successfully', 'debug');
-      await notify('Redis and LRU caches have been cleared successfully');
-    } catch (error) {
-      logErr('resetRedisCache', error);
-      await notify(`Error in resetRedisCache: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  
-  async function handleDbCommand() {
-    try {
-      log('Handling /db command', 'debug');
-      await saveRedisToPostgres();
-      const cacheContent = await getCacheContent();
-      const csvFilePath = await generateCacheCsvReport(cacheContent);
-      await sendCsvToAdmin(csvFilePath);
-      log('DB command executed successfully', 'debug');
-      await notify('Database operations completed. CSV report sent.');
-    } catch (error) {
-      logErr('handleDbCommand', error);
-      await notify(`Error executing DB command: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  
-  async function getCacheContent(): Promise<Report[]> {
-    const reports: Report[] = [];
-  
-    for (const [key, value] of lruCache) {
-      reports.push({
-        reportId: key,
-        messageContent: [],
-        mediaHashes: [],
-        complaintCount: 0,
-        source: '',
-        sender: '',
-        isSpam: value.isSpam,
-        reason: value.reason,
-        timestamp: Date.now(),
-        checkType: value.checkType
-      });
-    }
-  
+}
+
+async function saveRedisToPostgres() {
+  try {
+    log('Starting Redis to PostgreSQL data transfer', 'info');
     const keys = await redis.keys('report:*');
-    for (const key of keys) {
-      const reportData = await redis.get(key);
-      if (reportData) {
-        reports.push(JSON.parse(reportData) as Report);
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      const batchSize = 100;
+      for (let i = 0; i < keys.length; i += batchSize) {
+        const batch = keys.slice(i, i + batchSize);
+        const reports = await Promise.all(batch.map(key => redis.get(key)));
+        
+        const values = reports.filter(Boolean).map(reportData => {
+          const report = JSON.parse(reportData!) as Report;
+          return [
+            report.reportId,
+            report.messageContent,
+            report.mediaHashes,
+            report.complaintCount,
+            report.source,
+            report.sender,
+            report.isSpam,
+            report.reason,
+            new Date(report.timestamp)
+          ];
+        });
+
+        if (values.length > 0) {
+          const query = `
+            INSERT INTO reports 
+            (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, created_at)
+            VALUES ${values.map((_, index) => `($${index * 9 + 1}, $${index * 9 + 2}, $${index * 9 + 3}, $${index * 9 + 4}, $${index * 9 + 5}, $${index * 9 + 6}, $${index * 9 + 7}, $${index * 9 + 8}, $${index * 9 + 9})`).join(', ')}
+            ON CONFLICT (report_id, created_at) DO UPDATE SET
+            message_content = EXCLUDED.message_content,
+            media_hashes = EXCLUDED.media_hashes,
+            complaint_count = EXCLUDED.complaint_count,
+            source = EXCLUDED.source,
+            sender = EXCLUDED.sender,
+            is_spam = EXCLUDED.is_spam,
+            reason = EXCLUDED.reason
+          `;
+
+          await client.query(query, values.flat());
+        }
       }
+
+      await client.query('COMMIT');
+      log(`Successfully transferred ${keys.length} reports from Redis to PostgreSQL`, 'info');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-  
-    return reports;
+  } catch (error) {
+    if (error instanceof Error) {
+      logErr('saveRedisToPostgres', `${error.message}\n${error.stack}`);
+    } else {
+      logErr('saveRedisToPostgres', String(error));
+    }
+    await notify(`Error in saveRedisToPostgres: ${error instanceof Error ? error.message : String(error)}`);
   }
-  
-  async function generateCacheCsvReport(reports: Report[]): Promise<string> {
-    const csvFilePath = join(tmpdir(), 'cache_report.csv');
+}
+
+async function generateCsvReport(): Promise<string> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT 
+        report_id,
+        message_content[1] as message,
+        complaint_count,
+        source,
+        sender,
+        is_spam,
+        reason,
+        created_at
+      FROM reports
+      WHERE created_at >= NOW() - INTERVAL '7 days'
+      ORDER BY created_at DESC
+    `);
+
+    const csvFilePath = join(tmpdir(), 'spam_report.csv');
     const csvWriter = createObjectCsvWriter({
       path: csvFilePath,
       header: [
-        {id: 'reportId', title: 'Report ID'},
-        {id: 'isSpam', title: 'Is Spam'},
-        {id: 'reason', title: 'Reason'},
-        {id: 'timestamp', title: 'Timestamp'},
+        {id: 'report_id', title: 'Report ID'},
+        {id: 'message', title: 'Message'},
+        {id: 'complaint_count', title: 'Complaint Count'},
         {id: 'source', title: 'Source'},
         {id: 'sender', title: 'Sender'},
-        {id: 'complaintCount', title: 'Complaint Count'},
-        {id: 'messageContent', title: 'Message Content'}
+        {id: 'is_spam', title: 'Is Spam'},
+        {id: 'reason', title: 'Reason'},
+        {id: 'created_at', title: 'Created At'}
       ]
     });
-  
-    const reportData = reports.map(report => ({
-      ...report,
-      messageContent: report.messageContent.join('\n'),
-    }));
-  
-    await csvWriter.writeRecords(reportData);
-    log(`Cache CSV report generated: ${csvFilePath}`, 'debug');
+
+    await csvWriter.writeRecords(result.rows);
+    log(`CSV report generated: ${csvFilePath}`, 'debug');
     return csvFilePath;
+  } catch (error) {
+    logErr('generateCsvReport', error);
+    throw error;
+  } finally {
+    client.release();
   }
-  
-  // Database functions
-  async function initDB() {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-  
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS reports (
-          id SERIAL,
-          report_id TEXT NOT NULL,
-          message_content TEXT[],
-          media_hashes TEXT[],
-          complaint_count INTEGER NOT NULL,
-          source TEXT NOT NULL,
-          sender TEXT NOT NULL,
-          is_spam INTEGER,
-          reason TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) PARTITION BY RANGE (created_at);
-      `);
-  
-      await client.query(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint WHERE conname = 'unique_report_id_created_at'
-          ) THEN
-            ALTER TABLE reports ADD CONSTRAINT unique_report_id_created_at UNIQUE (report_id, created_at);
-          END IF;
-        END $$;
-      `);
-  
-      await client.query(`
-        CREATE INDEX IF NOT EXISTS idx_reports_is_spam_created_at ON reports (is_spam, created_at);
-        CREATE INDEX IF NOT EXISTS idx_reports_report_id ON reports (report_id);
-      `);
-  
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS schema_version (
-          id SERIAL PRIMARY KEY,
-          version TEXT NOT NULL,
-          applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-  
-      await client.query(`
-        INSERT INTO schema_version (version)
-        SELECT $1
-        WHERE NOT EXISTS (SELECT 1 FROM schema_version);
-      `, [DB_SCHEMA_VERSION]);
-  
-      const now = new Date();
-      for (let i = 0; i < 12; i++) {
-        const startDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
-        const endDate = new Date(now.getFullYear(), now.getMonth() + i + 1, 1);
-        const partitionName = `reports_y${startDate.getFullYear()}_m${String(startDate.getMonth() + 1).padStart(2, '0')}`;
-        
-        const partitionExists = await client.query(`
-          SELECT 1
-          FROM pg_class c
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = $1 AND n.nspname = 'public'
-        `, [partitionName]);
-  
-        if (partitionExists.rows.length === 0) {
-          const createPartitionQuery = `
-            CREATE TABLE IF NOT EXISTS ${partitionName}
-            PARTITION OF reports
-            FOR VALUES FROM ('${startDate.toISOString()}') TO ('${endDate.toISOString()}');
-          `;
-          await client.query(createPartitionQuery);
-        }
-      }
-  
-      await client.query('COMMIT');
-      log('Database structure updated', 'info');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      logErr('initDB', error);
-      throw error;
-    } finally {
-      client.release();
+}
+
+async function sendCsvToAdmin(csvFilePath: string) {
+  await client.sendFile(ADMIN_ID, {
+    file: csvFilePath,
+    caption: 'Here is the latest report.',
+    attributes: [
+      new Api.DocumentAttributeFilename({ fileName: 'report.csv' })
+    ]
+  });
+  log(`CSV file sent to admin: ${csvFilePath}`, 'debug');
+}
+
+async function checkDB(): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query('SELECT NOW()');
+    log(`Database connection successful. Current time: ${result.rows[0].now}`, 'debug');
+    return true;
+  } catch (error) {
+    logErr('checkDB', error);
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+// Setup handlers
+async function setupHandlers() {
+  if (!botEntity) throw new Error('Bot entity not initialized');
+  const botUserId = botEntity.userId.toString();
+
+  const handlers = [
+    { 
+      handler: handleCheck, 
+      options: { fromUsers: [botUserId], incoming: true, forwards: true, outgoing: false } 
+    },
+    { 
+      handler: handleSys, 
+      options: { fromUsers: [botUserId], incoming: true, forwards: false, outgoing: false, pattern: sysRegex.source } 
+    },
+    { 
+      handler: handleAdmin, 
+      options: { fromUsers: [ADMIN_ID], incoming: true, forwards: false, outgoing: false }
     }
-  }
-  
-  async function saveRedisToPostgres() {
+  ];
+
+  handlers.forEach(({ handler, options }) => {
     try {
-      log('Starting Redis to PostgreSQL data transfer', 'info');
+      client.addEventHandler(handler, new NewMessage(options));
+      log(`Handler ${handler.name} set up successfully`, 'debug');
+    } catch (error) {
+      logErr(`setupHandlers - ${handler.name}`, error);
+    }
+  });
+
+  client.addEventHandler(async (event) => {
+    if (event.message instanceof Api.Message &&
+        event.message.senderId?.toString() === botUserId &&
+        event.message.message &&
+        !event.message.message.match(sysRegex.source)) {
+      await handleAdd(event);
+    }
+  }, new NewMessage({ fromUsers: [botUserId], incoming: true, forwards: false, outgoing: false }));
+}
+
+// System health check
+async function checkSystemHealth() {
+  try {
+    await redis.ping();
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('SELECT 1');
+    } finally {
+      dbClient.release();
+    }
+
+    if (!client) {
+      throw new Error('Telegram client not initialized');
+    }
+
+    try {
+      await client.getMe();
+    } catch (error) {
+      throw new Error('Telegram client is not connected');
+    }
+
+    const currentTime = Date.now();
+    const timeSinceLastReport = currentTime - lastReportProcessTime;
+
+    if (timeSinceLastReport > 5 * 60 * 1000 && timeSinceLastReport <= 10 * 60 * 1000) {
+      log('No reports processed in the last 5 minutes. Sending "/next 7" command.', 'warn');
+      await sendToBot("/next 7");
+    } else if (timeSinceLastReport > 10 * 60 * 1000) {
+      throw new Error('No reports processed in the last 10 minutes');
+    }
+
+    log('System health check passed', 'info');
+  } catch (error) {
+    logErr('System health check failed', error);
+    await notify(`System health check failed: ${error instanceof Error ? error.message : String(error)}. Attempting restart...`);
+    process.exit(1);
+  }
+}
+
+// Cleanup function for old data
+async function cleanupOldData() {
+  const startTime = Date.now();
+  log('Starting cleanup of old data', 'info');
+
+  try {
+    const oneMonthAgo = new Date();
+    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
+    let lruDeletedCount = 0;
+    for (const [key, value] of lruCache.entries()) {
+      if (value.timestamp < oneMonthAgo.getTime()) {
+        lruCache.delete(key);
+        lruDeletedCount++;
+      }
+    }
+    log(`LRU Cache cleanup completed. Deleted ${lruDeletedCount} items.`, 'info');
+
+    if (redis.status === 'ready') {
       const keys = await redis.keys('report:*');
-      const client = await pool.connect();
-  
-      try {
-        await client.query('BEGIN');
-  
-        const batchSize = 100;
-        for (let i = 0; i < keys.length; i += batchSize) {
-          const batch = keys.slice(i, i + batchSize);
-          const reports = await Promise.all(batch.map(key => redis.get(key)));
-          
-          const values = reports.filter(Boolean).map(reportData => {
-            const report = JSON.parse(reportData!) as Report;
-            return [
-              report.reportId,
-              report.messageContent,
-              report.mediaHashes,
-              report.complaintCount,
-              report.source,
-              report.sender,
-              report.isSpam,
-              report.reason,
-              new Date(report.timestamp)
-            ];
-          });
-  
-          if (values.length > 0) {
-            const query = `
-              INSERT INTO reports 
-              (report_id, message_content, media_hashes, complaint_count, source, sender, is_spam, reason, created_at)
-              VALUES ${values.map((_, index) => `($${index * 9 + 1}, $${index * 9 + 2}, $${index * 9 + 3}, $${index * 9 + 4}, $${index * 9 + 5}, $${index * 9 + 6}, $${index * 9 + 7}, $${index * 9 + 8}, $${index * 9 + 9})`).join(', ')}
-              ON CONFLICT (report_id, created_at) DO UPDATE SET
-              message_content = EXCLUDED.message_content,
-              media_hashes = EXCLUDED.media_hashes,
-              complaint_count = EXCLUDED.complaint_count,
-              source = EXCLUDED.source,
-              sender = EXCLUDED.sender,
-              is_spam = EXCLUDED.is_spam,
-              reason = EXCLUDED.reason
-            `;
-  
-            await client.query(query, values.flat());
+      const batchSize = 1000;
+      let redisDeletedCount = 0;
+
+      for (let i = 0; i < keys.length; i += batchSize) {
+        const batch = keys.slice(i, i + batchSize);
+        const pipeline = redis.pipeline();
+
+        for (const key of batch) {
+          const report = JSON.parse(await redis.get(key) || '{}') as Report;
+          if (new Date(report.timestamp) < oneMonthAgo) {
+            pipeline.del(key);
+            redisDeletedCount++;
           }
         }
-  
-        await client.query('COMMIT');
-        log(`Successfully transferred ${keys.length} reports from Redis to PostgreSQL`, 'info');
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
+
+        await pipeline.exec();
+        log(`Redis cleanup progress: ${i + batch.length}/${keys.length}`, 'debug');
+
+        if (Date.now() - startTime > 10 * 60 * 1000) {
+          log('Cleanup taking too long, will continue in next run', 'warn');
+          break;
+        }
       }
-    } catch (error) {
-      if (error instanceof Error) {
-        logErr('saveRedisToPostgres', `${error.message}\n${error.stack}`);
-      } else {
-        logErr('saveRedisToPostgres', String(error));
-      }
-      await notify(`Error in saveRedisToPostgres: ${error instanceof Error ? error.message : String(error)}`);
+      log(`Redis cleanup completed. Deleted ${redisDeletedCount} items.`, 'info');
+    } else {
+      log('Redis is not ready, skipping Redis cleanup', 'warn');
     }
-  }
-  
-  async function generateCsvReport(): Promise<string> {
+
     const client = await pool.connect();
     try {
-      const result = await client.query(`
-        SELECT 
-          report_id,
-          message_content[1] as message,
-          complaint_count,
-          source,
-          sender,
-          is_spam,
-          reason,
-          created_at
-        FROM reports
-        WHERE created_at >= NOW() - INTERVAL '7 days'
-        ORDER BY created_at DESC
+      let totalDeleted = 0;
+      const batchSize = 10000;
+      while (true) {
+        const result = await client.query(
+          'WITH deleted AS (DELETE FROM reports WHERE created_at < $1 RETURNING *) SELECT COUNT(*) FROM deleted',
+          [oneMonthAgo, batchSize]
+        );
+        const deletedCount = parseInt(result.rows[0].count);
+        totalDeleted += deletedCount;
+        log(`Postgres cleanup progress: deleted ${totalDeleted} records`, 'debug');
+
+        if (deletedCount < batchSize) break;
+
+        if (Date.now() - startTime > 10 * 60 * 1000) {
+          log('Postgres cleanup taking too long, will continue in next run', 'warn');
+          break;
+        }
+      }
+      log(`Postgres cleanup completed. Deleted ${totalDeleted} records.`, 'info');
+
+      const oldPartitions = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public' AND tablename LIKE 'reports_y%_m%'
       `);
-  
-      const csvFilePath = join(tmpdir(), 'spam_report.csv');
-      const csvWriter = createObjectCsvWriter({
-        path: csvFilePath,
-        header: [
-          {id: 'report_id', title: 'Report ID'},
-          {id: 'message', title: 'Message'},
-          {id: 'complaint_count', title: 'Complaint Count'},
-          {id: 'source', title: 'Source'},
-          {id: 'sender', title: 'Sender'},
-          {id: 'is_spam', title: 'Is Spam'},
-          {id: 'reason', title: 'Reason'},
-          {id: 'created_at', title: 'Created At'}
-        ]
-      });
-  
-      await csvWriter.writeRecords(result.rows);
-      log(`CSV report generated: ${csvFilePath}`, 'debug');
-      return csvFilePath;
-    } catch (error) {
-      logErr('generateCsvReport', error);
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-  
-  async function sendCsvToAdmin(csvFilePath: string) {
-    await client.sendFile(ADMIN_ID, {
-      file: csvFilePath,
-      caption: 'Here is the latest report.',
-      attributes: [
-        new Api.DocumentAttributeFilename({ fileName: 'report.csv' })
-      ]
-    });
-    log(`CSV file sent to admin: ${csvFilePath}`, 'debug');
-  }
-  
-  async function checkDB(): Promise<boolean> {
-    const client = await pool.connect();
-    try {
-      const result = await client.query('SELECT NOW()');
-      log(`Database connection successful. Current time: ${result.rows[0].now}`, 'debug');
-      return true;
-    } catch (error) {
-      logErr('checkDB', error);
-      return false;
-    } finally {
-      client.release();
-    }
-  }
-  
-  // Setup handlers
-  async function setupHandlers() {
-    if (!botEntity) throw new Error('Bot entity not initialized');
-    const botUserId = botEntity.userId.toString();
-  
-    const handlers = [
-      { 
-        handler: handleCheck, 
-        options: { fromUsers: [botUserId], incoming: true, forwards: true, outgoing: false } 
-      },
-      { 
-        handler: handleSys, 
-        options: { fromUsers: [botUserId], incoming: true, forwards: false, outgoing: false, pattern: sysRegex.source } 
-      },
-      { 
-        handler: handleAdmin, 
-        options: { fromUsers: [ADMIN_ID], incoming: true, forwards: false, outgoing: false }
+      
+      for (const row of oldPartitions.rows) {
+        const partitionDate = new Date(row.tablename.substring(9, 13), parseInt(row.tablename.substring(15)) - 1);
+        if (partitionDate < oneMonthAgo) {
+          await client.query(`DROP TABLE IF EXISTS ${row.tablename}`);
+          log(`Dropped old partition: ${row.tablename}`, 'info');
+        }
+
+        if (Date.now() - startTime > 10 * 60 * 1000) {
+          log('Partition cleanup taking too long, will continue in next run', 'warn');
+          break;
+        }
       }
-    ];
-  
-    handlers.forEach(({ handler, options }) => {
+    } finally {
+      client.release();
+    }
+
+    const duration = (Date.now() - startTime) / 1000;
+    log(`Cleanup of old data completed in ${duration.toFixed(2)} seconds`, 'info');
+  } catch (error) {
+    logErr('Error during cleanup of old data', error);
+  }
+}
+
+// Graceful shutdown
+async function gracefulShutdown(restart: boolean = false) {
+  log(`Starting graceful shutdown... ${restart ? '(Restarting)' : ''}`, 'info');
+
+  autoMode = false;
+  await notify(`Automatic mode stopped due to application ${restart ? 'restart' : 'shutdown'}.`);
+
+  clearExistingTimers();
+
+  isShuttingDown = true;
+
+  processingReports.clear();
+
+  const safeRedisOperation = async (operation: () => Promise<void>) => {
+    if (redis.status === 'ready') {
       try {
-        client.addEventHandler(handler, new NewMessage(options));
-        log(`Handler ${handler.name} set up successfully`, 'debug');
+        await operation();
       } catch (error) {
-        logErr(`setupHandlers - ${handler.name}`, error);
+        logErr('Redis operation during shutdown', error);
       }
-    });
-  
-    client.addEventHandler(async (event) => {
-      if (event.message instanceof Api.Message &&
-          event.message.senderId?.toString() === botUserId &&
-          event.message.message &&
-          !event.message.message.match(sysRegex.source)) {
-        await handleAdd(event);
-      }
-    }, new NewMessage({ fromUsers: [botUserId], incoming: true, forwards: false, outgoing: false }));
+    }
+  };
+
+  await safeRedisOperation(async () => {
+    if (redisBatch.length > 0) {
+      await saveRedisBatch();
+    }
+  });
+
+  try {
+    await pool.end();
+    log('Database connection closed', 'info');
+  } catch (error) {
+    logErr('gracefulShutdown - closing database connection', error);
   }
-  
-  // System health check
-  async function checkSystemHealth() {
+
+  try {
+    if (client && client.connected) {
+      await client.disconnect();
+      log('Telegram client disconnected', 'info');
+    }
+  } catch (error) {
+    logErr('gracefulShutdown - disconnecting Telegram client', error);
+  }
+
+  try {
+    if (redis.status === 'ready') {
+      await redis.quit();
+      log('Redis connection closed', 'info');
+    }
+  } catch (error) {
+    logErr('gracefulShutdown - closing Redis connection', error);
+  }
+
+  log(`Graceful shutdown completed${restart ? ' (Restarting)' : ''}`, 'info');
+  await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
+
+  if (restart) {
+    const { spawn } = await import('child_process');
+    spawn(process.argv[0], process.argv.slice(1), {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'ignore']
+    }).unref();
+  }
+
+  process.exit(restart ? 1 : 0);
+}
+
+function clearExistingTimers() {
+  if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
+}
+
+// Main function
+async function main() {
+  try {
+    log('Starting application...', 'info');
+
+    try {
+      await initDB();
+      log('Database initialized successfully', 'info');
+    } catch (dbError) {
+      logErr('Database initialization failed', dbError);
+      throw dbError;
+    }
+
     try {
       await redis.ping();
-      const dbClient = await pool.connect();
+      log('Successfully connected to Redis', 'info');
+    } catch (redisError) {
+      logErr('Redis connection failed', redisError);
+      throw redisError;
+    }
+
+    try {
+      client = await initClient();
+      await initBot();
+      log('Telegram client and bot initialized successfully', 'info');
+    } catch (telegramError) {
+      logErr('Telegram initialization failed', telegramError);
+      throw telegramError;
+    }
+
+    try {
+      await setupHandlers();
+      log('Event handlers set up successfully', 'info');
+    } catch (handlersError) {
+      logErr('Event handlers setup failed', handlersError);
+      throw handlersError;
+    }
+
+    app.listen(PORT, () => log(`Server running on port ${PORT}`, 'info'));
+
+    schedule.scheduleJob('0 */2 * * *', saveRedisToPostgres);
+    schedule.scheduleJob('*/15 * * * *', checkSystemHealth);
+    schedule.scheduleJob('*/5 * * * *', limitCacheSize);
+    schedule.scheduleJob('0 5 * * *', cleanupOldData);
+    schedule.scheduleJob('*/30 * * * *', cleanupCache);
+    schedule.scheduleJob('*/5 * * * *', cleanupLRUCache);
+    schedule.scheduleJob('*/5 * * * *', checkStuckReports);
+
+    log('Periodic tasks scheduled', 'info');
+
+    log('Application initialized successfully', 'info');
+    await notify('Application initialized successfully');
+    
+    log('Sending initial status report', 'debug');
+    await sendStatus();
+    log('Initial status report sent', 'debug');
+
+    if (autoMode) {
+      log('Starting auto mode', 'info');
+      startIdleUndoTimer();
       try {
-        await dbClient.query('SELECT 1');
-      } finally {
-        dbClient.release();
-      }
-  
-      if (!client) {
-        throw new Error('Telegram client not initialized');
-      }
-  
-      try {
-        await client.getMe();
+        await sendToBot("/next 1");
+        log('Initial "/next 1" command sent successfully', 'debug');
       } catch (error) {
-        throw new Error('Telegram client is not connected');
+        logErr('Failed to send initial "/next 1" command', error);
+        await notify('Failed to start auto mode. Please check the logs and restart if necessary.');
       }
-  
-      const currentTime = Date.now();
-      const timeSinceLastReport = currentTime - lastReportProcessTime;
-  
-      if (timeSinceLastReport > 5 * 60 * 1000 && timeSinceLastReport <= 10 * 60 * 1000) {
-        log('No reports processed in the last 5 minutes. Sending "/next 7" command.', 'warn');
-        await sendToBot("/next 7");
-      } else if (timeSinceLastReport > 10 * 60 * 1000) {
-        throw new Error('No reports processed in the last 10 minutes');
-      }
-  
-      log('System health check passed', 'info');
-    } catch (error) {
-      logErr('System health check failed', error);
-      await notify(`System health check failed: ${error instanceof Error ? error.message : String(error)}. Attempting restart...`);
-      process.exit(1);
     }
-  }
-  
-  // Cleanup function for old data
-  async function cleanupOldData() {
-    const startTime = Date.now();
-    log('Starting cleanup of old data', 'info');
-  
-    try {
-      const oneMonthAgo = new Date();
-      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-  
-      let lruDeletedCount = 0;
-      for (const [key, value] of lruCache.entries()) {
-        if (value.timestamp < oneMonthAgo.getTime()) {
-          lruCache.delete(key);
-          lruDeletedCount++;
-        }
-      }
-      log(`LRU Cache cleanup completed. Deleted ${lruDeletedCount} items.`, 'info');
-  
-      if (redis.status === 'ready') {
-        const keys = await redis.keys('report:*');
-        const batchSize = 1000;
-        let redisDeletedCount = 0;
-  
-        for (let i = 0; i < keys.length; i += batchSize) {
-          const batch = keys.slice(i, i + batchSize);
-          const pipeline = redis.pipeline();
-  
-          for (const key of batch) {
-            const report = JSON.parse(await redis.get(key) || '{}') as Report;
-            if (new Date(report.timestamp) < oneMonthAgo) {
-              pipeline.del(key);
-              redisDeletedCount++;
-            }
-          }
-  
-          await pipeline.exec();
-          log(`Redis cleanup progress: ${i + batch.length}/${keys.length}`, 'debug');
-  
-          if (Date.now() - startTime > 10 * 60 * 1000) {
-            log('Cleanup taking too long, will continue in next run', 'warn');
-            break;
-          }
-        }
-        log(`Redis cleanup completed. Deleted ${redisDeletedCount} items.`, 'info');
-      } else {
-        log('Redis is not ready, skipping Redis cleanup', 'warn');
-      }
-  
-      const client = await pool.connect();
-      try {
-        let totalDeleted = 0;
-        const batchSize = 10000;
-        while (true) {
-          const result = await client.query(
-            'WITH deleted AS (DELETE FROM reports WHERE created_at < $1 LIMIT $2 RETURNING *) SELECT COUNT(*) FROM deleted',
-            [oneMonthAgo, batchSize]
-          );
-          const deletedCount = parseInt(result.rows[0].count);
-          totalDeleted += deletedCount;
-          log(`Postgres cleanup progress: deleted ${totalDeleted} records`, 'debug');
-  
-          if (deletedCount < batchSize) break;
-  
-          if (Date.now() - startTime > 10 * 60 * 1000) {
-            log('Postgres cleanup taking too long, will continue in next run', 'warn');
-            break;
-          }
-        }
-        log(`Postgres cleanup completed. Deleted ${totalDeleted} records.`, 'info');
-  
-        const oldPartitions = await client.query(`
-          SELECT tablename 
-          FROM pg_tables 
-          WHERE schemaname = 'public' AND tablename LIKE 'reports_y%_m%'
-        `);
-        
-        for (const row of oldPartitions.rows) {
-          const partitionDate = new Date(row.tablename.substring(9, 13), parseInt(row.tablename.substring(15)) - 1);
-          if (partitionDate < oneMonthAgo) {
-            await client.query(`DROP TABLE IF EXISTS ${row.tablename}`);
-            log(`Dropped old partition: ${row.tablename}`, 'info');
-          }
-  
-          if (Date.now() - startTime > 10 * 60 * 1000) {
-            log('Partition cleanup taking too long, will continue in next run', 'warn');
-            break;
-          }
-        }
-      } finally {
-        client.release();
-      }
-  
-      const duration = (Date.now() - startTime) / 1000;
-      log(`Cleanup of old data completed in ${duration.toFixed(2)} seconds`, 'info');
-    } catch (error) {
-      logErr('Error during cleanup of old data', error);
-    }
-  }
-  
-  // Graceful shutdown
-  async function gracefulShutdown(restart: boolean = false) {
-    log(`Starting graceful shutdown... ${restart ? '(Restarting)' : ''}`, 'info');
-  
-    autoMode = false;
-    await notify(`Automatic mode stopped due to application ${restart ? 'restart' : 'shutdown'}.`);
-  
-    clearExistingTimers();
-  
-    isShuttingDown = true;
-  
-    processingReports.clear();
-  
-    const safeRedisOperation = async (operation: () => Promise<void>) => {
-      if (redis.status === 'ready') {
-        try {
-          await operation();
-        } catch (error) {
-          logErr('Redis operation during shutdown', error);
-        }
-      }
-    };
-  
-    await safeRedisOperation(async () => {
-      if (redisBatch.length > 0) {
-        await saveRedisBatch();
-      }
-    });
-  
-    try {
-      await pool.end();
-      log('Database connection closed', 'info');
-    } catch (error) {
-      logErr('gracefulShutdown - closing database connection', error);
-    }
-  
-    try {
-      if (client && client.connected) {
-        await client.disconnect();
-        log('Telegram client disconnected', 'info');
-      }
-    } catch (error) {
-      logErr('gracefulShutdown - disconnecting Telegram client', error);
-    }
-  
-    try {
-      if (redis.status === 'ready') {
-        await redis.quit();
-        log('Redis connection closed', 'info');
-      }
-    } catch (error) {
-      logErr('gracefulShutdown - closing Redis connection', error);
-    }
-  
-    log(`Graceful shutdown completed${restart ? ' (Restarting)' : ''}`, 'info');
-    await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
-  
-    if (restart) {
-      const { spawn } = await import('child_process');
-      spawn(process.argv[0], process.argv.slice(1), {
-        detached: true,
-        stdio: ['ignore', 'ignore', 'ignore']
-      }).unref();
-    }
-  
-    process.exit(restart ? 1 : 0);
-  }
-  
-  function clearExistingTimers() {
-    if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
-  }
-  
-  // Main function
-  async function main() {
-    try {
-      log('Starting application...', 'info');
-  
-      try {
-        await initDB();
-        log('Database initialized successfully', 'info');
-      } catch (dbError) {
-        logErr('Database initialization failed', dbError);
-        throw dbError;
-      }
-  
-      try {
-        await redis.ping();
-        log('Successfully connected to Redis', 'info');
-      } catch (redisError) {
-        logErr('Redis connection failed', redisError);
-        throw redisError;
-      }
-  
-      try {
-        client = await initClient();
-        await initBot();
-        log('Telegram client and bot initialized successfully', 'info');
-      } catch (telegramError) {
-        logErr('Telegram initialization failed', telegramError);
-        throw telegramError;
-      }
-  
-      try {
-        await setupHandlers();
-        log('Event handlers set up successfully', 'info');
-      } catch (handlersError) {
-        logErr('Event handlers setup failed', handlersError);
-        throw handlersError;
-      }
-  
-      app.listen(PORT, () => log(`Server running on port ${PORT}`, 'info'));
-  
-      schedule.scheduleJob('0 */2 * * *', saveRedisToPostgres);
-      schedule.scheduleJob('*/15 * * * *', checkSystemHealth);
-      schedule.scheduleJob('*/5 * * * *', limitCacheSize);
-      schedule.scheduleJob('0 2 * * *', cleanupOldData);
-      schedule.scheduleJob('*/30 * * * *', cleanupCache);
-      schedule.scheduleJob('*/5 * * * *', cleanupLRUCache);
-      schedule.scheduleJob('*/5 * * * *', checkStuckReports);
-  
-      log('Periodic tasks scheduled', 'info');
-  
-      log('Application initialized successfully', 'info');
-      await notify('Application initialized successfully');
-      
-      log('Sending initial status report', 'debug');
-      await sendStatus();
-      log('Initial status report sent', 'debug');
-  
-      if (autoMode) {
-        log('Starting auto mode', 'info');
-        startIdleUndoTimer();
-        try {
-          await sendToBot("/next 1");
-          log('Initial "/next 1" command sent successfully', 'debug');
-        } catch (error) {
-          logErr('Failed to send initial "/next 1" command', error);
-          await notify('Failed to start auto mode. Please check the logs and restart if necessary.');
-        }
-      }
-  
-    } catch (error) {
-      logErr('main', error);
-      await notify(`Application initialization failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(1);
-    }
-  }
-  
-  // Run the application
-  main().catch(error => {
-    logErr('main function', error);
+
+  } catch (error) {
+    logErr('main', error);
+    await notify(`Application initialization failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
-  });
-  
-  // Handle uncaught exceptions and unhandled rejections
-  process.on('uncaughtException', async (error) => {
-    logErr('Uncaught Exception', error);
-    await notify('Uncaught Exception occurred. Application will restart.');
-    await gracefulShutdown(true);
-  });
-  
-  process.on('unhandledRejection', async (reason, promise) => {
-    logErr('Unhandled Rejection', reason);
-    await notify('Unhandled Rejection occurred. Application will restart.');
-    await gracefulShutdown(true);
-  });
-  
-  // Handle SIGTERM signal for graceful shutdown
-  process.on('SIGTERM', async () => {
-    log('SIGTERM signal received', 'info');
-    await notify('SIGTERM signal received. Application will shut down gracefully.');
-    await gracefulShutdown();
-  });
-  
-  // Handle SIGINT signal for graceful shutdown (e.g., when pressing Ctrl+C)
-  process.on('SIGINT', async () => {
-    log('SIGINT signal received', 'info');
-    await notify('SIGINT signal received. Application will shut down gracefully.');
-    await gracefulShutdown();
-  });
-  
-  // Express routes
-  app.get('/health', async (req, res) => {
-    try {
-      await checkSystemHealth();
-      res.status(200).json({ status: 'healthy' });
-    } catch (error) {
-      res.status(500).json({ status: 'unhealthy', error: error instanceof Error ? error.message : String(error) });
-    }
-  });
-  
-  app.get('/status', async (req, res) => {
-    try {
-      const cacheSize = await getCacheSize();
-      const dbStatus = await checkDB();
-      const redisStatus = redis.status === 'ready';
-      const telegramStatus = client && client.connected;
-  
-      const status = {
-        autoMode,
-        cacheSize: `${cacheSize.toFixed(2)} MB`,
-        dbStatus,
-        redisStatus,
-        telegramStatus,
-        apiRequestsCount,
-        apiTokensUsed,
-        lastReportProcessTime: new Date(lastReportProcessTime).toISOString(),
-        processingReportsCount: processingReports.size,
-      };
-  
-      res.status(200).json(status);
-    } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
-    }
-  });
-  
-  // Helper function to get media content
-  async function getMediaContent(mediaKey: string): Promise<Buffer | null> {
-    try {
-      const mediaBase64 = await redis.get(mediaKey);
-      if (mediaBase64) {
-        return Buffer.from(mediaBase64, 'base64');
-      }
-    } catch (error) {
-      logErr('getMediaContent', error);
-    }
-    return null;
   }
-  
-  // Helper function to determine media type
-  function getMediaType(mediaHash: string): string {
-    const mediaType = mediaHash.split(':')[0];
-    switch (mediaType) {
-      case 'photo':
-        return 'image/jpeg';
-      case 'video':
-        return 'video/mp4';
-      case 'videonote':
-        return 'video/mp4';
-      case 'gif':
-        return 'image/gif';
-      case 'sticker':
-        return 'image/webp';
-      default:
-        return 'application/octet-stream';
-    }
+}
+
+// Run the application
+main().catch(error => {
+  logErr('main function', error);
+  process.exit(1);
+});
+
+// Handle uncaught exceptions and unhandled rejections
+process.on('uncaughtException', async (error) => {
+  logErr('Uncaught Exception', error);
+  await notify('Uncaught Exception occurred. Application will restart.');
+  await gracefulShutdown(true);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  logErr('Unhandled Rejection', reason);
+  await notify('Unhandled Rejection occurred. Application will restart.');
+  await gracefulShutdown(true);
+});
+
+// Handle SIGTERM signal for graceful shutdown
+process.on('SIGTERM', async () => {
+  log('SIGTERM signal received', 'info');
+  await notify('SIGTERM signal received. Application will shut down gracefully.');
+  await gracefulShutdown();
+});
+
+// Handle SIGINT signal for graceful shutdown (e.g., when pressing Ctrl+C)
+process.on('SIGINT', async () => {
+  log('SIGINT signal received', 'info');
+  await notify('SIGINT signal received. Application will shut down gracefully.');
+  await gracefulShutdown();
+});
+
+// Express routes
+app.get('/health', async (req, res) => {
+  try {
+    await checkSystemHealth();
+    res.status(200).json({ status: 'healthy' });
+  } catch (error) {
+    res.status(500).json({ status: 'unhealthy', error: error instanceof Error ? error.message : String(error) });
   }
-  
-  // Route to serve media content
-  app.get('/media/:reportId/:mediaIndex', async (req, res) => {
-    const { reportId, mediaIndex } = req.params;
-    try {
-      const report = await getCachedReport(reportId);
-      if (!report) {
-        return res.status(404).send('Report not found');
-      }
-  
-      const mediaHash = report.mediaHashes[parseInt(mediaIndex)];
-      if (!mediaHash) {
-        return res.status(404).send('Media not found');
-      }
-  
-      const mediaKey = `media:${mediaHash.split(':')[1]}`;
-      const mediaContent = await getMediaContent(mediaKey);
-      if (!mediaContent) {
-        return res.status(404).send('Media content not found');
-      }
-  
-      const mediaType = getMediaType(mediaHash);
-      res.contentType(mediaType);
-      res.send(mediaContent);
-    } catch (error) {
-      logErr(`Error serving media for report ${reportId}`, error);
-      res.status(500).send('Internal server error');
+});
+
+app.get('/status', async (req, res) => {
+  try {
+    const cacheSize = await getCacheSize();
+    const dbStatus = await checkDB();
+    const redisStatus = redis.status === 'ready';
+    const telegramStatus = client && client.connected;
+
+    const status = {
+      autoMode,
+      cacheSize: `${cacheSize.toFixed(2)} MB`,
+      dbStatus,
+      redisStatus,
+      telegramStatus,
+      apiRequestsCount,
+      apiTokensUsed,
+      lastReportProcessTime: new Date(lastReportProcessTime).toISOString(),
+      processingReportsCount: processingReports.size,
+    };
+
+    res.status(200).json(status);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Helper function to get media content
+async function getMediaContent(mediaKey: string): Promise<Buffer | null> {
+  try {
+    const mediaBase64 = await redis.get(mediaKey);
+    if (mediaBase64) {
+      return Buffer.from(mediaBase64, 'base64');
     }
-  });
-  
-  // Route to get report details
-  app.get('/report/:reportId', async (req, res) => {
-    const { reportId } = req.params;
-    try {
-      const report = await getCachedReport(reportId);
-      if (!report) {
-        return res.status(404).json({ error: 'Report not found' });
-      }
-  
-      // Remove sensitive information
-      const safeReport = {
-        ...report,
-        mediaHashes: report.mediaHashes.map((_, index) => `/media/${reportId}/${index}`),
-      };
-  
-      res.json(safeReport);
-    } catch (error) {
-      logErr(`Error fetching report ${reportId}`, error);
-      res.status(500).json({ error: 'Internal server error' });
+  } catch (error) {
+    logErr('getMediaContent', error);
+  }
+  return null;
+}
+
+// Helper function to determine media type
+function getMediaType(mediaHash: string): string {
+  const mediaType = mediaHash.split(':')[0];
+  switch (mediaType) {
+    case 'photo':
+      return 'image/jpeg';
+    case 'video':
+      return 'video/mp4';
+    case 'videonote':
+      return 'video/mp4';
+    case 'gif':
+      return 'image/gif';
+    case 'sticker':
+      return 'image/webp';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+// Route to serve media content
+app.get('/media/:reportId/:mediaIndex', async (req, res) => {
+  const { reportId, mediaIndex } = req.params;
+  try {
+    const report = await getCachedReport(reportId);
+    if (!report) {
+      return res.status(404).send('Report not found');
     }
-  });
-  
-  // Route to manually trigger undo for a specific report
-  app.post('/undo/:reportId', async (req, res) => {
-    const { reportId } = req.params;
-    try {
-      const success = await undo(reportId);
-      if (success) {
-        res.json({ message: `Successfully undone report ${reportId}` });
-      } else {
-        res.status(400).json({ error: `Failed to undo report ${reportId}` });
-      }
-    } catch (error) {
-      logErr(`Error undoing report ${reportId}`, error);
-      res.status(500).json({ error: 'Internal server error' });
+
+    const mediaHash = report.mediaHashes[parseInt(mediaIndex)];
+    if (!mediaHash) {
+      return res.status(404).send('Media not found');
     }
-  });
-  
-  // Error handling middleware
-  app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    logErr('Express error', err);
+
+    const mediaKey = `media:${mediaHash.split(':')[1]}`;
+    const mediaContent = await getMediaContent(mediaKey);
+    if (!mediaContent) {
+      return res.status(404).send('Media content not found');
+    }
+
+    const mediaType = getMediaType(mediaHash);
+    res.contentType(mediaType);
+    res.send(mediaContent);
+  } catch (error) {
+    logErr(`Error serving media for report ${reportId}`, error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Route to get report details
+app.get('/report/:reportId', async (req, res) => {
+  const { reportId } = req.params;
+  try {
+    const report = await getCachedReport(reportId);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    // Remove sensitive information
+    const safeReport = {
+      ...report,
+      mediaHashes: report.mediaHashes.map((_, index) => `/media/${reportId}/${index}`),
+    };
+
+    res.json(safeReport);
+  } catch (error) {
+    logErr(`Error fetching report ${reportId}`, error);
     res.status(500).json({ error: 'Internal server error' });
-  });
-  
-  export { app, client, redis, pool, openai, lruCache };
+  }
+});
+
+// Route to manually trigger undo for a specific report
+app.post('/undo/:reportId', async (req, res) => {
+  const { reportId } = req.params;
+  try {
+    const success = await undo(reportId);
+    if (success) {
+      res.json({ message: `Successfully undone report ${reportId}` });
+    } else {
+      res.status(400).json({ error: `Failed to undo report ${reportId}` });
+    }
+  } catch (error) {
+    logErr(`Error undoing report ${reportId}`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Error handling middleware
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  logErr('Express error', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+export { app, client, redis, pool, openai, lruCache };
