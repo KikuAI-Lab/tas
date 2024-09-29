@@ -643,6 +643,11 @@ async function processReport(report: Report): Promise<void> {
     await applyDecision(report, decision);
     await saveCache(report, decision);
 
+    // Сохраняем в Redis только если решение не из кэша
+    if (decision.checkType !== 'default') {
+      await saveReportToRedis(report);
+    }
+
   } catch (error) {
     logErr(`processReport for ${report.reportId}`, error);
   } finally {
@@ -1151,6 +1156,12 @@ async function saveReportToRedis(report: Report): Promise<void> {
 
   if (report.isSpam === -1) {
     log(`Skipping save for report ${report.reportId} with isSpam === -1`, 'debug');
+    return;
+  }
+
+  // Проверяем, не является ли отчет результатом обработки LRU кэша
+  if (report.checkType === 'default') {
+    log(`Skipping save for report ${report.reportId} from LRU cache`, 'debug');
     return;
   }
 
@@ -2038,6 +2049,7 @@ async function handleFixCommand(reportId: string): Promise<void> {
 
     report.isSpam = report.isSpam === 1 ? 0 : 1;
     report.reason = `Manual fix: ${report.isSpam === 1 ? 'marked as spam' : 'marked as not spam'}`;
+    report.checkType = 'manual';
 
     await saveReportToRedis(report);
     await saveCache(report, {
@@ -2046,15 +2058,8 @@ async function handleFixCommand(reportId: string): Promise<void> {
       checkType: 'manual'
     });
 
-    const client = await pool.connect();
-    try {
-      await client.query(
-        'UPDATE reports SET is_spam = $1, reason = $2 WHERE report_id = $3',
-        [report.isSpam, report.reason, report.reportId]
-      );
-    } finally {
-      client.release();
-    }
+    // Удаляем прямое обновление PostgreSQL
+    // Данные будут обновлены при следующем выполнении saveRedisToPostgres
 
     await notify(`Report ${reportId} has been fixed. New status: ${report.isSpam === 1 ? 'spam' : 'not spam'}`);
   } catch (error) {
