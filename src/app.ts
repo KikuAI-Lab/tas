@@ -69,6 +69,7 @@ let lastCommandSentTime = 0;
 let isProcessingScheduled = false;
 let isUndoInProgress = false;
 let idleUndoTimeout: NodeJS.Timeout | null = null;
+let isProcessingBuffer = false;
 
 // Initialize Express app
 const app = express();
@@ -485,10 +486,12 @@ async function handleAdd(event: NewMessageEvent) {
         clearTimeout(idleResumeTimeout);
         idleResumeTimeout = null;
       }
+      scheduleProcessing();
     } else if (messageContent.includes("Hello there! Send /next to start processing reports.") ||
                messageContent.includes("Send /next for a new spam report.")) {
       if (autoMode) {
         await sendToBot("/next 5");
+        scheduleProcessing();
       }
       consecutiveErrorCount = 0;
     } else if (messageContent.includes("Sorry, an error has occurred during your request. Please try again later.")) {
@@ -547,69 +550,97 @@ async function retryProcessing(reportId: string) {
   log(`Failed to process report ${reportId} after ${maxRetries} retries`, 'error');
 }
 
+async function startProcessing() {
+  log('Starting message processing', 'debug');
+  if (!isProcessingBuffer && messageBuffer.length > 0) {
+    try {
+      await processBuffer();
+    } catch (error) {
+      logErr('Error in startProcessing', error);
+    }
+  } else {
+    log(`Buffer processing skipped. isProcessingBuffer: ${isProcessingBuffer}, bufferLength: ${messageBuffer.length}`, 'debug');
+  }
+}
+
 async function processBuffer() {
+  if (isProcessingBuffer) {
+    log('Buffer is already being processed', 'debug');
+    return;
+  }
+
   log('Processing buffer', 'debug');
+  isProcessingBuffer = true;
   
   const currentTime = Date.now();
   const timeThreshold = 100; // 100 мс для группировки связанных сообщений
   const processingTimeout = 10000;
 
-  // Группируем сообщения только по близости по времени
-  const groupedMessages = messageBuffer.reduce((acc, item) => {
-    const group = acc.find(g => Math.abs(g[0].timestamp - item.timestamp) <= timeThreshold);
-    if (group) {
-      group.push(item);
-    } else {
-      acc.push([item]);
-    }
-    return acc;
-  }, [] as BufferItem[][]);
-
-  for (const group of groupedMessages) {
-    const checkMsgs = group.filter(item => item.type === 'check');
-    const sysMsg = group.find(item => item.type === 'sys');
-
-    if (sysMsg && sysMsg.reportId) {
-      try {
-        if (checkMsgs.length > 0) {
-          // Объединяем содержимое всех check сообщений
-          const combinedContent = checkMsgs.flatMap(msg => msg.content);
-          const combinedMediaHashes = checkMsgs.flatMap(msg => msg.mediaHashes || []);
-
-          // Удаляем дубликаты из контента и медиа-хешей
-          const uniqueContent = Array.from(new Set(combinedContent));
-          const uniqueMediaHashes = Array.from(new Set(combinedMediaHashes));
-
-          await Promise.race([
-            processReport({
-              reportId: sysMsg.reportId,
-              messageContent: uniqueContent,
-              mediaHashes: uniqueMediaHashes,
-              complaintCount: 0,
-              source: '',
-              sender: '',
-              isSpam: -1,
-              timestamp: checkMsgs[0].timestamp,
-              ...parseSysMessage(sysMsg.content[0])
-            }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
-          ]);
-          log(`Processed combined report ${sysMsg.reportId} from buffer`, 'debug');
-        }
-      } catch (error) {
-        if (error instanceof Error && error.message === 'Processing timeout') {
-          log(`Processing timeout for report ${sysMsg.reportId}`, 'warn');
-          await retryProcessing(sysMsg.reportId);
-        } else {
-          logErr(`Error processing report ${sysMsg.reportId} from buffer`, error);
-        }
+  try {
+    // Группируем сообщения только по близости по времени
+    const groupedMessages = messageBuffer.reduce((acc, item) => {
+      const group = acc.find(g => Math.abs(g[0].timestamp - item.timestamp) <= timeThreshold);
+      if (group) {
+        group.push(item);
+      } else {
+        acc.push([item]);
       }
-    } else if (checkMsgs.length > 0) {
-      log(`Orphaned check messages in buffer, timestamps: ${checkMsgs.map(msg => msg.timestamp).join(', ')}`, 'warn');
-    }
-  }
+      return acc;
+    }, [] as BufferItem[][]);
 
-  messageBuffer.length = 0;
+    for (const group of groupedMessages) {
+      const checkMsgs = group.filter(item => item.type === 'check');
+      const sysMsg = group.find(item => item.type === 'sys');
+
+      if (sysMsg && sysMsg.reportId) {
+        try {
+          if (checkMsgs.length > 0) {
+            // Объединяем содержимое всех check сообщений
+            const combinedContent = checkMsgs.flatMap(msg => msg.content);
+            const combinedMediaHashes = checkMsgs.flatMap(msg => msg.mediaHashes || []);
+
+            // Удаляем дубликаты из контента и медиа-хешей
+            const uniqueContent = Array.from(new Set(combinedContent));
+            const uniqueMediaHashes = Array.from(new Set(combinedMediaHashes));
+
+            await Promise.race([
+              processReport({
+                reportId: sysMsg.reportId,
+                messageContent: uniqueContent,
+                mediaHashes: uniqueMediaHashes,
+                complaintCount: 0,
+                source: '',
+                sender: '',
+                isSpam: -1,
+                timestamp: checkMsgs[0].timestamp,
+                ...parseSysMessage(sysMsg.content[0])
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
+            ]);
+            log(`Processed combined report ${sysMsg.reportId} from buffer`, 'debug');
+          } else {
+            log(`No check messages found for report ${sysMsg.reportId}`, 'warn');
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message === 'Processing timeout') {
+            log(`Processing timeout for report ${sysMsg.reportId}`, 'warn');
+            await retryProcessing(sysMsg.reportId);
+          } else {
+            logErr(`Error processing report ${sysMsg.reportId} from buffer`, error);
+          }
+        }
+      } else if (checkMsgs.length > 0) {
+        log(`Orphaned check messages in buffer, timestamps: ${checkMsgs.map(msg => msg.timestamp).join(', ')}`, 'warn');
+      }
+    }
+
+    messageBuffer.length = 0;
+    log('Buffer cleared after processing', 'debug');
+  } catch (error) {
+    logErr('Error in processBuffer', error);
+  } finally {
+    isProcessingBuffer = false;
+  }
 }
 
 async function processReport(report: Report): Promise<void> {
@@ -1061,9 +1092,14 @@ function preprocess(message: string, media?: Api.TypeMessageMedia): string {
 function scheduleProcessing() {
   if (!isProcessingScheduled) {
     isProcessingScheduled = true;
-    setImmediate(() => {
-      processBuffer();
-      isProcessingScheduled = false;
+    setImmediate(async () => {
+      try {
+        await startProcessing();
+      } catch (error) {
+        logErr('Error in scheduled processing', error);
+      } finally {
+        isProcessingScheduled = false;
+      }
     });
   }
 }
@@ -2816,6 +2852,8 @@ async function main() {
       try {
         await sendToBot("/next 1");
         log('Initial "/next 1" command sent successfully', 'debug');
+        // Заменим прямой вызов startProcessing() на scheduleProcessing()
+        scheduleProcessing();
       } catch (error) {
         logErr('Failed to send initial "/next 1" command', error);
         await notify('Failed to start auto mode. Please check the logs and restart if necessary.');
