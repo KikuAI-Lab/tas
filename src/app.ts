@@ -724,6 +724,17 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
     urlRegex.test(msg) || usernameRegex.test(msg)
   );
   
+  const hasMedia = report.mediaHashes.length > 0;
+  
+  // Новая проверка: если есть и медиа, и ссылка/юзернейм одновременно
+  if (hasMedia && hasLinksOrUsernames) {
+    return {
+      isSpam: 1,
+      reason: "Fast check: Media and link/username combination detected",
+      checkType: 'fast'
+    };
+  }
+  
   const excessiveEmoji = report.messageContent.some(msg => {
     const emojiCount = (msg.match(emojiRegex) || []).length;
     return emojiCount > 50;
@@ -765,10 +776,8 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
     suspiciousKeywords.some(keyword => msg.toLowerCase().includes(keyword))
   );
 
-  // Новая проверка на повторяющиеся сообщения
   const hasRepeatedMessages = new Set(report.messageContent).size < report.messageContent.length;
 
-  // Новая проверка на количество ссылок
   const linkCount = report.messageContent.reduce((count, msg) => {
     const matches = msg.match(urlRegex);
     return count + (matches ? matches.length : 0);
