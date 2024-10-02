@@ -283,6 +283,8 @@ async function sendToBot(message: string) {
     return;
   }
 
+  resetIdleUndoTimer(); // Добавлен сброс таймера при отправке команды боту
+
   if (!botEntity) throw new Error('Bot entity not initialized');
 
   const currentTime = Date.now();
@@ -499,7 +501,7 @@ async function handleAdd(event: NewMessageEvent) {
         }
       }, 180000);
       resetIdleUndoTimer();
-      setTimeout(() => sendToBot("/next"), 50);
+      setTimeout(() => sendToBot("/next"), 200);
     } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.")) {
       noReportsFoundCount = 0;
       lastReportProcessTime = Date.now();
@@ -1664,7 +1666,8 @@ async function undoRecentReports() {
         return;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Add a 200ms delay between undo attempts
+      await new Promise(resolve => setTimeout(resolve, 200));
     }
   } catch (error) {
     logErr('Error in undoRecentReports', error);
@@ -2915,15 +2918,12 @@ async function gracefulShutdown(restart: boolean = false) {
   log(`Graceful shutdown completed${restart ? ' (Restarting)' : ''}`, 'info');
   await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
 
+  // Instead of calling process.exit(), we'll let the process end naturally
   if (restart) {
-    const { spawn } = await import('child_process');
-    spawn(process.argv[0], process.argv.slice(1), {
-      detached: true,
-      stdio: ['ignore', 'ignore', 'ignore']
-    }).unref();
+    // Use the Heroku-friendly method to restart the application
+    log('Exiting for restart...', 'info');
+    process.kill(process.pid, 'SIGUSR2');
   }
-
-  process.exit(restart ? 1 : 0);
 }
 
 function clearExistingTimers() {
@@ -3039,6 +3039,13 @@ process.on('SIGINT', async () => {
   log('SIGINT signal received', 'info');
   await notify('SIGINT signal received. Application will shut down gracefully.');
   await gracefulShutdown();
+});
+
+// Handle SIGUSR2 signal for graceful restart
+process.on('SIGUSR2', async () => {
+  log('SIGUSR2 signal received', 'info');
+  await notify('SIGUSR2 signal received. Application will restart gracefully.');
+  await gracefulShutdown(true);
 });
 
 // Express routes
