@@ -850,7 +850,7 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
     'application/x-ms-installer', 'application/x-bat', 'application/x-vbs', 'application/x-powershell',
     'application/javascript', 'application/x-javascript', 'text/javascript', 'application/java-archive',
     'application/x-java-archive', 'application/vnd.android.package-archive', 'application/x-ms-shortcut',
-    'application/x-shockwave-flash', 'application/octet-stream'
+    'application/x-shockwave-flash'
   ];
 
   const dangerousExtensions = [
