@@ -283,6 +283,8 @@ async function sendToBot(message: string) {
     return;
   }
 
+  resetIdleUndoTimer(); // Добавлен сброс таймера при отправке команды боту
+
   if (!botEntity) throw new Error('Bot entity not initialized');
 
   const currentTime = Date.now();
@@ -499,7 +501,7 @@ async function handleAdd(event: NewMessageEvent) {
         }
       }, 180000);
       resetIdleUndoTimer();
-      setTimeout(() => sendToBot("/next"), 50);
+      setTimeout(() => sendToBot("/next"), 200);
     } else if (messageContent.includes("Please select 😡 BAN or 😌 NO.")) {
       noReportsFoundCount = 0;
       lastReportProcessTime = Date.now();
@@ -1627,6 +1629,8 @@ async function undoRecentReports() {
     return;
   }
 
+  resetIdleUndoTimer(); // Сброс таймера в начале функции
+
   isUndoInProgress = true;
   const MAX_UNDO_ATTEMPTS = 100;
   let undoCount = 0;
@@ -1634,8 +1638,9 @@ async function undoRecentReports() {
 
   try {
     for (const reportId of recentReportIds) {
-      if (isProcessingReports) {
-        log('Report processing resumed, cancelling undo process', 'info');
+      // Проверка наличия активности перед каждой попыткой отмены
+      if (isProcessingReports || messageBuffer.length > 0 || Date.now() - lastReportProcessTime < IDLE_UNDO_DELAY) {
+        log('System activity detected, cancelling undo process', 'info');
         return;
       }
 
@@ -1659,17 +1664,25 @@ async function undoRecentReports() {
 
       undoCount++;
       if (undoCount >= MAX_UNDO_ATTEMPTS) {
-        log(`Reached maximum undo attempts (${MAX_UNDO_ATTEMPTS}). Stopping bot for 30 minutes.`, 'warn');
+        log(`Reached maximum undo attempts (${MAX_UNDO_ATTEMPTS}). Stopping bot temporarily.`, 'warn');
         await stopBotTemporarily();
         return;
       }
 
+      // Добавляем небольшую задержку между попытками отмены
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   } catch (error) {
     logErr('Error in undoRecentReports', error);
   } finally {
     isUndoInProgress = false;
+    resetIdleUndoTimer(); // Сброс таймера в конце функции
+  }
+
+  // Если все попытки отмены завершились, отправляем команду для получения новых отчетов
+  if (autoMode) {
+    log('Undo process completed, requesting new reports', 'info');
+    await sendToBot("/next 2");
   }
 }
 
