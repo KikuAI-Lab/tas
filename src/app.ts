@@ -3,18 +3,17 @@ import { NewMessage, NewMessageEvent } from 'telegram/events/NewMessage.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { TelegramClient } from 'telegram/index.js';
 import { createObjectCsvWriter } from 'csv-writer';
-import { handleFineCommand } from './finetune.js';
 import { Api } from 'telegram/tl/index.js';
 import { LRUCache } from 'lru-cache';
 import schedule from 'node-schedule';
 import { createHash } from 'crypto';
-import path, { join } from 'path';
 import bigInt from "big-integer";
 import winston from 'winston';
 import express from 'express';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
+import path from 'path';
 import { tmpdir } from 'os';
 import pkg from 'pg';
 import os from 'os';
@@ -40,10 +39,12 @@ const SUSPEND_DURATION = 5 * 60 * 1000;
 const MAX_PROCESSING_TIME = 55000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const DB_SCHEMA_VERSION = '1.0';
+const MIN_COMMAND_DELAY = 2000;
 const MAX_CACHE_SIZE_MB = 100;
 const GPT_RETRY_DELAY = 10000;
-const IDLE_UNDO_DELAY = 45000; // 45 seconds
-const MIN_COMMAND_DELAY = 50; // Минимальная задержка между командами в миллисекундах
+const IDLE_UNDO_DELAY = 45000;
+const BUFFER_TTL = 60 * 1000; // 1 minute in milliseconds
+const LRU_TTL = 60 * 1000; // 1 minute in milliseconds
 
 // Global variables
 let autoMode = true;
@@ -52,30 +53,32 @@ let COMMAND_DELAY = 50;
 let apiRequestsCount = 0;
 let client: TelegramClient;
 let isShuttingDown = false;
+let lastCommandSentTime = 0;
 let lastDecisionSentTime = 0;
-let redisBatch: Report[] = [];
+let isUndoInProgress = false;
 let consecutiveErrorCount = 0;
+let redisBatch: Report[] = [];
+let isProcessingBuffer = false;
 let isProcessingReports = false;
+let isProcessingScheduled = false;
 let noReportsFoundCount: number = 0;
+let lastReportProcessTime = Date.now();
 let suspendedUntil: number | null = null;
 let idleTimeout: NodeJS.Timeout | null = null;
 let botEntity: Api.InputPeerUser | null = null;
-let processingReports: Map<string, number> = new Map();
-let lastReportProcessTime = Date.now();
+let idleUndoTimeout: NodeJS.Timeout | null = null;
 let redisBatchTimeout: NodeJS.Timeout | null = null;
 let idleResumeTimeout: NodeJS.Timeout | null = null;
+let processingReports: Map<string, number> = new Map();
 let undoRange: { start: string; end: string } | null = null;
-let lastCommandSentTime = 0;
-let isProcessingScheduled = false;
-let isUndoInProgress = false;
-let idleUndoTimeout: NodeJS.Timeout | null = null;
-let isProcessingBuffer = false;
+let messageBuffer: BufferItemWithTTL[] = [];
+let sequenceCounter = 0;
 
 // Initialize Express app
 const app = express();
 
 // Initialize Redis
-const redis = new Redis.Redis(REDIS_URL);
+const redis = new Redis(REDIS_URL);
 
 // Initialize PostgreSQL
 const { Pool } = pkg;
@@ -112,23 +115,29 @@ const logger = winston.createLogger({
 });
 
 // Initialize LRU Cache
-interface CachedDecision {
+type CachedDecision = {
   isSpam: number;
   reason: string;
   checkType: 'default' | 'fast' | 'gpt' | 'gpt4' | 'manual';
   reportId: string;
   timestamp: number;
+};
+
+type CacheItem = CachedDecision | { type: 'buffer', data: Buffer } | { type: 'string', data: string };
+
+interface BufferItemWithTTL extends BufferItem {
+  expiresAt: number;
+  sequenceNumber: number;
+  timestamp: number; // Ensure this is present
 }
 
-const lruCache = new LRUCache<string, CachedDecision>({
+const lruCache = new LRUCache<string, CacheItem>({
   max: 10000,
-  ttl: 24 * 60 * 60 * 1000, // 24 hours
+  ttl: LRU_TTL,
   maxSize: MAX_CACHE_SIZE_MB * 1024 * 1024,
-  sizeCalculation: (value, key) => JSON.stringify(value).length + key.length,
+  sizeCalculation: (value, key) => 
+    (typeof value === 'object' ? JSON.stringify(value).length : 0) + key.length,
 });
-
-// Optimized structure for message buffer
-const messageBuffer: BufferItem[] = [];
 
 // Interfaces and types
 interface BufferItem {
@@ -138,13 +147,16 @@ interface BufferItem {
   timestamp: number;
   mediaHashes?: string[];
   mediaKey?: string | null;
-  hasReplyToChannel?: boolean; // Новое поле
+  hasReplyToChannel?: boolean;
+  mediaLoaded?: boolean;
+  mediaType?: string;
 }
 
 interface Report {
   reportId: string;
   messageContent: string[];
   mediaHashes: string[];
+  mediaTypes?: string[];
   complaintCount: number;
   source: string;
   sender: string;
@@ -154,7 +166,7 @@ interface Report {
   decisionSent?: boolean;
   isOpen?: boolean;
   checkType?: 'default' | 'fast' | 'gpt' | 'gpt4' | 'manual';
-  hasReplyToChannel?: boolean; // Добавляем новое свойство
+  hasReplyToChannel?: boolean;
 }
 
 type SpamDecision = {
@@ -243,15 +255,27 @@ async function initClient(): Promise<TelegramClient> {
     throw new Error('API_ID, API_HASH, and SESSION_STRING must be set in .env file');
   }
 
-  const stringSession = new StringSession(SESSION_STRING);
-  const client = new TelegramClient(stringSession, API_ID, API_HASH, {
-    connectionRetries: 5,
-    retryDelay: 1000,
-    useWSS: true,
-  });
-
   try {
+    // Создаем сессию с существующей строкой
+    const stringSession = new StringSession(SESSION_STRING);
+    
+    const client = new TelegramClient(stringSession, API_ID, API_HASH, {
+      connectionRetries: 5,
+      retryDelay: 1000,
+      useWSS: true,
+      deviceModel: "Desktop",
+      systemVersion: "Windows 10",
+      appVersion: "1.0.0",
+      langCode: "en"
+    });
+
     await client.connect();
+    
+    // Проверяем авторизацию
+    if (!await client.isUserAuthorized()) {
+      throw new Error('User is not authorized. Please run generate-session script again.');
+    }
+
     log('Client connected successfully', 'info');
     return client;
   } catch (error) {
@@ -283,14 +307,13 @@ async function sendToBot(message: string) {
     return;
   }
 
-  resetIdleUndoTimer(); // Добавлен сброс таймера при отправке команды боту
+  resetIdleUndoTimer();
 
   if (!botEntity) throw new Error('Bot entity not initialized');
 
   const currentTime = Date.now();
   const timeSinceLastCommand = currentTime - lastCommandSentTime;
 
-  // Адаптивная задержка
   let adaptiveDelay = Math.max(MIN_COMMAND_DELAY - timeSinceLastCommand, 0);
 
   if (timeSinceLastCommand < 30) {
@@ -311,7 +334,7 @@ async function sendToBot(message: string) {
           resolve();
         }, adaptiveDelay);
       });
-    }, 3, 5000); // 3 попытки, 5 секунд между попытками
+    }, 3, 5000);
     const endTime = Date.now();
     const actualDelay = endTime - startTime;
 
@@ -363,6 +386,96 @@ function getMessageHash(messageContent: string[], sender: string): string {
   return createHash('md5').update(content).digest('hex');
 }
 
+async function getHashAndType(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null): Promise<{ hash: string; type: string }> {
+  if (!media) return { hash: 'empty', type: 'empty' };
+  
+  if (media instanceof Api.MessageMediaEmpty) {
+    log('Media type: MessageMediaEmpty', 'debug');
+    return { hash: 'empty', type: 'empty' };
+  }
+  
+  if (media instanceof Api.MessageMediaPhoto) {
+    log('Media type: MessageMediaPhoto', 'debug');
+    return { hash: `photo:${media.photo?.id || 'unknown'}`, type: 'photo' };
+  }
+  
+  if (media instanceof Api.MessageMediaDocument) {
+    const document = media.document;
+    if (document instanceof Api.Document) {
+      const fileType = document.mimeType.split('/')[0];
+      const attribute = document.attributes.find(attr => 
+        attr instanceof Api.DocumentAttributeSticker ||
+        attr instanceof Api.DocumentAttributeAnimated ||
+        attr instanceof Api.DocumentAttributeVideo
+      );
+      
+      if (attribute instanceof Api.DocumentAttributeSticker) {
+        log('Media type: Sticker', 'debug');
+        return { hash: `sticker:${document.id}`, type: 'sticker' };
+      }
+      if (attribute instanceof Api.DocumentAttributeAnimated || document.mimeType === 'image/gif') {
+        log('Media type: GIF', 'debug');
+        return { hash: `gif:${document.id}`, type: 'gif' };
+      }
+      if (attribute instanceof Api.DocumentAttributeVideo) {
+        log(`Media type: ${attribute.roundMessage ? 'Video Note' : 'Video'}`, 'debug');
+        return { hash: attribute.roundMessage ? `videonote:${document.id}` : `video:${document.id}`, type: attribute.roundMessage ? 'videonote' : 'video' };
+      }
+      
+      log(`Media type: ${fileType}`, 'debug');
+      return { hash: `${fileType}:${document.id}`, type: fileType };
+    }
+  }
+  
+  if (media instanceof Api.MessageMediaWebPage) {
+    log('Media type: MessageMediaWebPage', 'debug');
+    if (media.webpage instanceof Api.WebPage) {
+      return { hash: `webpage:${media.webpage.url}`, type: 'webpage' };
+    } else if (media.webpage instanceof Api.WebPageEmpty) {
+      return { hash: `webpage:empty`, type: 'webpage_empty' };
+    } else if (media.webpage instanceof Api.WebPageNotModified) {
+      return { hash: `webpage:not_modified`, type: 'webpage_not_modified' };
+    }
+    return { hash: `webpage:unknown`, type: 'webpage_unknown' };
+  }
+  
+  if (media instanceof Api.MessageMediaStory) {
+    log('Media type: MessageMediaStory', 'debug');
+    return { hash: `story:${media.id}`, type: 'story' };
+  }
+  
+  if (media instanceof Api.ReplyInlineMarkup) {
+    log('Media type: ReplyInlineMarkup', 'debug');
+    return processInlineMarkup(media);
+  }
+  
+  log(`Unknown media type: ${media.className}`, 'debug');
+  return { hash: `unknown:${media.className}`, type: 'unknown' };
+}
+
+// Function to add an item to the buffer with TTL
+function addToBuffer(item: BufferItem) {
+  const itemWithTTL: BufferItemWithTTL = {
+    ...item,
+    expiresAt: Date.now() + BUFFER_TTL,
+    sequenceNumber: sequenceCounter++,
+    timestamp: Date.now() // Ensure this is set
+  };
+  messageBuffer.push(itemWithTTL);
+  log(`Added item to buffer with expiration at ${new Date(itemWithTTL.expiresAt).toISOString()} and sequence number ${itemWithTTL.sequenceNumber}`, 'debug');
+}
+
+// Function to clean expired buffer items
+function cleanExpiredBufferItems() {
+  const now = Date.now();
+  const initialLength = messageBuffer.length;
+  messageBuffer = messageBuffer.filter(item => item.expiresAt > now);
+  const removedCount = initialLength - messageBuffer.length;
+  if (removedCount > 0) {
+    log(`Removed ${removedCount} expired items from buffer`, 'debug');
+  }
+}
+
 // Message handling functions
 async function handleCheck(event: NewMessageEvent) {
   const message = event.message;
@@ -374,19 +487,14 @@ async function handleCheck(event: NewMessageEvent) {
     let mediaKey: string | null = null;
     let inlineTitle: string | null = null;
     let hasReplyToChannel = false;
+    let mediaType: string | undefined;
 
     if (message.media) {
-      const hash = await getHash(message.media);
+      const { hash, type } = await getHashAndType(message.media);
       mediaHashes.push(hash);
-      log(`Media hash: ${hash}`, 'info');
-
-      if (message.media instanceof Api.MessageMediaPhoto || 
-          (message.media instanceof Api.MessageMediaDocument && 
-           message.media.document instanceof Api.Document)) {
-        mediaKey = `media:${message.media instanceof Api.MessageMediaPhoto ? message.media.photo?.id : message.media.document?.id}`;
-        log(`Media key generated: ${mediaKey}`, 'debug');
-      }
-
+      mediaType = type;
+      log(`Media hash: ${hash}, type: ${type}`, 'info');
+      
       if (message.media instanceof Api.MessageMediaWebPage && message.media.webpage instanceof Api.WebPage) {
         inlineTitle = message.media.webpage.title || null;
         if (inlineTitle) {
@@ -401,14 +509,13 @@ async function handleCheck(event: NewMessageEvent) {
     }
 
     if (message.replyMarkup) {
-      const markupHash = await getHash(message.replyMarkup);
-      mediaHashes.push(markupHash);
-      log(`Reply markup hash: ${markupHash}`, 'debug');
+      const { hash } = await getHashAndType(message.replyMarkup);
+      mediaHashes.push(hash);
+      log(`Reply markup hash: ${hash}`, 'debug');
     }
 
     const processedContent = preprocess(messageContent, message.media);
 
-    // Добавляем inline title к содержимому сообщения
     if (inlineTitle) {
       messageContent = `Inline Title: ${inlineTitle}\n\n${processedContent}`;
     } else {
@@ -421,10 +528,11 @@ async function handleCheck(event: NewMessageEvent) {
       timestamp: Date.now(),
       mediaHashes,
       mediaKey: mediaKey || undefined,
-      hasReplyToChannel
+      hasReplyToChannel,
+      mediaType
     };
 
-    messageBuffer.push(bufferItem);
+    addToBuffer(bufferItem);
     log(`Check message added to buffer. Content: ${messageContent}`, 'debug');
     scheduleProcessing();
   }
@@ -451,7 +559,7 @@ async function handleSys(event: NewMessageEvent) {
           timestamp: Date.now()
         };
 
-        messageBuffer.push(bufferItem);
+        addToBuffer(bufferItem);
         log(`System message added to buffer. ReportId: ${sysInfo.reportId}`, 'debug');
         scheduleProcessing();
       } else {
@@ -547,8 +655,8 @@ async function handleAdd(event: NewMessageEvent) {
         const reportId = reportIdMatch[1];
         if (undoRange && isReportInUndoRange(reportId)) {
           processingReports.delete(reportId);
-          const cachedDecision = lruCache.get(getMessageHash([messageContent], reportId));
-          if (cachedDecision) {
+          const cachedDecision = getLruCache(getMessageHash([messageContent], reportId)) as CachedDecision | undefined;
+          if (cachedDecision && 'isSpam' in cachedDecision) {
             const expectedDecision = messageContent.includes("marked as spam 😡") ? 1 : 0;
             if (cachedDecision.isSpam !== expectedDecision) {
               const mismatchMessage = `Mismatch in decision for report ${reportId}. Expected: ${expectedDecision}, Actual: ${cachedDecision.isSpam}`;
@@ -561,6 +669,12 @@ async function handleAdd(event: NewMessageEvent) {
       consecutiveErrorCount = 0;
     }
   }
+}
+
+function setupPeriodicCleanup() {
+  setInterval(() => {
+    cleanExpiredBufferItems();
+  }, BUFFER_TTL / 2); // Run cleanup every 30 seconds
 }
 
 async function retryProcessing(reportId: string) {
@@ -603,70 +717,73 @@ async function processBuffer() {
 
   log('Processing buffer', 'debug');
   isProcessingBuffer = true;
-  
-  const currentTime = Date.now();
-  const timeThreshold = 100; // 100 мс для группировки связанных сообщений
-  const processingTimeout = 10000;
 
   try {
-    const groupedMessages = messageBuffer.reduce((acc, item) => {
-      const group = acc.find(g => Math.abs(g[0].timestamp - item.timestamp) <= timeThreshold);
-      if (group) {
-        group.push(item);
-      } else {
-        acc.push([item]);
+    cleanExpiredBufferItems();
+
+    // Sort buffer by timestamps
+    messageBuffer.sort((a, b) => {
+      if (typeof a.timestamp !== 'number' || typeof b.timestamp !== 'number') {
+        log(`Invalid timestamp found: a=${a.timestamp}, b=${b.timestamp}`, 'warn');
+        return 0;
       }
-      return acc;
-    }, [] as BufferItem[][]);
+      return a.timestamp - b.timestamp;
+    });
 
-    for (const group of groupedMessages) {
-      const checkMsgs = group.filter(item => item.type === 'check');
-      const sysMsg = group.find(item => item.type === 'sys');
+    const timeThreshold = 100; // milliseconds
+    const processingTimeout = 30000; // 30 seconds
 
-      if (sysMsg && sysMsg.reportId) {
-        try {
-          if (checkMsgs.length > 0) {
-            const combinedContent = checkMsgs.flatMap(msg => msg.content);
-            const combinedMediaHashes = checkMsgs.flatMap(msg => msg.mediaHashes || []);
-            const hasReplyToChannel = checkMsgs.some(msg => msg.hasReplyToChannel);
+    let checkMsgs: BufferItemWithTTL[] = [];
+    let sysMsg: BufferItemWithTTL | null = null;
 
-            const uniqueContent = Array.from(new Set(combinedContent));
-            const uniqueMediaHashes = Array.from(new Set(combinedMediaHashes));
+    for (let i = 0; i < messageBuffer.length; i++) {
+      const item = messageBuffer[i];
+      
+      if (!item || typeof item.timestamp !== 'number') {
+        log(`Invalid buffer item at index ${i}: ${JSON.stringify(item)}`, 'warn');
+        continue;
+      }
 
-            await Promise.race([
-              processReport({
-                reportId: sysMsg.reportId,
-                messageContent: uniqueContent,
-                mediaHashes: uniqueMediaHashes,
-                complaintCount: 0,
-                source: '',
-                sender: '',
-                isSpam: -1,
-                timestamp: checkMsgs[0].timestamp,
-                hasReplyToChannel, // Добавляем новое поле
-                ...parseSysMessage(sysMsg.content[0])
-              }),
-              new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
-            ]);
-            log(`Processed combined report ${sysMsg.reportId} from buffer`, 'debug');
-          } else {
-            log(`No check messages found for report ${sysMsg.reportId}`, 'warn');
-          }
-        } catch (error) {
-          if (error instanceof Error && error.message === 'Processing timeout') {
-            log(`Processing timeout for report ${sysMsg.reportId}`, 'warn');
-            await retryProcessing(sysMsg.reportId);
-          } else {
-            logErr(`Error processing report ${sysMsg.reportId} from buffer`, error);
-          }
+      if (item.type === 'check') {
+        checkMsgs.push(item);
+      } else if (item.type === 'sys') {
+        if (sysMsg) {
+          // If we already have a sysMsg, process the current group
+          await processGroup(checkMsgs, sysMsg, processingTimeout);
+          checkMsgs = [];
         }
-      } else if (checkMsgs.length > 0) {
-        log(`Orphaned check messages in buffer, timestamps: ${checkMsgs.map(msg => msg.timestamp).join(', ')}`, 'warn');
+        sysMsg = item;
+      }
+
+      // If more than timeThreshold has passed since the last message, process the group
+      if (sysMsg && checkMsgs.length > 0 && i < messageBuffer.length - 1) {
+        const nextItem = messageBuffer[i + 1];
+        if (nextItem && typeof nextItem.timestamp === 'number' && nextItem.timestamp - item.timestamp > timeThreshold) {
+          await processGroup(checkMsgs, sysMsg, processingTimeout);
+          checkMsgs = [];
+          sysMsg = null;
+        }
       }
     }
 
-    messageBuffer.length = 0;
-    log('Buffer cleared after processing', 'debug');
+    // Process any remaining messages
+    if (sysMsg && checkMsgs.length > 0) {
+      await processGroup(checkMsgs, sysMsg, processingTimeout);
+    }
+
+    // Clear processed messages from the buffer
+    const lastProcessedTimestamp = messageBuffer[messageBuffer.length - 1]?.timestamp;
+    if (lastProcessedTimestamp) {
+      messageBuffer = messageBuffer.filter(item => {
+        if (typeof item.timestamp !== 'number') {
+          log(`Invalid timestamp found during buffer cleanup: ${JSON.stringify(item)}`, 'warn');
+          return false;
+        }
+        return item.timestamp > lastProcessedTimestamp;
+      });
+    }
+
+    log(`Buffer processing completed. Remaining items: ${messageBuffer.length}`, 'debug');
   } catch (error) {
     logErr('Error in processBuffer', error);
   } finally {
@@ -674,12 +791,65 @@ async function processBuffer() {
   }
 }
 
+async function processGroup(checkMsgs: BufferItemWithTTL[], sysMsg: BufferItemWithTTL, processingTimeout: number) {
+  if (sysMsg.reportId) {
+    try {
+      if (checkMsgs.length > 0) {
+        const combinedContent = checkMsgs.flatMap(msg => msg.content);
+        const combinedMediaHashes = checkMsgs.flatMap(msg => msg.mediaHashes || []);
+        const hasReplyToChannel = checkMsgs.some(msg => msg.hasReplyToChannel);
+        const mediaTypes = checkMsgs.map(msg => msg.mediaType).filter(Boolean);
+
+        const uniqueContent = Array.from(new Set(combinedContent));
+        const uniqueMediaHashes = Array.from(new Set(combinedMediaHashes));
+
+        log(`Processing report ${sysMsg.reportId}. Media hashes: ${uniqueMediaHashes.join(', ')}`, 'debug');
+
+        await Promise.race([
+          processReport({
+            reportId: sysMsg.reportId,
+            messageContent: uniqueContent,
+            mediaHashes: uniqueMediaHashes,
+            complaintCount: 0,
+            source: '',
+            sender: '',
+            isSpam: -1,
+            timestamp: checkMsgs[0].timestamp,
+            hasReplyToChannel,
+            mediaTypes: mediaTypes.length > 0 ? mediaTypes.filter((type): type is string => type !== undefined) : undefined,
+            ...parseSysMessage(sysMsg.content[0])
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Processing timeout')), processingTimeout))
+        ]);
+        log(`Processed combined report ${sysMsg.reportId} from buffer`, 'debug');
+      } else {
+        log(`No check messages found for report ${sysMsg.reportId}`, 'warn');
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Processing timeout') {
+        log(`Processing timeout for report ${sysMsg.reportId}`, 'warn');
+        await retryProcessing(sysMsg.reportId);
+      } else {
+        logErr(`Error processing report ${sysMsg.reportId} from buffer`, error);
+      }
+    }
+  } else if (checkMsgs.length > 0) {
+    log(`Orphaned check messages in buffer, timestamps: ${checkMsgs.map(msg => msg.timestamp).join(', ')}`, 'warn');
+  }
+}
+
 async function processReport(report: Report): Promise<void> {
   log(`Processing report ${report.reportId}`, 'debug');
+  
+  // Anonymize sender before any processing
+  if (report.sender) {
+    report.sender = createHash('sha256').update(report.sender).digest('hex');
+  }
+
   resetIdleUndoTimer();
   isProcessingReports = true;
   log(`Started processing report ${report.reportId}`, 'debug');
-  
+
   if (processingReports.has(report.reportId)) {
     const processingStartTime = processingReports.get(report.reportId);
     if (processingStartTime && Date.now() - processingStartTime < MAX_PROCESSING_TIME) {
@@ -690,7 +860,7 @@ async function processReport(report: Report): Promise<void> {
   }
 
   processingReports.set(report.reportId, Date.now());
-  
+
   const processingStartTime = Date.now();
 
   try {
@@ -715,8 +885,11 @@ async function processReport(report: Report): Promise<void> {
       }
     }
 
-    decision = await fastCheck(report) || await gptCheck(report);
+    // Preparation of content for GPT check
+    const contentForGpt = report.messageContent.join('\n');
 
+    // Check with GPT
+    decision = await fastCheck(report) || await gptCheck(report, contentForGpt);
     if (!decision) {
       log(`All checks returned null for report ${report.reportId}. Marking as spam.`, 'warn');
       decision = { isSpam: 1, reason: "All checks inconclusive, defaulting to spam", checkType: 'default' };
@@ -725,7 +898,6 @@ async function processReport(report: Report): Promise<void> {
     await applyDecision(report, decision);
     await saveCache(report, decision);
 
-    // Сохраняем в Redis только если решение не из кэша
     if (decision.checkType !== 'default') {
       await saveReportToRedis(report);
     }
@@ -768,11 +940,11 @@ function getFileInfoFromHash(hash: string): { mimeType: string; fileName: string
       fileName = `${fileId}.webp`;
       break;
     case 'document':
-      // Для документов мы не можем точно определить MIME-тип и расширение,
-      // поэтому оставляем значения по умолчанию
+      // For documents, we don't have enough information to determine the exact mime type
+      // So we keep the default 'application/octet-stream'
       break;
     default:
-      // Для неизвестных типов оставляем значения по умолчанию
+      // For unknown types, we keep the defaults
       break;
   }
 
@@ -792,16 +964,14 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   
   const hasMedia = report.mediaHashes.length > 0;
   
-  // Проверка на наличие replyTo на канал
   if (report.hasReplyToChannel) {
     return {
       isSpam: 1,
-      reason: "Fast check: Message is a reply to a channel",
+      reason: "Fast check result",
       checkType: 'fast'
     };
   }
   
-  // Проверка на наличие фото или видео с 2 и более жалобами
   const hasPhotoOrVideoWithComplaints = report.mediaHashes.some(hash => {
     const mediaType = hash.split(':')[0];
     return (mediaType === 'photo' || mediaType === 'video' || mediaType === 'gif' || mediaType === 'image') && report.complaintCount >= 2;
@@ -810,12 +980,11 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   if (hasPhotoOrVideoWithComplaints) {
     return {
       isSpam: 1,
-      reason: "Fast check: Photo/video with 2 or more complaints",
+      reason: "Fast check result",
       checkType: 'fast'
     };
   }
   
-  // Проверка на другие типы медиа с 3 и более жалобами
   const hasOtherMediaWithComplaints = report.mediaHashes.some(hash => {
     const mediaType = hash.split(':')[0];
     return (mediaType !== 'photo' && mediaType !== 'video' && mediaType !== 'gif' && mediaType !== 'image') && report.complaintCount >= 3;
@@ -824,16 +993,15 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   if (hasOtherMediaWithComplaints) {
     return {
       isSpam: 1,
-      reason: "Fast check: Other media with 3 or more complaints",
+      reason: "Fast check result",
       checkType: 'fast'
     };
   }
   
-  // Проверка на наличие ссылок или юзернеймов с 3 и более жалобами
   if (hasLinksOrUsernames && report.complaintCount >= 3) {
     return {
       isSpam: 1,
-      reason: "Fast check: Links/usernames with 3 or more complaints",
+      reason: "Fast check result",
       checkType: 'fast'
     };
   }
@@ -921,21 +1089,15 @@ async function fastCheck(report: Report): Promise<SpamDecision | null> {
   return null;
 }
 
-async function gptCheck(report: Report): Promise<SpamDecision | null> {
+async function gptCheck(report: Report, contentForGpt: string): Promise<SpamDecision | null> {
   log(`Starting GPT check for report ${report.reportId}`, 'debug');
 
-  const gptPrompt = `You are an advanced AI specialized in detecting commercial spam in Telegram groups across any language. Your task is to analyze the provided message along with its metadata and context to determine whether it is spam. Respond ONLY with:
-  1 for spam
-  0 for not spam
-  
-  **Input Structure:**
-  - **Message:** The content of the message to analyze.
-  - **Source:** The name of the group where the message was sent.
-  - **Sender:** The name or nickname of the sender. Emoji flags indicate the sender's country.
-  - **Complaints:** The number of complaints the message has received.
-  
-  **Special Note on "Inline Title":**
-  If you see a line starting with "Inline Title:" in the message content, it indicates the title of an embedded webpage or media (like a YouTube video) shared in the message. This title is often clickbait or misleading in spam messages. Pay extra attention to these titles, especially if they promise easy money, quick earnings, or seem overly sensational.
+  // Ensure sender is anonymized in GPT prompt
+  const anonymizedSender = report.sender ? 
+    createHash('sha256').update(report.sender).digest('hex').substring(0, 8) : 
+    'unknown';
+
+  const gptPrompt = `You are an advanced AI specialized in detecting commercial spam across any language. Your task is to analyze the provided message and media analysis to determine whether it is spam. Respond with 1 for spam, 0 for not spam.
 
   **Spam Classification Criteria:**
   
@@ -944,6 +1106,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - ANY sale, promotion, vacancies, employment postings, part-time work, household tasks, job offer, or service provision, regardless of context or type.
        - ANY requests for services, including pet-sitting, house-sitting, or other personal assistance, especially if mentioning payment.
        - ANY requests for help with tasks like loading/unloading, delivery, or any other work promising payment.
+       - ANY requests to top up a phone balance, credit balance or for donations for medical treatment.
        - Unsolicited marketing or promotional content for any product or service.
        - Investment opportunities, especially those promising high returns.
        - Phishing attempts, fake giveaways, or unrealistic financial promises.
@@ -957,8 +1120,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Asks to write in private messages for product inquiries or purchases.
        - Offers to borrow money or financial assistance.
        - Invitations to join some activities.
-       - ANY requests to top up a phone balance.
-       - ANY requests for donations for medical treatment.
+       - Drugs ad, ecpecially encrypted (e.g. "в касание", "кто поделится мяу?", etc.)
      - **Job Offers and Temporary Work:**
        - Any messages offering temporary work, part-time jobs, or quick earning opportunities, regardless of the group's theme.
        - Requests for help with tasks like loading/unloading, delivery, pet-sitting, house-sitting, or any other work promising payment.
@@ -986,7 +1148,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Encrypted or coded messages resembling adult content sales. (e.g. "Ready vcs", "CP", "TN", "GV", "TF", "SL", "ID", "SVC", etc. - in any register)
      - **Excessive Links and URLs:**
        - Presence of multiple links (more than 1) in a single message.
-       - Use of URL shorteners or suspicious domains.
+       - Use of URL shorteners or suspicious domains. (e.g., "bit.ly", "goo.gl", "clck.ru", "ow.ly", etc.)
        - Referral links containing parameters like "ref_" or "startapp=".
      - **Obfuscated Text and Symbols:**
        - Use of numbers or symbols to replace letters (e.g., "h3ll0" instead of "hello", or "kaнᴀⲗ" instead of "канал", etc.).
@@ -1043,29 +1205,8 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
      - **Unsolicited Book or Course Recommendations:**
        - Messages promoting or recommending specific books, courses, or educational materials, especially if they're related to making money, improving financial situations, or trading.
        - Offers to share or provide access to books or courses, particularly if they claim to have had a significant impact on the sender's financial success or skills.
-    
-  2. **Context-Based Indicators:**
-     - **Sender Analysis:**
-       - Sender names or nicknames containing spam-specific patterns or keywords related to sales or marketing.
-       - For very short messages, pay extra attention to the sender's name for commercial indicators.
-     - **Complaint Counts:**
-       - Messages with an extremely high number of complaints (e.g., >50) should be closely evaluated, but not automatically classified as spam.
-       - Messages with more than 2 complaints and containing phone numbers are likely spam.
-       - Consider the overall context and content of the message, regardless of complaint count.
-     - **Message Length:**
-       - Very short messages (less than 5 words) without spam indicators are typically not spam.
-       - Combine excessive emojis with commercial offers are more likely to be spam.
-     - **Relevance to Group:**
-       - Are out of context with the group's theme or ongoing discussions, especially if they introduce commercial content.
-       - Abruptly change the topic to product offers or job postings.
-     - **Source Group Analysis:**
-       - Consider the nature of the group where the message was posted. Groups with names suggesting spam, hacking, or illicit activities should increase suspicion of commercial spam.
-     - **Multiple Indicators:**
-       - Combine commercial offers, promises of quick gains, and calls for urgent action are highly likely to be spam.
-     - **Inline Titles:**
-       - Pay special attention to inline titles, especially if they align with common spam tactics like promising easy money, quick earnings, or seem overly sensational.
   
-  3. **Not Spam Indicators:**
+  2. **Not Spam Indicators:**
      - **Normal Communication:**
        - Casual conversations, jokes, memes, and personal interactions without commercial intent.
        - Short expressions of gratitude (e.g., "Thanks!", "Great job", etc.).
@@ -1078,8 +1219,8 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
        - Local slang, cultural references, or region-specific discussions without commercial elements.
        - Political discussions or criticisms, even if controversial or using strong language.
      - **Functional Messages:**
-       - Bot commands (starting with "/", e.g., "/start", "/help" or "/start@AdmiinLyLy_bot", etc.) - if they have less than 3 complaints.
-       - Warnings about scams or spam.
+       - Bot commands (starting with "/", e.g., "/start", "/help" or "/start@AdmiinLyLy_bot", etc.)
+       - Warnings about scams or spam. Even if its many repeating messages.
        - Satirical, ironic, or controversial opinions without commercial intent.
      - **Greetings and Updates:**
        - Simple greetings or short phrases in any language (e.g., "Hello", "Привет", "Yoo", "ЫЭЫЭЫХЫХЫ", etc.).
@@ -1088,6 +1229,7 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
      - **Cryptocurrency and Financial Discussions:**
        - Legitimate discussions about cryptocurrency prices, market trends, or trading strategies without promotional content.
        - Sharing of cryptocurrency wallet addresses without spam indicators. (e.g., "0x123456789...", "UQA-aBE6_uNKRUCXdsh...", etc.)
+       - Questions about listings or investments without promotional content.
      - **Numerical Formats:**
        - Standard numerical formats like "$500,000.00" are not inherently spam unless accompanied by suspicious claims or offers.
      - **Explicit or Offensive Content:**
@@ -1096,34 +1238,30 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
   
   **Instructions:**
   - Analyze based on above indicators
-  - Consider sender's name for spam patterns (ignore @usernames)
   - Ensure multi-language support
-  - For very short messages, consider full context (sender's name)
-  - Messages offering temporary work or quick earning opportunities should always be classified as spam, regardless of the group's theme.
+  - Messages offering temporary work or quick earning opportunities should always be classified as spam.
   - Cryptocurrency wallet addresses alone are not spam, but be cautious if they're accompanied by promotional content.
   - Bot commands and slash (/) messages are generally not spam unless they contain explicit promotional content.
   - Messages with repetitive symbol patterns like "🔤🔤🔤🔤🔤" should be considered spam.
   - Short, vague messages that could be interpreted as invitations for commercial or adult services should be carefully evaluated in context.
-  - Mark hi/hello messages as NOT spam virtually always, regardless of the complaint count. However, if you encounter a short message with emojis like 💋❤️ and similar, and it's obvious that the sender is there to offer sexual services (judging from the sender name) in a non-adult chat (based on the source name), then mark it as SPAM.
-  - If the message indicates that there are more than 1 channel link (e.g., "Channel links: >1"), it's likely spam.
+  - If the message indicates that there are more than 1 channel link, it's likely spam.
   - Pay close attention to "Inline Title" information, as it often reveals the true nature of shared links or media, especially in cases of clickbait or misleading content.
   
   **REMINDER:** 
-  - Do not consider the 'Source' field as definitive; it is only for contextual information.
-  - Ignore the sender's nickname unless it contains spam-specific patterns.
-  - High complaint counts alone do not automatically indicate spam. Always consider the full context and content of the message.
-  - Short, casual greetings are typically not spam, but consider the full context, especially if the source or sender name suggests spam-related activities.
   - Messages promoting social media services or any kind of product, especially with promises of quick gains and urgent calls to action, are very likely to be spam.
   - Legitimate discussions about cryptocurrencies or sharing of wallet addresses without promotional content are not spam.
   - Any offers of part-time work, temporary jobs, or requests for paid help should be classified as spam.
-  - Be cautious with short, ambiguous messages that could be interpreted as solicitations, especially in groups with adult or dating themes.
+  - Be cautious with short, ambiguous messages that could be interpreted as solicitations.
   - "Inline Title" information can be crucial in identifying spam, especially for shared links or media with misleading titles.
   
-  **Respond ONLY with number 1 (for spam) or 0 (for not spam), without any explanations.**
-  **Your analysis:**
+  **Respond ONLY with the format: [decision]**
+  Where [decision] is 1 for spam, 0 for not spam.
   `;
 
-  const userPrompt = generateUserPrompt(report);
+  const userPrompt = `Content for analysis:
+  """
+  ${contentForGpt}
+  """`;
 
   const messages: Array<ChatCompletionMessageParam> = [
     { role: "system", content: gptPrompt },
@@ -1135,24 +1273,31 @@ async function gptCheck(report: Report): Promise<SpamDecision | null> {
       return openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: messages,
-        max_tokens: 1,
+        max_tokens: 100,
         temperature: 0.1,
       });
     });
     
     updateApiUsage(response.usage?.total_tokens || 0);
     
-    const decision = response.choices[0]?.message?.content?.trim();
+    const gptResponse = response.choices[0]?.message?.content?.trim();
     
-    if (decision === '0' || decision === '1') {
-      return {
-        isSpam: Number(decision),
-        reason: Number(decision) === 1 ? "GPT: spam" : "GPT: not spam",
-        checkType: 'gpt'
-      };
+    if (gptResponse) {
+      const [decision] = gptResponse.split(';');
+      const isSpam = parseInt(decision);
+
+      if (isSpam === 0 || isSpam === 1) {
+        const spamDecision: SpamDecision = {
+          isSpam: isSpam,
+          reason: `GPT check result`,
+          checkType: 'gpt'
+        };
+
+        return spamDecision;
+      }
     }
 
-    log(`Unexpected GPT response for report ${report.reportId}: ${decision}`, 'warn');
+    log(`Unexpected GPT response for report ${report.reportId}: ${gptResponse}`, 'warn');
     return null;
 
   } catch (error) {
@@ -1176,7 +1321,7 @@ async function retryGptRequest<T>(request: () => Promise<T>, maxRetries: number 
 }
 
 // Helper functions
-function preprocess(message: string, media?: Api.TypeMessageMedia): string {
+function preprocess(message: string, media?: Api.TypeMessageMedia, sender?: string): string {
   const lines = message.split('\n');
   let processedMessage = lines.slice(1).join('\n').trim();
   
@@ -1189,6 +1334,13 @@ function preprocess(message: string, media?: Api.TypeMessageMedia): string {
   
   if (processedMessage.length > 1000) {
     processedMessage = processedMessage.substring(0, 997) + '...';
+  }
+
+  // Anonymize sender
+  if (sender) {
+    const anonymizedSender = createHash('sha256').update(sender).digest('hex');
+    log(`Anonymized sender: ${anonymizedSender}`, 'debug');
+    // Use anonymizedSender wherever needed
   }
   
   return processedMessage;
@@ -1228,26 +1380,6 @@ function parseSysMessage(message: string): Partial<Report> {
   if (senderMatch) info.sender = senderMatch[1].trim();
 
   return info;
-}
-
-function generateUserPrompt(report: Report): string {
-  let prompt = "Context:\n";
-  prompt += `- Complaint count: ${report.complaintCount}\n`;
-  prompt += `- Source: ${report.source}\n`;
-  prompt += `- Sender: ${report.sender}\n`;
-  
-  if (report.mediaHashes.length > 0) {
-    prompt += `- Media types present: ${report.mediaHashes.map(hash => hash.split(':')[0]).join(', ')}\n`;
-  }
-
-  if (report.messageContent.length > 0) {
-    prompt += "\nMessage content:\n";
-    prompt += `"""\n${report.messageContent.join('\n')}\n"""`;
-  } else {
-    prompt += "\nNote: No message content available. Analyzing based on context and metadata.";
-  }
-
-  return prompt;
 }
 
 async function applyDecision(report: Report, decision: SpamDecision): Promise<void> {
@@ -1312,7 +1444,10 @@ async function sendDecision(report: Report, decision: SpamDecision): Promise<voi
 async function saveCache(report: Report, decision: SpamDecision): Promise<void> {
   if (isShuttingDown) return;
 
-  const messageHash = getMessageHash(report.messageContent, report.sender);
+  const messageHash = getMessageHash(
+    report.messageContent, 
+    report.sender ? createHash('sha256').update(report.sender).digest('hex') : ''
+  );
   const cachedDecision: CachedDecision = {
     isSpam: decision.isSpam,
     reason: decision.reason,
@@ -1320,7 +1455,7 @@ async function saveCache(report: Report, decision: SpamDecision): Promise<void> 
     reportId: report.reportId,
     timestamp: Date.now()
   };
-  lruCache.set(messageHash, cachedDecision);
+  setLruCache(messageHash, cachedDecision);
   log(`Decision cached for report ${report.reportId}`, 'debug');
 }
 
@@ -1332,10 +1467,14 @@ async function saveReportToRedis(report: Report): Promise<void> {
     return;
   }
 
-  // Проверяем, не является ли отчет результатом обработки LRU кэша
   if (report.checkType === 'default') {
     log(`Skipping save for report ${report.reportId} from LRU cache`, 'debug');
     return;
+  }
+
+  // Ensure sender is anonymized before saving
+  if (report.sender && !report.sender.match(/^[a-f0-9]{64}$/)) {
+    report.sender = createHash('sha256').update(report.sender).digest('hex');
   }
 
   const key = `report:${report.reportId}`;
@@ -1402,25 +1541,39 @@ async function checkCache(report: Report): Promise<SpamDecision | null> {
   if (isShuttingDown) return null;
 
   try {
-    const messageHash = getMessageHash(report.messageContent, report.sender);
-    let cachedDecision = lruCache.get(messageHash);
+    // Ensure sender is anonymized for cache lookup
+    const messageHash = getMessageHash(
+      report.messageContent, 
+      report.sender ? createHash('sha256').update(report.sender).digest('hex') : ''
+    );
     
-    if (!cachedDecision && report.messageContent.join('').length > 500) {
-      const redisKey = `cache:${messageHash}`;
-      const redisDecision = await redis.get(redisKey);
-      if (redisDecision) {
-        cachedDecision = JSON.parse(redisDecision) as CachedDecision;
-        lruCache.set(messageHash, cachedDecision);
+    const cachedItem = getLruCache(messageHash);
+    
+    if (cachedItem && typeof cachedItem === 'object' && 'isSpam' in cachedItem) {
+      const cachedDecision = cachedItem as CachedDecision;
+      if (cachedDecision.isSpam === 0 || cachedDecision.isSpam === 1) {
+        log(`Cache hit for report ${report.reportId}`, 'debug');
+        return {
+          isSpam: cachedDecision.isSpam,
+          reason: cachedDecision.reason,
+          checkType: cachedDecision.checkType
+        };
       }
     }
 
-    if (cachedDecision && (cachedDecision.isSpam === 0 || cachedDecision.isSpam === 1)) {
-      log(`Cache hit for report ${report.reportId}`, 'debug');
-      return {
-        isSpam: cachedDecision.isSpam,
-        reason: cachedDecision.reason,
-        checkType: cachedDecision.checkType
-      };
+    if (!cachedItem && report.messageContent.join('').length > 500) {
+      const redisKey = `cache:${messageHash}`;
+      const redisDecision = await redis.get(redisKey);
+      if (redisDecision) {
+        const parsedDecision = JSON.parse(redisDecision) as CachedDecision;
+        setLruCache(messageHash, parsedDecision);
+        log(`Cache hit from Redis for report ${report.reportId}`, 'debug');
+        return {
+          isSpam: parsedDecision.isSpam,
+          reason: parsedDecision.reason,
+          checkType: parsedDecision.checkType
+        };
+      }
     }
   } catch (error) {
     if (!isShuttingDown) {
@@ -1480,12 +1633,15 @@ async function getReportsBetween(startReportId: string, endReportId: string): Pr
   const startId = BigInt(startReportId);
   const endId = BigInt(endReportId);
 
-  const lruReports = Array.from(lruCache.values())
-    .filter(decision => {
-      const reportId = BigInt(decision.reportId);
+  const lruReports = Array.from(lruCache.entries())
+    .filter((entry): entry is [string, CachedDecision] => 
+      typeof entry[1] === 'object' && 'reportId' in entry[1]
+    )
+    .filter(([_, item]) => {
+      const reportId = BigInt(item.reportId);
       return reportId >= startId && reportId <= endId;
     })
-    .map(decision => decision.reportId);
+    .map(([_, item]) => item.reportId);
 
   const redisKeys = await redis.keys('report:*');
   const redisReports = (await Promise.all(redisKeys.map(async key => {
@@ -1534,11 +1690,15 @@ async function handleLruCommand() {
 }
 
 function getLruContent(): CachedDecision[] {
-  return Array.from(lruCache.values());
+  return Array.from(lruCache.entries())
+    .filter((entry): entry is [string, CachedDecision] => 
+      typeof entry[1] === 'object' && 'isSpam' in entry[1]
+    )
+    .map(([_, value]) => value);
 }
 
 async function generateLruCsvReport(lruContent: CachedDecision[]): Promise<string> {
-  const csvFilePath = join(tmpdir(), 'lru_report.csv');
+  const csvFilePath = path.join(tmpdir(), 'lru_report.csv');
   const csvWriter = createObjectCsvWriter({
     path: csvFilePath,
     header: [
@@ -1721,7 +1881,7 @@ async function cleanupCache() {
     let deletedCount = 0;
 
     for (const [key, value] of lruCache.entries()) {
-      if (now - value.timestamp > 24 * 60 * 60 * 1000) {
+      if (typeof value === 'object' && 'timestamp' in value && now - value.timestamp > 24 * 60 * 60 * 1000) {
         lruCache.delete(key);
         deletedCount++;
       }
@@ -1800,7 +1960,6 @@ async function limitCacheSize() {
     log('limitCacheSize: Application is shutting down, cache size limitation skipped', 'debug');
     return;
   }
-
   try {
     const currentSize = await getCacheSize();
     log(`Current cache size: ${currentSize.toFixed(2)} MB`, 'debug');
@@ -1834,17 +1993,17 @@ async function limitCacheSize() {
 }
 
 // Media handling functions
-async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null): Promise<string> {
-  if (!media) return 'empty';
+async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null): Promise<{ hash: string; type: string }> {
+  if (!media) return { hash: 'empty', type: 'empty' };
   
   if (media instanceof Api.MessageMediaEmpty) {
     log('Media type: MessageMediaEmpty', 'debug');
-    return 'empty';
+    return { hash: 'empty', type: 'empty' };
   }
   
   if (media instanceof Api.MessageMediaPhoto) {
     log('Media type: MessageMediaPhoto', 'debug');
-    return `photo:${media.photo?.id || 'unknown'}`;
+    return { hash: `photo:${media.photo?.id || 'unknown'}`, type: 'photo' };
   }
   
   if (media instanceof Api.MessageMediaDocument) {
@@ -1859,37 +2018,37 @@ async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null)
       
       if (attribute instanceof Api.DocumentAttributeSticker) {
         log('Media type: Sticker', 'debug');
-        return `sticker:${document.id}`;
+        return { hash: `sticker:${document.id}`, type: 'sticker' };
       }
       if (attribute instanceof Api.DocumentAttributeAnimated || document.mimeType === 'image/gif') {
         log('Media type: GIF', 'debug');
-        return `gif:${document.id}`;
+        return { hash: `gif:${document.id}`, type: 'gif' };
       }
       if (attribute instanceof Api.DocumentAttributeVideo) {
         log(`Media type: ${attribute.roundMessage ? 'Video Note' : 'Video'}`, 'debug');
-        return attribute.roundMessage ? `videonote:${document.id}` : `video:${document.id}`;
+        return { hash: attribute.roundMessage ? `videonote:${document.id}` : `video:${document.id}`, type: attribute.roundMessage ? 'videonote' : 'video' };
       }
       
       log(`Media type: ${fileType}`, 'debug');
-      return `${fileType}:${document.id}`;
+      return { hash: `${fileType}:${document.id}`, type: fileType };
     }
   }
   
   if (media instanceof Api.MessageMediaWebPage) {
     log('Media type: MessageMediaWebPage', 'debug');
     if (media.webpage instanceof Api.WebPage) {
-      return `webpage:${media.webpage.url}`;
+      return { hash: `webpage:${media.webpage.url}`, type: 'webpage' };
     } else if (media.webpage instanceof Api.WebPageEmpty) {
-      return `webpage:empty`;
+      return { hash: `webpage:empty`, type: 'webpage_empty' };
     } else if (media.webpage instanceof Api.WebPageNotModified) {
-      return `webpage:not_modified`;
+      return { hash: `webpage:not_modified`, type: 'webpage_not_modified' };
     }
-    return `webpage:unknown`;
+    return { hash: `webpage:unknown`, type: 'webpage_unknown' };
   }
   
   if (media instanceof Api.MessageMediaStory) {
     log('Media type: MessageMediaStory', 'debug');
-    return `story:${media.id}`;
+    return { hash: `story:${media.id}`, type: 'story' };
   }
   
   if (media instanceof Api.ReplyInlineMarkup) {
@@ -1898,23 +2057,23 @@ async function getHash(media: Api.TypeMessageMedia | Api.TypeReplyMarkup | null)
   }
   
   log(`Unknown media type: ${media.className}`, 'debug');
-  return `unknown:${media.className}`;
+  return { hash: `unknown:${media.className}`, type: 'unknown' };
 }
 
-function processInlineMarkup(markup: Api.ReplyInlineMarkup): string {
+function processInlineMarkup(markup: Api.ReplyInlineMarkup): { hash: string; type: string } {
   for (const row of markup.rows) {
     for (const button of row.buttons) {
       if (button instanceof Api.KeyboardButtonUrl) {
         log(`Inline URL button found: ${button.url}`, 'debug');
-        return `url_button:${button.url}`;
+        return { hash: `url_button:${button.url}`, type: 'url_button' };
       }
       if (button instanceof Api.KeyboardButtonCallback) {
         log('Inline callback button found', 'debug');
-        return `callback_button:${button.data.toString('hex')}`;
+        return { hash: `callback_button:${button.data.toString('hex')}`, type: 'callback_button' };
       }
     }
   }
-  return 'inline_keyboard:generic';
+  return { hash: 'inline_keyboard:generic', type: 'inline_keyboard' };
 }
 
 async function undo(reportId?: string): Promise<boolean> {
@@ -1970,10 +2129,13 @@ async function undo(reportId?: string): Promise<boolean> {
 }
 
 async function getRecentReportIds(limit: number): Promise<string[]> {
-  const lruReports = Array.from(lruCache.values())
-    .sort((a, b) => b.timestamp - a.timestamp)
+  const lruReports = Array.from(lruCache.entries())
+    .filter((entry): entry is [string, CachedDecision] => 
+      typeof entry[1] === 'object' && 'reportId' in entry[1] && 'timestamp' in entry[1]
+    )
+    .sort(([_, a], [__, b]) => b.timestamp - a.timestamp)
     .slice(0, limit)
-    .map(decision => decision.reportId);
+    .map(([_, decision]) => decision.reportId);
 
   if (lruReports.length < limit) {
     const redisKeys = await redis.keys('report:*');
@@ -2026,7 +2188,7 @@ async function getRedisContent(): Promise<Report[]> {
 }
 
 async function generateRedisCsvReport(redisContent: Report[]): Promise<string> {
-  const csvFilePath = join(tmpdir(), 'redis_report.csv');
+  const csvFilePath = path.join(tmpdir(), 'redis_report.csv');
   const csvWriter = createObjectCsvWriter({
     path: csvFilePath,
     header: [
@@ -2035,7 +2197,7 @@ async function generateRedisCsvReport(redisContent: Report[]): Promise<string> {
       {id: 'reason', title: 'Reason'},
       {id: 'timestamp', title: 'Timestamp'},
       {id: 'source', title: 'Source'},
-      {id: 'sender', title: 'Sender'},
+      {id: 'sender', title: 'Anonymized Sender'},
       {id: 'complaintCount', title: 'Complaint Count'},
       {id: 'messageContent', title: 'Message Content'},
       {id: 'mediaHashes', title: 'Media Hashes'}
@@ -2045,7 +2207,11 @@ async function generateRedisCsvReport(redisContent: Report[]): Promise<string> {
   const reportData = redisContent.map(report => ({
     ...report,
     messageContent: report.messageContent.join('\n'),
-    mediaHashes: report.mediaHashes.join(', ')
+    mediaHashes: report.mediaHashes.join(', '),
+    // Ensure sender is anonymized in CSV export
+    sender: report.sender && !report.sender.match(/^[a-f0-9]{64}$/) ? 
+      createHash('sha256').update(report.sender).digest('hex') : 
+      report.sender
   }));
 
   await csvWriter.writeRecords(reportData);
@@ -2054,7 +2220,10 @@ async function generateRedisCsvReport(redisContent: Report[]): Promise<string> {
 }
 
 async function getReportFromCaches(reportId: string): Promise<Report | null> {
-  const lruDecision = Array.from(lruCache.values()).find(decision => decision.reportId === reportId);
+  const lruDecision = Array.from(lruCache.values()).find(item => 
+    typeof item === 'object' && 'reportId' in item && item.reportId === reportId
+  ) as CachedDecision | undefined;
+
   if (lruDecision) {
     return {
       reportId: lruDecision.reportId,
@@ -2163,25 +2332,6 @@ async function handleAdmin(event: NewMessageEvent) {
           await handleLruCommand();
           break;
 
-        case '/fine':
-          try {
-            const filePaths = await handleFineCommand();
-            for (const filePath of filePaths) {
-              await client.sendFile(ADMIN_ID, {
-                file: filePath,
-                caption: 'Fine-tuning data file',
-                attributes: [
-                  new Api.DocumentAttributeFilename({ fileName: path.basename(filePath) })
-                ]
-              });
-            }
-            await notify('Fine-tuning data files have been generated and sent.');
-          } catch (error) {
-            logErr('Error generating fine-tuning data', error);
-            await notify('Error generating fine-tuning data. Please check the logs.');
-          }
-          break;
-
         case '/fix':
           if (commandParts.length === 2) {
             await handleFixCommand(commandParts[1]);
@@ -2202,7 +2352,6 @@ async function handleAdmin(event: NewMessageEvent) {
           /db - Perform database operations and generate report
           /redis - Get cache info and generate report
           /lru - Get cache info and generate report
-          /fine - Generate fine-tuning data
           /fix [reportId] - Fix and reassess a specific report`);
       }
     } catch (error) {
@@ -2231,9 +2380,6 @@ async function handleFixCommand(reportId: string): Promise<void> {
       reason: report.reason,
       checkType: 'manual'
     });
-
-    // Удаляем прямое обновление PostgreSQL
-    // Данные будут обновлены при следующем выполнении saveRedisToPostgres
 
     await notify(`Report ${reportId} has been fixed. New status: ${report.isSpam === 1 ? 'spam' : 'not spam'}`);
   } catch (error) {
@@ -2346,19 +2492,21 @@ async function handleDbCommand() {
 async function getCacheContent(): Promise<Report[]> {
   const reports: Report[] = [];
 
-  for (const [key, value] of lruCache) {
-    reports.push({
-      reportId: key,
-      messageContent: [],
-      mediaHashes: [],
-      complaintCount: 0,
-      source: '',
-      sender: '',
-      isSpam: value.isSpam,
-      reason: value.reason,
-      timestamp: Date.now(),
-      checkType: value.checkType
-    });
+  for (const [key, value] of lruCache.entries()) {
+    if (typeof value === 'object' && 'isSpam' in value) {
+      reports.push({
+        reportId: key,
+        messageContent: [],
+        mediaHashes: [],
+        complaintCount: 0,
+        source: '',
+        sender: '',
+        isSpam: value.isSpam,
+        reason: value.reason,
+        timestamp: value.timestamp,
+        checkType: value.checkType
+      });
+    }
   }
 
   const keys = await redis.keys('report:*');
@@ -2373,7 +2521,7 @@ async function getCacheContent(): Promise<Report[]> {
 }
 
 async function generateCacheCsvReport(reports: Report[]): Promise<string> {
-  const csvFilePath = join(tmpdir(), 'cache_report.csv');
+  const csvFilePath = path.join(tmpdir(), 'cache_report.csv');
   const csvWriter = createObjectCsvWriter({
     path: csvFilePath,
     header: [
@@ -2450,7 +2598,7 @@ async function initDB() {
     `, [DB_SCHEMA_VERSION]);
 
     const now = new Date();
-    for (let i = 0; i < 24; i++) {  // Create partitions for 2 years ahead
+    for (let i =0; i < 24; i++) {  // Create partitions for 2 years ahead
       const startDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
       const endDate = new Date(now.getFullYear(), now.getMonth() + i + 1, 1);
       const partitionName = `reports_y${startDate.getFullYear()}_m${String(startDate.getMonth() + 1).padStart(2, '0')}`;
@@ -2577,50 +2725,6 @@ async function saveRedisToPostgres(isManualCall: boolean = false) {
   }
 }
 
-async function generateCsvReport(): Promise<string> {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(`
-      SELECT 
-        report_id,
-        message_content[1] as message,
-        complaint_count,
-        source,
-        sender,
-        is_spam,
-        reason,
-        created_at
-      FROM reports
-      WHERE created_at >= NOW() - INTERVAL '7 days'
-      ORDER BY created_at DESC
-    `);
-
-    const csvFilePath = join(tmpdir(), 'spam_report.csv');
-    const csvWriter = createObjectCsvWriter({
-      path: csvFilePath,
-      header: [
-        {id: 'report_id', title: 'Report ID'},
-        {id: 'message', title: 'Message'},
-        {id: 'complaint_count', title: 'Complaint Count'},
-        {id: 'source', title: 'Source'},
-        {id: 'sender', title: 'Sender'},
-        {id: 'is_spam', title: 'Is Spam'},
-        {id: 'reason', title: 'Reason'},
-        {id: 'created_at', title: 'Created At'}
-      ]
-    });
-
-    await csvWriter.writeRecords(result.rows);
-    log(`CSV report generated: ${csvFilePath}`, 'debug');
-    return csvFilePath;
-  } catch (error) {
-    logErr('generateCsvReport', error);
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 async function sendCsvToAdmin(csvFilePath: string) {
   await client.sendFile(ADMIN_ID, {
     file: csvFilePath,
@@ -2696,7 +2800,6 @@ async function ensureConnection(): Promise<void> {
         await reconnect();
       }
 
-      // Вместо вызова getMe(), просто проверяем состояние подключения
       if (client.connected) {
         log('Connection ensured', 'debug');
         return;
@@ -2728,7 +2831,6 @@ async function checkSystemHealth() {
       throw new Error('Telegram client not initialized');
     }
 
-    // Вместо вызова getMe(), просто проверяем состояние подключения
     if (!client.connected) {
       throw new Error('Telegram client is not connected');
     }
@@ -2763,7 +2865,7 @@ async function cleanupOldData() {
     // LRU Cache cleanup
     let lruDeletedCount = 0;
     for (const [key, value] of lruCache.entries()) {
-      if (value.timestamp < oneMonthAgo.getTime()) {
+      if (typeof value === 'object' && 'timestamp' in value && value.timestamp < oneMonthAgo.getTime()) {
         lruCache.delete(key);
         lruDeletedCount++;
       }
@@ -2918,9 +3020,7 @@ async function gracefulShutdown(restart: boolean = false) {
   log(`Graceful shutdown completed${restart ? ' (Restarting)' : ''}`, 'info');
   await notify(`Application has been ${restart ? 'restarted' : 'shut down'} gracefully.`);
 
-  // Instead of calling process.exit(), we'll let the process end naturally
   if (restart) {
-    // Use the Heroku-friendly method to restart the application
     log('Exiting for restart...', 'info');
     process.kill(process.pid, 'SIGUSR2');
   }
@@ -2928,6 +3028,15 @@ async function gracefulShutdown(restart: boolean = false) {
 
 function clearExistingTimers() {
   if (redisBatchTimeout) clearTimeout(redisBatchTimeout);
+}
+
+// Helper functions for LRU cache
+function setLruCache(key: string, value: CacheItem): void {
+  lruCache.set(key, value);
+}
+
+function getLruCache(key: string): CacheItem | undefined {
+  return lruCache.get(key);
 }
 
 // Main function
@@ -2978,6 +3087,7 @@ async function main() {
     schedule.scheduleJob('*/5 * * * *', cleanupLRUCache);
     schedule.scheduleJob('*/5 * * * *', checkStuckReports);
     schedule.scheduleJob('0 0 1 * *', initDB);
+    setupPeriodicCleanup();
 
     log('Periodic tasks scheduled', 'info');
 
@@ -3084,12 +3194,22 @@ app.get('/status', async (req, res) => {
 });
 
 // Helper function to get media content
-async function getMediaContent(mediaKey: string): Promise<Buffer | null> {
+async function getMediaContent(key: string): Promise<Buffer | null> {
   try {
-    const mediaBase64 = await redis.get(mediaKey);
-    if (mediaBase64) {
-      return Buffer.from(mediaBase64, 'base64');
+    const cachedContent = getLruCache(key);
+    if (cachedContent && typeof cachedContent === 'object' && 'type' in cachedContent && cachedContent.type === 'buffer') {
+      return cachedContent.data;
     }
+    
+    const mediaBase64 = await redis.get(key);
+    if (mediaBase64) {
+      const mediaContent = Buffer.from(mediaBase64, 'base64');
+      setLruCache(key, { type: 'buffer', data: mediaContent });
+      return mediaContent;
+    }
+    
+    log(`Media not found for key: ${key}`, 'warn');
+    return null;
   } catch (error) {
     logErr('getMediaContent', error);
   }
@@ -3187,5 +3307,3 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   logErr('Express error', err);
   res.status(500).json({ error: 'Internal server error' });
 });
-
-export { app, client, redis, pool, openai, lruCache };

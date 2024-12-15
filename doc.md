@@ -1,295 +1,48 @@
-# TAS - Система антиспама для Telegram
-
-## Описание
-
-TAS (Telegram Anti-Spam) - это автоматизированная система для обнаружения спама в группах Telegram. Система использует комбинацию методов, включая кэширование в памяти, быструю комплексную проверку и проверку с помощью GPT для принятия решений о спам-сообщениях.
-
-## Процесс работы приложения:
-
-1. Инициализация компонентов:
-   - Telegram Client (использует библиотеку telegram gramJS)
-   - Redis Cache (использует ioredis)
-   - LRU Cache (для хранения результатов проверки сообщений)
-   - PostgreSQL Database
-   - Express Server (для API и мониторинга)
-   - OpenAI API Client (для GPT проверок)
-
-2. Настройка обработчиков событий для различных типов сообщений от бота и администратора.
-
-3. Обработка входящих сообщений:
-   a) checkMsg: сообщения для проверки (incoming: true, forwards: true)
-   b) sysMsg: системные сообщения с метаданными (incoming: true, forwards: false, pattern: /Sender:/)
-   c) addMsg: дополнительные сообщения от бота
-   d) adminMsg: команды от администратора
-
-4. Процесс обработки отчета:
-   a) Объединение checkMsg и sysMsg в один отчет
-   b) Создание хеша сообщения на основе содержимого и отправителя
-   c) Проверка отчета:
-      - checkCache: Проверка наличия решения в LRU кэше по хешу сообщения
-      - fastCheck: Быстрая проверка на явные признаки спама
-      - gptCheck: Проверка с помощью GPT для сложных случаев
-   d) Применение решения и обновление отчета
-   e) Сохранение решения в LRU кэш и добавление отчета в пакет для Redis
-
-5. Пакетное сохранение отчетов:
-   - В Redis каждые 10 минут или когда размер пакета достигает 100 отчетов
-   - В PostgreSQL с партиционированием по дате каждые 2 часа
-
-6. Управление очередью обработки:
-   - Адаптивная корректировка задержки между командами
-   - Отправка "/next 2" только при отсутствии активных процессов обработки отчетов
-   - При получении ошибки "Sorry, an error has occurred during your request", система пытается отменить последние отчеты с помощью функции undoRecentReports
-
-7. Дополнительные функции:
-   - Периодическая проверка состояния системы
-   - Очистка устаревших данных из кэша и базы данных
-   - Генерация отчетов и мониторинг использования ресурсов
-   - Обработка команд администратора для управления системой
-   - API эндпоинты для проверки здоровья системы, получения статуса и ручного управления
-
-## Важные моменты:
-- Использование LRU кэша для быстрого доступа к результатам проверки сообщений
-- Кэширование на основе хеша содержимого сообщения и отправителя
-- Пакетное сохранение в Redis для оптимизации производительности
-- Партиционирование таблиц в PostgreSQL для эффективного управления данными
-- Адаптивная корректировка задержек для оптимальной производительности
-- Механизмы обработки ошибок и восстановления для повышения надежности
-- Возможность работы в автоматическом и ручном режимах
-- API эндпоинты для мониторинга и ручного управления системой
-
-## Команды администратора:
-
-- "/start" - активация автоматического режима
-- "/stop" - остановка работы приложения и переход в ручной режим
-- "/status" - получение текущего статуса системы (включая использование ресурсов)
-- "/undos [startReportId] [endReportId]" - запуск процесса отмены и повторной проверки отчетов
-- "/delay [value]" - установка задержки между командами (в миллисекундах)
-- "/reset" - очистка кэша Redis и LRU
-- "/db" - выполнение операций с базой данных и генерация отчета
-- "/redis" - получение информации о текущем состоянии Redis кэша и генерация отчета
-- "/lru" - получение информации о текущем состоянии LRU кэша и генерация отчета
-- "/fine" - генерация данных для fine-tuning модели GPT
-- "/fix [reportId]" - исправление и переоценка конкретного отчета
-
-## Оптимизации и особенности реализации:
-
-1. Использование буфера сообщений для группировки связанных сообщений перед обработкой
-2. Адаптивная корректировка задержек обработки для оптимизации производительности
-3. Механизм отмены и повторной проверки отчетов для исправления ошибок
-4. Использование GPT-4 для анализа как текстового содержимого, так и медиафайлов
-5. Механизмы для предотвращения чрезмерного использования ресурсов (ограничение размера кэша, очистка старых данных)
-6. Система мониторинга здоровья приложения и автоматического перезапуска при необходимости
-7. Детальное логирование и отчетность для облегчения отладки и анализа работы системы
-8. Кэширование результатов проверки на основе хеша сообщения и отправителя
-9. API эндпоинты для проверки здоровья системы, получения статуса и ручного управления
-10. Механизм последовательной отмены недавних отчетов в случае ошибки обработки
-11. Реализация "безопасного перезапуска" для корректного завершения всех текущих операций перед перезапуском приложения
-
-## Конфигурация и переменные окружения
-
-```typescript
-// env:
-const BOT_ID: string; 
-const PORT: number = 3000;
-const API_HASH: string;
-const ADMIN_ID: string;
-const REDIS_URL: string;
-const DATABASE_URL: string;
-const API_ID: number;
-const DEEP_LOG: boolean;
-const SESSION_STRING: string;
-const OPENAI_API_KEY: string;
-const BOT_ACCESS_HASH: string;
-
-// обычные переменные:
-let COMMAND_DELAY: number = 50;
-const DB_SCHEMA_VERSION: string = '1.0';
-const MEDIA_EXPIRY: number = 30; // 30 seconds
-const ENABLE_GPT_MEDIA_ANALYSIS: boolean = true;
-const BUFFER_DELAY: number = 100; // 100 ms
-const MAX_CACHE_SIZE_MB: number = 100; // 100 MB
-const GPT_RETRY_DELAY: number = 10000; // 10 seconds
-const MAX_PROCESSING_TIME: number = 55000; // 55 seconds
-const REDIS_BATCH_INTERVAL: number = 10 * 60 * 1000; // 10 minutes
-const SUSPEND_DURATION: number = 5 * 60 * 1000; // 5 minutes
-const MAX_CONSECUTIVE_ERRORS: number = 5;
-const IDLE_UNDO_DELAY: number = 45000; // 45 seconds
-```
-
-## Регулярные выражения
-```typescript
-const sysRegex = {
-  reportId: /#r(\d+)/,
-  complaintCount: /😱(\d+)/,
-  source: /^Source:\s*(.+)/m,
-  sender: /^Sender:\s*(.+)/m,
-};
-```
-
-## Типы сообщений и их обработчики
-
-1. **checkMsg** (сообщения для классификации)
-   - Параметры: `incoming: true, forwards: true`
-   - Обработчик: `handleCheck()`
-   
-   Цель: Обработка пересланных сообщений от бота для анализа на предмет спама.
-
-2. **sysMsg** (системные сообщения)
-   - Параметры: `incoming: true, forwards: false, pattern: /Sender:/` (и анти паттерн "Admin:")
-   - Обработчик: `handleSys()`
-   
-   Цель: Обработка системных сообщений, содержащих метаданные отчета.
-
-3. **addMsg** (дополнительные сообщения)
-   - Параметры: `incoming: true, forwards: false`
-   - Обработчик: `handleAdd()`
-   
-   Цель: Обработка различных служебных сообщений от бота.
-
-4. **adminMsg** (сообщения от администратора)
-   - Параметры: `incoming: true, forwards: false, fromUsers: [ADMIN_ID]`
-   - Обработчик: `handleAdmin()`
-   
-   Цель: Обработка команд администратора для управления системой.
-
-## Основные функции
-
-1. `processBuffer()`: Обрабатывает буфер сообщений, создавая отчеты из сгруппированных сообщений.
-
-2. `processReport()`: Координирует процесс проверки отчета на спам, используя различные методы.
-
-3. `fastCheck()`: Выполняет быструю проверку на наличие явных признаков спама.
-
-4. `gptCheck()`: Использует GPT для анализа сложных случаев спама.
-
-5. `applyDecision()`: Применяет решение о спаме и обновляет отчет.
-
-6. `saveCache()`: Сохраняет решение в LRU кэше.
-
-7. `checkCache()`: Проверяет наличие решения в кэше для данного хеша сообщения.
-
-8. `getMediaFromRedis()`: Получает медиафайлы из Redis для анализа GPT.
-
-9. `saveRedisToPostgres()`: Переносит данные из Redis в PostgreSQL.
-
-10. `generateCsvReport()`: Создает CSV-отчет о спам-активности.
-
-## Дополнительные функции
-
-1. `checkSystemHealth()`: Проверяет состояние всех компонентов системы.
-
-2. `cleanupOldData()`: Удаляет устаревшие данные из LRU кэша, Redis и PostgreSQL.
-
-3. `gracefulShutdown()`: Обеспечивает корректное завершение работы приложения.
-
-4. `limitCacheSize()`: Ограничивает размер LRU кэша и Redis кэша.
-
-5. `undoRecentReports()`: Последовательно отменяет недавние отчеты в случае ошибки.
-
-6. `getRecentReportIds()`: Получает ID последних обработанных отчетов.
-
-7. `handleUndosCommand()`: Обрабатывает команду отмены и повторной проверки отчетов из LRU кэша и Redis.
-
-8. `generateLruCsvReport()`: Создает CSV-отчет о содержимом LRU кэша.
-
-9. `handleRedisCommand()`: Обрабатывает команду для получения информации о Redis кэше и генерации отчета.
-
-10. `handleLruCommand()`: Обрабатывает команду для получения информации о LRU кэше и генерации отчета.
-
-11. `handleFixCommand()`: Обрабатывает команду для исправления и переоценки конкретного отчета.
-
-## API эндпоинты
-
-1. `/health`: Проверка здоровья системы.
-
-2. `/status`: Получение текущего статуса системы.
-
-3. `/media/:reportId/:mediaIndex`: Получение медиа-контента, связанного с отчетом.
-
-4. `/report/:reportId`: Получение деталей конкретного отчета.
-
-5. `/undo/:reportId`: Ручной запуск отмены для конкретного отчета.
-
-## Идеи для будущего развития:
-
-- Использование методов машинного обучения для улучшения GPT-4 модели
-- Разработка новых методов анализа для GPT-4 модели
-- Разработка новых методов анализа для медиафайловя
-- Реализовать систему кэширования результатов GPT-анализа для похожих сообщений, чтобы уменьшить количество запросов к API
-- Внедрить более продвинутую систему повторных попыток с экспоненциальной задержкой для всех внешних API-вызовов
-- Реализовать асинхронную загрузку и анализ медиафайлов для ускорения обработки отчетов
-- Использовать специализированные ML-модели для анализа изображений и видео на предмет спама
-- Внедрить систему машинного обучения для адаптивной настройки параметров проверки на основе исторических данных
-- Реализовать механизм периодической очистки неиспользуемых данных из памяти
-- Оптимизировать структуры данных для более эффективного использования памяти
-- Внедрить систему A/B тестирования для оценки эффективности различных алгоритмов и настроек
-
-## Обработка ошибок и восстановление
-
-1. `retryProcessing()`: Повторяет обработку отчета в случае ошибки или таймаута.
-
-2. `undoRecentReports()`: Отменяет последние отчеты в случае ошибки и пытается их переобработать.
-
-3. `waitForUndoResponse()`: Ожидает подтверждения отмены отчета от бота.
-
-4. `waitForReport()`: Ожидает получения отчета после отмены.
-
-5. `retryGptRequest()`: Повторяет запрос к GPT API в случае ошибки.
-
-## Оптимизация использования ресурсов
-
-1. `getCacheSize()`: Оценивает текущий размер кэша (LRU и Redis).
-
-2. `limitCacheSize()`: Ограничивает размер кэша, удаляя старые записи при необходимости.
-
-3. `cleanupLRUCache()`: Очищает старые записи из LRU кэша.
-
-4. `cleanupCache()`: Очищает устаревшие данные из LRU кэша и Redis.
-
-## Безопасность и мониторинг
-
-1. `checkSystemHealth()`: Проверяет состояние всех компонентов системы и перезапускает приложение при необходимости.
-
-2. `sendStatus()`: Отправляет детальный отчет о состоянии системы администратору.
-
-3. `notify()`: Отправляет важные уведомления администратору.
-
-## Работа с медиафайлами
-
-1. `getHash()`: Генерирует хэш для различных типов медиа-контента.
-
-2. `processInlineMarkup()`: Обрабатывает встроенные кнопки и разметку в сообщениях.
-
-3. `getMediaContent()`: Получает медиа-контент из Redis.
-
-4. `getMediaType()`: Определяет тип медиа-контента по хэшу.
-
-## Обработка команд администратора
-
-1. `handleFixCommand()`: Обрабатывает команду для исправления и переоценки конкретного отчета.
-
-2. `stopBotTemporarily()`: Временно останавливает бота в случае достижения максимального количества попыток отмены.
-
-3. `resetRedisCache()`: Очищает кэш Redis и LRU по команде администратора.
-
-## Дополнительные улучшения
-
-1. Реализован механизм "безопасного перезапуска", который корректно завершает все текущие операции перед перезапуском приложения.
-
-2. Добавлена функция `isReportInUndoRange()` для проверки, находится ли отчет в диапазоне отмены.
-
-3. Реализован механизм автоматической отмены отчетов при отсутствии активности (`startIdleUndoTimer()` и `resetIdleUndoTimer()`).
-
-4. Добавлена функция `handleDbCommand()` для выполнения операций с базой данных и генерации отчетов.
-
-5. Реализована функция `getCacheContent()` для получения содержимого кэша (LRU и Redis) для генерации отчетов.
-
-## Конфигурация базы данных
-
-База данных использует партиционирование по дате для эффективного управления данными. Схема базы данных включает следующие таблицы:
-
-1. `reports`: Основная таблица для хранения отчетов о спаме.
-2. `schema_version`: Таблица для отслеживания версии схемы базы данных.
-
-Партиции создаются автоматически для каждого месяца, что позволяет эффективно управлять большими объемами данных и упрощает процесс архивации старых данных.
+# TAS: Telegram Anti-Spam System - Technical Overview
+
+## Introduction
+
+TAS (Telegram Anti-Spam System) is an advanced solution designed to detect and manage spam in Telegram groups. This document provides a technical overview of the system, its current state, and future development plans.
+
+## System Components
+
+1. Telegram Client: Uses the telegram gramJS library to interact with Telegram's API.
+2. Redis Cache: For temporary data storage and quick access to recent decisions.
+3. LRU (Least Recently Used) Cache: For rapid checking of repeated spam from the same sender.
+4. PostgreSQL Database: For long-term data storage and machine learning purposes.
+5. Express Server: Handles API requests and system monitoring.
+6. OpenAI API Client: For accessing the GPT-4o-mini model.
+
+## How TAS Works
+
+1. Message Reception and Categorization
+   - The system receives messages through the Telegram Client.
+   - Messages are categorized into four types:
+     a) checkMsg: Messages to be checked for spam.
+     b) sysMsg: System messages containing metadata.
+     c) addMsg: Additional bot messages (e.g., "No reports found").
+     d) adminMsg: Commands from system administrators.
+
+2. Initial Screening
+   - The system creates a hash of the message based on its content and sender.
+   - This hash is checked against the LRU cache for quick identification of repeated spam.
+   - A fast check is performed to identify obvious spam indicators.
+
+3. Deep Content Analysis
+   - If the message contains media, it's first analyzed using Google Cloud Vision API.
+   - The text content (including any text extracted from images) is then processed by GPT-4o-mini.
+   - GPT-4o-mini analyzes the message for spam indicators, considering context and content.
+
+4. Decision Making
+   - The system combines results from all checks to determine if the message is spam.
+   - This decision is then applied to the report.
+
+5. Result Handling
+   - The decision is saved in the LRU cache for quick future reference.
+   - The full report is added to a batch for Redis storage.
+   - Every 10 minutes or when 100 reports accumulate, the batch is saved to Redis.
+   - Every 2 hours, data from Redis is transferred to PostgreSQL for long-term storage.
+
+6. Queue Management
+   - The system adaptively adjusts delays between processing commands to optimize performance.
+   - If an error occurs, the system can undo recent reports using the undoRecentReports function.
