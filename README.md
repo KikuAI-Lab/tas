@@ -24,7 +24,7 @@
 ## What TAS Detects
 
 ✅ **Commercial spam:**
-- Buy/sell offers (куплю, продам, продаю)
+- Buy/sell offers
 - Job offers and work solicitations
 - Service offers (repair, tutoring, etc.)
 - Real estate (rent, sale)
@@ -81,7 +81,7 @@ API will be available at `http://localhost:8000`
 ```bash
 curl -X POST http://localhost:8000/classify \
   -H "Content-Type: application/json" \
-  -d '{"text": "Заработок без вложений! Переходи https://...", "lang": "ru"}'
+  -d '{"text": "Earn money from home! Click here https://...", "lang": "en"}'
 ```
 
 ### Response
