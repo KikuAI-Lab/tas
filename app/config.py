@@ -1,0 +1,22 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    openai_api_key: str = ""
+    model_name: str = "unitary/multilingual-toxic-xlm-roberta"
+    
+    rules_threshold: float = 0.7
+    ml_threshold: float = 0.8
+    llm_fallback: bool = True
+    
+    cache_size: int = 10000
+    cache_ttl: int = 3600
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        extra = "ignore"
+
+
+settings = Settings()
+

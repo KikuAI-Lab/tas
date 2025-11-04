@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TAS - Universal Anti-Spam API</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .input-group {
+            margin-bottom: 30px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 120px;
+        }
+        
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 32px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            width: 100%;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .result {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .result.show {
+            display: block;
+        }
+        
+        .result.spam {
+            background: #fee;
+            border: 2px solid #fcc;
+        }
+        
+        .result.safe {
+            background: #efe;
+            border: 2px solid #cfc;
+        }
+        
+        .result.uncertain {
+            background: #ffe;
+            border: 2px solid #fcc;
+        }
+        
+        .score {
+            font-size: 2em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        .labels {
+            margin: 15px 0;
+        }
+        
+        .label {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.9em;
+            margin-right: 8px;
+            margin-bottom: 4px;
+        }
+        
+        .label.spam {
+            background: #fcc;
+            color: #c00;
+        }
+        
+        .label.scam {
+            background: #faa;
+            color: #800;
+        }
+        
+        .label.high_risk {
+            background: #f88;
+            color: #600;
+        }
+        
+        .layers {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #ddd;
+        }
+        
+        .layer {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            margin-right: 8px;
+            background: #e0e0e0;
+            color: #666;
+        }
+        
+        .reasons {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #ddd;
+        }
+        
+        .reasons ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .reasons li {
+            padding: 4px 0;
+            color: #666;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .loading.show {
+            display: block;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .api-info {
+            margin-top: 40px;
+            padding-top: 30px;
+            border-top: 2px solid #e0e0e0;
+        }
+        
+        .api-info h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .api-info code {
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛡️ TAS</h1>
+            <p>Universal Anti-Spam API - Multi-layer Detection</p>
+        </div>
+        
+        <div class="content">
+            <div class="input-group">
+                <label for="text">Enter text to check:</label>
+                <textarea id="text" placeholder="Enter message text here..."></textarea>
+            </div>
+            
+            <button onclick="checkSpam()">Check for Spam</button>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p style="margin-top: 10px;">Analyzing...</p>
+            </div>
+            
+            <div class="result" id="result">
+                <div class="score" id="score"></div>
+                <div class="labels" id="labels"></div>
+                <div class="layers" id="layers"></div>
+                <div class="reasons" id="reasons"></div>
+            </div>
+            
+            <div class="api-info">
+                <h3>API Endpoint</h3>
+                <p>POST <code>https://your-api-url.com/classify</code></p>
+                <p>Request body:</p>
+                <pre style="background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto;"><code>{
+  "text": "Your text here",
+  "lang": "en"
+}</code></pre>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_URL = window.location.origin.includes('github.io') 
+            ? 'https://tas-api.onrender.com' 
+            : (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+                ? 'http://localhost:8000'
+                : window.location.origin);
+        
+        async function checkSpam() {
+            const text = document.getElementById('text').value.trim();
+            if (!text) {
+                alert('Please enter some text');
+                return;
+            }
+            
+            const loading = document.getElementById('loading');
+            const result = document.getElementById('result');
+            
+            loading.classList.add('show');
+            result.classList.remove('show');
+            
+            try {
+                const response = await fetch(`${API_URL}/classify`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text: text,
+                        lang: 'en'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                loading.classList.remove('show');
+                displayResult(data);
+            } catch (error) {
+                loading.classList.remove('show');
+                alert('Error: ' + error.message);
+            }
+        }
+        
+        function displayResult(data) {
+            const result = document.getElementById('result');
+            const score = document.getElementById('score');
+            const labels = document.getElementById('labels');
+            const layers = document.getElementById('layers');
+            const reasons = document.getElementById('reasons');
+            
+            const spamScore = data.spam_score || 0;
+            const confidence = data.confidence || 0;
+            
+            score.textContent = `Spam Score: ${(spamScore * 100).toFixed(1)}%`;
+            score.style.color = spamScore >= 0.7 ? '#c00' : spamScore >= 0.5 ? '#f80' : '#0a0';
+            
+            result.className = 'result show';
+            if (spamScore >= 0.7) {
+                result.classList.add('spam');
+            } else if (spamScore >= 0.5) {
+                result.classList.add('uncertain');
+            } else {
+                result.classList.add('safe');
+            }
+            
+            labels.innerHTML = '';
+            if (data.labels && data.labels.length > 0) {
+                data.labels.forEach(label => {
+                    const span = document.createElement('span');
+                    span.className = `label ${label}`;
+                    span.textContent = label;
+                    labels.appendChild(span);
+                });
+            }
+            
+            layers.innerHTML = 'Layers used: ';
+            if (data.layers_used && data.layers_used.length > 0) {
+                data.layers_used.forEach(layer => {
+                    const span = document.createElement('span');
+                    span.className = 'layer';
+                    span.textContent = layer;
+                    layers.appendChild(span);
+                });
+            }
+            
+            reasons.innerHTML = '';
+            if (data.reasons && data.reasons.length > 0) {
+                const ul = document.createElement('ul');
+                data.reasons.forEach(reason => {
+                    const li = document.createElement('li');
+                    li.textContent = '• ' + reason;
+                    ul.appendChild(li);
+                });
+                reasons.appendChild(ul);
+            }
+        }
+        
+        document.getElementById('text').addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'Enter') {
+                checkSpam();
+            }
+        });
+    </script>
+</body>
+</html>
+
