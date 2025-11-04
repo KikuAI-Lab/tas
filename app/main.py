@@ -2,8 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict
 from app.pipeline import pipeline
+from app.regex_patterns import regex_patterns
 from app.config import settings
 import logging
 
@@ -39,6 +40,16 @@ class ClassifyResponse(BaseModel):
     version: str
 
 
+class BatchRequest(BaseModel):
+    texts: List[str] = Field(..., min_items=1, max_items=100)
+
+
+class BatchResponse(BaseModel):
+    results: List[Dict]
+    total: int
+    processed: int
+
+
 @app.get("/")
 async def root():
     return {
@@ -47,6 +58,8 @@ async def root():
         "description": "Multi-layer spam detection service",
         "endpoints": {
             "classify": "/classify",
+            "batch": "/batch",
+            "patterns": "/patterns",
             "health": "/health",
             "docs": "/docs"
         }
@@ -66,12 +79,66 @@ async def classify(request: ClassifyRequest):
         raise HTTPException(status_code=500, detail="Internal server error. Please try again later.")
 
 
+@app.post("/batch", response_model=BatchResponse)
+async def batch_classify(request: BatchRequest):
+    """Classify multiple texts in batch."""
+    try:
+        results = []
+        processed = 0
+        
+        for text in request.texts:
+            try:
+                result = await pipeline.classify(text, "en")
+                results.append(result)
+                processed += 1
+            except Exception as e:
+                logger.warning(f"Error processing text: {e}")
+                results.append({
+                    "spam_score": 0.0,
+                    "confidence": 0.0,
+                    "labels": [],
+                    "reasons": ["Error processing"],
+                    "layers_used": [],
+                    "version": pipeline.version,
+                })
+        
+        return BatchResponse(
+            results=results,
+            total=len(request.texts),
+            processed=processed
+        )
+    except Exception as e:
+        logger.error(f"Batch classification error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error. Please try again later.")
+
+
+@app.get("/patterns")
+async def get_patterns():
+    """Get list of all detection patterns."""
+    patterns = []
+    for pattern, reason, score in regex_patterns.patterns:
+        patterns.append({
+            "reason": reason,
+            "score": score,
+            "pattern": pattern.pattern
+        })
+    
+    return {
+        "total": len(patterns),
+        "patterns": patterns
+    }
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "ml_model": "loaded" if pipeline.ml_model and pipeline.ml_model.model else "not_loaded",
+        "llm_enabled": settings.llm_fallback
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
