@@ -150,11 +150,13 @@ async def get_stats():
 
 @app.get("/health")
 async def health():
+    from app.pipeline import cache
     return {
         "status": "ok",
         "version": "1.0.1",
         "ml_model": "loaded" if hasattr(pipeline, 'ml_model') and pipeline.ml_model and pipeline.ml_model.model else "not_loaded",
-        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback
+        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback,
+        "cache_size": cache.size()
     }
 
 

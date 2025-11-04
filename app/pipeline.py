@@ -3,6 +3,10 @@ from app.regex_patterns import regex_patterns
 from app.ml_model import ml_model
 from app.llm_check import llm_check
 from app.config import settings
+from app.cache import ClassificationCache
+
+# Initialize cache with settings
+cache = ClassificationCache(max_size=settings.cache_size, ttl=settings.cache_ttl)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,12 @@ class MultiLayerPipeline:
                 "layers_used": [],
                 "version": self.version,
             }
+        
+        # Check cache first
+        cached = cache.get(text, lang)
+        if cached:
+            cached["cached"] = True
+            return cached
 
         layers_used = []
         final_score = 0.0
@@ -91,7 +101,12 @@ class MultiLayerPipeline:
 
                 layers_used.append("llm")
 
-        return self._format_result(final_score, final_confidence, all_reasons, layers_used)
+        result = self._format_result(final_score, final_confidence, all_reasons, layers_used)
+        
+        # Cache result
+        cache.set(text, result, lang)
+        
+        return result
 
     def _format_result(self, score: float, confidence: float, reasons: List[str], layers_used: List[str]) -> Dict:
         labels = []
