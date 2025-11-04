@@ -381,39 +381,21 @@
             const confidence = data.confidence || 0;
             const reason = data.reason || "No specific reason";
             
-            if (isSpam) {
-                score.innerHTML = `⚠️ SPAM DETECTED<br><small style="font-size: 0.7em; opacity: 0.8; font-weight: normal;">Confidence: <strong>${(confidence * 100).toFixed(1)}%</strong></small>`;
-                score.style.color = '#c00';
-                result.classList.add('spam');
-            } else if (spamScore >= 0.5) {
-                result.classList.add('uncertain');
             } else {
+                score.innerHTML = `✅ SAFE<br><small style="font-size: 0.7em; opacity: 0.8; font-weight: normal;">Confidence: <strong>${(confidence * 100).toFixed(1)}%</strong></small>`;
+                score.style.color = '#0a0';
                 result.classList.add('safe');
             }
             
+            result.className = 'result show';
+            
             labels.innerHTML = '';
-            if (data.labels && data.labels.length > 0) {
-                data.labels.forEach(label => {
-                    const span = document.createElement('span');
-                    span.className = `label ${label}`;
-                    span.textContent = label;
-                    labels.appendChild(span);
-                });
-            }
+            layers.innerHTML = '';
             
-            layers.innerHTML = 'Layers used: ';
-            if (data.layers_used && data.layers_used.length > 0) {
-                data.layers_used.forEach(layer => {
-                    const span = document.createElement('span');
-                    span.className = 'layer';
-                    span.textContent = layer;
-                    layers.appendChild(span);
-                });
-            }
-            
-            reasons.innerHTML = '';
-            if (data.reasons && data.reasons.length > 0) {
-                const ul = document.createElement('ul');
+            if (reason) {
+                reasons.innerHTML = `<strong>Reason:</strong> ${reason}`;
+            } else {
+                reasons.innerHTML = '';
                 data.reasons.forEach(reason => {
                     const li = document.createElement('li');
                     li.textContent = '• ' + reason;

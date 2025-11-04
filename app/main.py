@@ -4,10 +4,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 from app.pipeline import pipeline
-from app.regex_patterns import regex_patterns
 from app.config import settings
 from app.rate_limit import rate_limiter
-from app.ml_model import ml_model
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -93,86 +91,6 @@ async def classify(request: ClassifyRequest, client_request: Request):
     except Exception as e:
         logger.error(f"Classification error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error. Please try again later.")
-
-
-@app.post("/batch", response_model=BatchResponse)
-async def batch_classify(request: BatchRequest):
-    """Classify multiple texts in batch."""
-    try:
-        results = []
-        processed = 0
-        
-        for text in request.texts:
-            try:
-                result = await pipeline.classify(text, "en")
-                results.append(result)
-                processed += 1
-            except Exception as e:
-                logger.warning(f"Error processing text: {e}")
-                results.append({
-                    "spam_score": 0.0,
-                    "confidence": 0.0,
-                    "labels": [],
-                    "reasons": ["Error processing"],
-                    "layers_used": [],
-                    "version": pipeline.version,
-                })
-        
-        return BatchResponse(
-            results=results,
-            total=len(request.texts),
-            processed=processed
-        )
-    except Exception as e:
-        logger.error(f"Batch classification error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error. Please try again later.")
-
-
-@app.get("/patterns")
-async def get_patterns():
-    """Get list of all detection patterns."""
-    patterns = []
-    for pattern, reason, score in regex_patterns.patterns:
-        patterns.append({
-            "reason": reason,
-            "score": score,
-            "pattern": pattern.pattern
-        })
-    
-    return {
-        "total": len(patterns),
-        "patterns": patterns
-    }
-
-
-@app.get("/stats")
-async def get_stats():
-    """Get API statistics and configuration."""
-    from app.pipeline import cache
-    ml_loaded = False
-    if hasattr(pipeline, 'ml_model') and pipeline.ml_model:
-        ml_loaded = ml_model.model is not None
-    
-    return {
-        "version": pipeline.version,
-        "thresholds": {
-            "rules": settings.rules_threshold,
-            "ml": settings.ml_threshold,
-            "ml_safe": settings.ml_safe_threshold,
-            "llm_fallback": settings.llm_fallback
-        },
-        "ml_model": {
-            "loaded": ml_loaded,
-            "name": settings.model_name
-        },
-        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback,
-        "cache": {
-            "enabled": True,
-            "size": cache.size(),
-            "max_size": settings.cache_size,
-            "ttl": settings.cache_ttl
-        }
-    }
 
 
 @app.get("/health")
