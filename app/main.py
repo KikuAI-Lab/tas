@@ -150,18 +150,30 @@ async def get_patterns():
 @app.get("/stats")
 async def get_stats():
     """Get API statistics and configuration."""
+    from app.pipeline import cache
+    ml_loaded = False
+    if hasattr(pipeline, 'ml_model') and pipeline.ml_model:
+        ml_loaded = ml_model.model is not None
+    
     return {
         "version": pipeline.version,
         "thresholds": {
             "rules": settings.rules_threshold,
             "ml": settings.ml_threshold,
+            "ml_safe": settings.ml_safe_threshold,
             "llm_fallback": settings.llm_fallback
         },
         "ml_model": {
-            "loaded": ml_model.model is not None if hasattr(pipeline, 'ml_model') else False,
+            "loaded": ml_loaded,
             "name": settings.model_name
         },
-        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback
+        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback,
+        "cache": {
+            "enabled": True,
+            "size": cache.size(),
+            "max_size": settings.cache_size,
+            "ttl": settings.cache_ttl
+        }
     }
 
 
