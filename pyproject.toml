@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "tas"
 version = "1.0.0"
-description = "Universal Anti-Spam REST API - Multi-layer spam detection service"
+description = "Transmodal Anti-Spam REST API - Multi-layer transmodal spam detection service"
 authors = ["Nick_JW"]
 readme = "README.md"
 packages = [{include = "app"}]

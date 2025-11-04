@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="TAS - Universal Anti-Spam API",
-    description="Multi-layer spam detection service: Rules → ML → LLM",
+    title="TAS - Transmodal Anti-Spam API",
+    description="Multi-layer transmodal spam detection: Rules → ML → LLM. Processes text, images, and other formats with unified scoring across layers.",
     version="1.0.1",
 )
 
@@ -55,9 +55,9 @@ class BatchResponse(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "name": "TAS - Universal Anti-Spam API",
+        "name": "TAS - Transmodal Anti-Spam API",
         "version": "1.0.1",
-        "description": "Multi-layer spam detection service",
+        "description": "Multi-layer transmodal spam detection service. Processes text, images, and other formats with unified scoring across detection layers.",
         "endpoints": {
             "classify": "/classify",
             "batch": "/batch",
