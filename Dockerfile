@@ -13,7 +13,7 @@ COPY pyproject.toml poetry.lock* ./
 COPY README.md ./
 
 RUN poetry config virtualenvs.create false && \
-    poetry install --only main --no-interaction --no-root --no-dev
+    poetry install --only main --no-interaction --no-root
 
 COPY app ./app
 
