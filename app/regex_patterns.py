@@ -10,8 +10,8 @@ class RegexPatterns:
             (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", re.IGNORECASE), "Contains email", 0.35),
             (re.compile(r"\b(?:0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{39,59})\b", re.IGNORECASE), "Contains cryptocurrency wallet", 0.35),
             (re.compile(r"(?i)\b(?:click here|urgent|limited time|act now|free money|guaranteed|no risk|congratulations|winner|prize|claim now|click below|verify account|suspended|locked|expire|immediate action)\b", re.IGNORECASE), "Contains scam phrase", 0.35),
-            (re.compile(r"(?i)\b(?:job|work|vacancy|employment|part[- ]?time|temporary|hiring|recruitment|заработок|работа|вакансия|подработка|удалённ|remote work|work from home|earn \$|make money|quick cash|набираю|на работу|команду|команда|дистанционн|онлайн.*работ|заработок|инвестиции|сотрудничество|оклад|зарплата|от\s+\d+\s*(?:руб|₽|р\.)|смены|график|ежедневная\s+оплата|грузчик|курьер|менеджер|сортировщик|уборщик|требуются|срочно|нужны|набираем|набор|доход|заработка|заработок|личный помощник|помощник|помощница)\b", re.IGNORECASE), "Job offer or work solicitation", 0.4),
-            (re.compile(r"(?i)\b(?:куплю|продам|продаю|покупаю|обмен|обменяю|сдам|сниму|аренд|аренду|стоимость|цена|дешево|недорого|скидка|акция|распродажа|новый|б/у|б у|б/у|состояние|отдам|бесплатно|дёшево|дорого|выкуп|обмен|бартер|от\s+\d+|руб|₽|р\.|звоните|пишите|whatsapp|вайбер|телеграм|telegram|срочно|быстро|немедленно|продается|покупаем|продаём|покупаем|ищу|ищем|нужен|нужна|нужно)\b", re.IGNORECASE), "Commercial trade offer", 0.4),
+            (re.compile(r"(?i)\b(?:job\s+offer|work\s+offer|vacancy|employment\s+offer|part[- ]?time\s+job|hiring|recruitment|заработок|работа\s+(?:на\s+дому|удалённ|онлайн|в\s+интернете)|вакансия|подработка|удалённ.*работ|remote\s+work|work\s+from\s+home|earn\s+\$|make\s+money|quick\s+cash|набираю|на\s+работу|команду|команда|дистанционн.*работ|заработок|инвестиции|сотрудничество|оклад|зарплата|от\s+\d+\s*(?:руб|₽|р\.)|смены|график|ежедневная\s+оплата|грузчик|курьер|менеджер|сортировщик|уборщик|требуются|срочно|нужны|набираем|набор|доход|заработка|личный\s+помощник|помощник|помощница)\b(?![^\s]*\b(?:программистом|в\s+компании|над\s+проектом|из\s+дома|в\s+Москве|ищу))\b", re.IGNORECASE), "Job offer or work solicitation", 0.4),
+            (re.compile(r"(?i)\b(?:куплю|продам|продаю|покупаю|обмен|обменяю|сдам|сниму|аренд|аренду|стоимость|цена|дешево|недорого|скидка|акция|распродажа|новый|б/у|б у|б/у|состояние|отдам|бесплатно|дёшево|дорого|выкуп|обмен|бартер|от\s+\d+|руб|₽|р\.|звоните|пишите|whatsapp|вайбер|телеграм|telegram|срочно|быстро|немедленно|продается)\b(?![^\s]*\b(?:в\s+прошлом|в\s+прошлом\s+году|каждый\s+день|в\s+магазине|свой|старый))\b", re.IGNORECASE), "Commercial trade offer", 0.4),
             (re.compile(r"(?i)\b(?:авто|машина|автомобиль|купить авто|продать авто|автосалон|подержанн|новый авто|расчет|кредит|лизинг|обмен авто)\b", re.IGNORECASE), "Car sale offer", 0.4),
             (re.compile(r"(?i)\b(?:квартир|дом|дача|участок|недвижимост|продажа|покупка|аренда|снять|сдать|комнат|студи|апартамент)\b", re.IGNORECASE), "Real estate offer", 0.4),
             (re.compile(r"(?i)\b(?:sale|discount|promotion|limited time|special offer|акция|скидка|распродажа|предложение|специальное)\b", re.IGNORECASE), "Sale or promotion", 0.35),
@@ -28,12 +28,28 @@ class RegexPatterns:
     def check(self, text: str) -> List[Tuple[str, float]]:
         results = []
         word_count = len(text.split())
+        text_lower = text.lower()
+        
+        # Negative context checks (whitelist patterns)
+        negative_contexts = [
+            r"\b(?:я|мы|он|она|они)\s+(?:работаю|работаем|работает|работают)",
+            r"\b(?:в\s+прошлом|в\s+прошлом\s+году|каждый\s+день|в\s+магазине)",
+            r"\b(?:свой|старый|продал|продали|купил|купили)\b",
+            r"\b(?:ищу|ищем|ищет)\s+(?:работу|работа)\b",
+            r"\b(?:звоню|звони|звоним)\s+(?:маме|мама|другу|друзья)\b",
+        ]
+        has_negative_context = any(re.search(pattern, text_lower) for pattern in negative_contexts)
         
         for pattern, reason, base_score in self.patterns:
             matches = pattern.findall(text)
             if matches:
                 match_count = len(matches) if isinstance(matches, list) else 1
                 score = min(base_score * match_count, 0.9)
+                
+                # Reduce score if negative context detected
+                if has_negative_context and reason in ["Commercial trade offer", "Job offer or work solicitation", "Real estate offer"]:
+                    score = score * 0.5
+                
                 results.append((reason, score))
         
         if word_count < 3 and len(text) < 15:
@@ -42,7 +58,7 @@ class RegexPatterns:
         commercial_boosts = ["Commercial trade offer", "Car sale offer", "Real estate offer", 
                             "Job offer or work solicitation", "Service offer"]
         has_commercial = any(reason in commercial_boosts for reason, _ in results)
-        if has_commercial and word_count <= 3:
+        if has_commercial and word_count <= 3 and not has_negative_context:
             results.append(("Short commercial message", 0.2))
         
         # Boost score if multiple commercial patterns detected

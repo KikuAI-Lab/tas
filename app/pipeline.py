@@ -94,10 +94,26 @@ class MultiLayerPipeline:
             commercial_count = sum(1 for reason, _ in rule_results if reason in commercial_keywords)
             if commercial_count >= 1:
                 word_count = len(text.split())
-                if word_count <= 5:
-                    rule_score = min(rule_score + 0.15, 0.95)
-                if "работа" in text.lower() or "work" in text.lower() or "job" in text.lower():
-                    if word_count <= 8:
+                text_lower = text.lower()
+                
+                # Check for negative context (not a spam offer)
+                negative_context = any([
+                    "в прошлом" in text_lower,
+                    "в прошлом году" in text_lower,
+                    "каждый день" in text_lower,
+                    "в магазине" in text_lower,
+                    "свой" in text_lower,
+                    "старый" in text_lower,
+                    "ищу работу" in text_lower,
+                    "работаю" in text_lower,
+                    "работаем" in text_lower,
+                ])
+                
+                if not negative_context:
+                    if word_count <= 5:
+                        rule_score = min(rule_score + 0.1, 0.95)
+                    if ("работа на дому" in text_lower or "работа удаленно" in text_lower or 
+                        "work from home" in text_lower) and word_count <= 8:
                         rule_score = min(rule_score + 0.1, 0.95)
         else:
             rule_score = 0.0

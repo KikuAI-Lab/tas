@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     patas_url: str = "http://localhost:8000"
     patas_api_key: str = ""
     
-    rules_threshold: float = 0.55
+    rules_threshold: float = 0.65
     llm_fallback: bool = True
     
     cache_size: int = 10000
