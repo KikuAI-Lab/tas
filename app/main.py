@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="TAS - Universal Anti-Spam API",
     description="Multi-layer spam detection service: Rules → ML → LLM",
-    version="1.0.0",
+    version="1.0.1",
 )
 
 app.add_middleware(
@@ -54,12 +54,13 @@ class BatchResponse(BaseModel):
 async def root():
     return {
         "name": "TAS - Universal Anti-Spam API",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "description": "Multi-layer spam detection service",
         "endpoints": {
             "classify": "/classify",
             "batch": "/batch",
             "patterns": "/patterns",
+            "stats": "/stats",
             "health": "/health",
             "docs": "/docs"
         }
@@ -129,13 +130,31 @@ async def get_patterns():
     }
 
 
+@app.get("/stats")
+async def get_stats():
+    """Get API statistics and configuration."""
+    return {
+        "version": pipeline.version,
+        "thresholds": {
+            "rules": settings.rules_threshold,
+            "ml": settings.ml_threshold,
+            "llm_fallback": settings.llm_fallback
+        },
+        "ml_model": {
+            "loaded": ml_model.model is not None if hasattr(pipeline, 'ml_model') else False,
+            "name": settings.model_name
+        },
+        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback
+    }
+
+
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "version": "1.0.0",
-        "ml_model": "loaded" if pipeline.ml_model and pipeline.ml_model.model else "not_loaded",
-        "llm_enabled": settings.llm_fallback
+        "version": "1.0.1",
+        "ml_model": "loaded" if hasattr(pipeline, 'ml_model') and pipeline.ml_model and pipeline.ml_model.model else "not_loaded",
+        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback
     }
 
 
