@@ -15,10 +15,12 @@
 ## Features
 
 - **Multi-layer detection**: Rules → LLM pipeline for accurate spam detection
+- **Advanced modules**: RRS (Reputation), LUR (URL Risk), SIG (Signatures), ROL (Rule Orchestrator), QZN (Quarantine)
 - **Cost-effective**: LLM used only when rules can't decide (80%+ requests avoid LLM)
-- **Fast**: Rules layer < 10ms, LLM fallback < 1000ms
+- **Fast**: Rules layer < 10ms, LLM fallback < 1000ms, P95 < 100ms
 - **Simple API**: One endpoint, simple response
 - **Commercial Focus**: Specialized for buy/sell, job offers, services
+- **PATAS Integration**: Import rules from PATAS batch analysis system
 
 ## What TAS Detects
 
@@ -77,6 +79,13 @@ curl -X POST http://localhost:8000/classify \
 Environment variables (`.env`):
 
 - `OPENAI_API_KEY` - OpenAI API key for LLM fallback (optional)
+- `PATAS_URL` - PATAS API URL for rule import (default: `http://localhost:8000`)
+- `PATAS_API_KEY` - PATAS API key (optional)
+- `ENABLE_RRS` - Enable Reputation & Rate Sentinel (default: `true`)
+- `ENABLE_LUR` - Enable Link & URL Risk (default: `true`)
+- `ENABLE_SIG` - Enable Signatures (default: `true`)
+- `ENABLE_ROL` - Enable Rule Orchestrator (default: `false`)
+- `ENABLE_QZN` - Enable Quarantine (default: `false`)
 
 ## Deployment
 
