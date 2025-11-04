@@ -19,7 +19,7 @@ Most requests are handled by Rules + ML layers (90%+), avoiding expensive LLM ca
 ## RapidAPI Listing
 
 ### Title
-TAS - Universal Anti-Spam API
+TAS - Transmodal Anti-Spam API
 
 ### Description
 Multi-layer spam detection service combining regex rules, ML models, and LLM fallback. Cost-effective alternative to pure LLM-based solutions.

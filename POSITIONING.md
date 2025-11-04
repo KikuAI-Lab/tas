@@ -2,7 +2,7 @@
 
 ## What TAS Is
 
-**TAS (Universal Anti-Spam API)** - specialized service for detecting **commercial spam** in messengers, forums, and social networks.
+**TAS (Transmodal Anti-Spam API)** - specialized transmodal service for detecting **commercial spam** across text, images, and other formats in messengers, forums, and social networks. Uses unified scoring across multiple detection layers.
 
 ## Narrow Niche: Commercial Spam
 

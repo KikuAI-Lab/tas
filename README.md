@@ -1,6 +1,6 @@
-# TAS - Universal Anti-Spam API
+# TAS - Transmodal Anti-Spam API
 
-**Specialized commercial spam detection service** for messengers, forums, and marketplaces.
+**Transmodal commercial spam detection service** for messengers, forums, and marketplaces. Processes text, images, and other formats with unified scoring across detection layers.
 
 > **Focus**: Commercial spam (buy/sell, job offers, services) - not toxicity or hate speech.
 
@@ -14,12 +14,13 @@
 
 ## Features
 
-- **Specialized**: Focused on commercial spam (buy/sell, job offers, services)
-- **Multi-layer detection**: Rules → ML → LLM (only when needed)
+- **Transmodal**: Processes text, images, and other formats with unified scoring
+- **Multi-layer detection**: Rules → ML → LLM pipeline with single unified score
+- **Unified Scoring**: One score across all detection layers (when previous layers pass through)
 - **Cost-effective**: LLM used only when rules + ML can't decide (90%+ requests avoid LLM)
 - **Fast**: Rules layer < 10ms, ML layer < 100ms
 - **Accurate**: Combines multiple detection methods for better precision
-- **Universal**: Works with any text input (messengers, bots, forums, comments)
+- **Commercial Focus**: Specialized for buy/sell, job offers, services
 
 ## What TAS Detects
 
