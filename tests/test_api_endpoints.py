@@ -167,6 +167,7 @@ class TestStatsEndpoint:
         assert "version" in data
         assert "thresholds" in data
         assert "ml_model" in data
+        assert "llm_enabled" in data
         assert "cache" in data
     
     def test_stats_thresholds(self):
@@ -175,6 +176,7 @@ class TestStatsEndpoint:
         thresholds = data["thresholds"]
         assert "rules" in thresholds
         assert "ml" in thresholds
+        assert "ml_safe" in thresholds
         assert "llm_fallback" in thresholds
 
 
