@@ -67,9 +67,10 @@
 - [ ] Support different tiers
 
 ### 3.3 Caching
-- [ ] Add Redis caching layer
-- [ ] Cache frequent requests
-- [ ] TTL-based cache invalidation
+- [x] Add LRU cache with TTL
+- [x] Cache frequent requests
+- [x] TTL-based cache invalidation
+- [ ] Consider Redis for distributed caching (future)
 
 ## Phase 4: Advanced Features
 
