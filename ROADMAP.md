@@ -12,24 +12,25 @@
 ## Phase 1: Pattern Optimization (Current Focus)
 
 ### 1.1 Improve Commercial Patterns
-- [ ] Add more specific buy/sell patterns
+- [x] Add more specific buy/sell patterns
   - Price mentions (from X rubles, $)
   - Condition indicators (new, used, condition)
   - Contact methods (call, write, WhatsApp)
-- [ ] Expand job offer patterns
+- [x] Expand job offer patterns
   - Specific job types (loader, courier, manager)
   - Salary mentions (salary, wage, from X rubles)
   - Work schedule (shifts, schedule, daily payment)
-- [ ] Add service category patterns
+  - Additional keywords (требуются, нужны, набор, помощник)
+- [x] Add service category patterns
   - Repair services
   - Tutoring
   - Cleaning
 
 ### 1.2 Pattern Testing
-- [ ] Test all patterns on report.csv
-- [ ] Measure false positive/negative rates
-- [ ] Optimize pattern weights
-- [ ] Remove low-performing patterns
+- [x] Test all patterns on report.csv
+- [x] Measure false positive/negative rates
+- [x] Optimize pattern weights
+- [ ] Remove low-performing patterns (ongoing)
 
 ### 1.3 Context Awareness
 - [ ] Detect price ranges (reasonable vs suspicious)
@@ -62,9 +63,9 @@
 - [x] POST /batch - Batch classification
 
 ### 3.2 Rate Limiting
-- [ ] Implement per-API-key rate limiting
-- [ ] Add rate limit headers
-- [ ] Support different tiers
+- [x] Implement per-IP rate limiting (100 req/min)
+- [x] Add rate limit headers
+- [ ] Support different tiers (future: per-API-key)
 
 ### 3.3 Caching
 - [x] Add LRU cache with TTL
