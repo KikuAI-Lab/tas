@@ -29,6 +29,8 @@ app.add_middleware(
 class ClassifyRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=8192)
     lang: Optional[str] = Field(default="en", max_length=10)
+    sender_id: Optional[str] = Field(default=None, max_length=100)
+    message_id: Optional[str] = Field(default=None, max_length=100)
 
 
 class ClassifyResponse(BaseModel):
@@ -68,8 +70,13 @@ async def classify(request: ClassifyRequest, client_request: Request):
     
     rate_limiter.record_request(client_ip, "classify")
     
-    try:
-        result = await pipeline.classify(request.text, request.lang or "en")
+        try:
+            result = await pipeline.classify(
+                request.text, 
+                request.lang or "en",
+                sender_id=request.sender_id,
+                message_id=request.message_id
+            )
         # Simplify response
         spam_score = result.get("spam_score", 0.0)
         confidence = result.get("confidence", 0.0)
