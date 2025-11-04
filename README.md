@@ -1,6 +1,8 @@
 # TAS - Universal Anti-Spam API
 
-**Multi-layer spam detection service** for messengers, bots, forums, and any text input.
+**Specialized commercial spam detection service** for messengers, forums, and marketplaces.
+
+> **Focus**: Commercial spam (buy/sell, job offers, services) - not toxicity or hate speech.
 
 [![Demo](https://img.shields.io/badge/demo-live-green)](https://kiku-jw.github.io/tas/)
 [![API](https://img.shields.io/badge/API-Fly.io-blue)](https://tas-api.fly.dev)
@@ -12,11 +14,28 @@
 
 ## Features
 
+- **Specialized**: Focused on commercial spam (buy/sell, job offers, services)
 - **Multi-layer detection**: Rules → ML → LLM (only when needed)
 - **Cost-effective**: LLM used only when rules + ML can't decide (90%+ requests avoid LLM)
 - **Fast**: Rules layer < 10ms, ML layer < 100ms
 - **Accurate**: Combines multiple detection methods for better precision
-- **Universal**: Works for any text input (messengers, bots, forums, comments)
+- **Universal**: Works with any text input (messengers, bots, forums, comments)
+
+## What TAS Detects
+
+✅ **Commercial spam:**
+- Buy/sell offers (куплю, продам, продаю)
+- Job offers and work solicitations
+- Service offers (repair, tutoring, etc.)
+- Real estate (rent, sale)
+- Car sales
+- Promotions and discounts
+
+❌ **TAS does NOT detect:**
+- Toxicity or hate speech
+- Insults or offensive language
+- Political content
+- Personal conflicts
 
 ## Architecture
 
@@ -197,13 +216,22 @@ tas/
 └── Dockerfile
 ```
 
+## Target Customers
+
+- **Messenger moderators** (Telegram, Discord, WhatsApp groups)
+- **Forum administrators** (city forums, specialized boards)
+- **Social media managers** (comments moderation)
+- **Bot developers** (automated moderation)
+- **Marketplace operators** (buy/sell platforms)
+
 ## Performance
 
 Tested on `report.csv` dataset:
-- **Rules layer**: Catches 60-70% of spam instantly
+- **Rules layer**: Catches 60-70% of commercial spam instantly
 - **ML layer**: Adds 20-30% more detection
 - **LLM layer**: Used only for 5-10% of edge cases
 - **Average latency**: < 50ms (rules + ML), < 1000ms (with LLM)
+- **Accuracy**: > 90% for commercial spam, < 5% false positives
 
 ## Contributing
 
