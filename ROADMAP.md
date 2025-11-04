@@ -56,10 +56,10 @@
 ## Phase 3: API Enhancements
 
 ### 3.1 Additional Endpoints
-- [ ] GET /patterns - List all detection patterns
+- [x] GET /patterns - List all detection patterns
 - [ ] POST /patterns/test - Test pattern on text
-- [ ] GET /stats/detailed - Detailed statistics
-- [ ] POST /batch - Batch classification
+- [x] GET /stats - API statistics and configuration
+- [x] POST /batch - Batch classification
 
 ### 3.2 Rate Limiting
 - [ ] Implement per-API-key rate limiting
