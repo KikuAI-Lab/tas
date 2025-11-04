@@ -45,7 +45,7 @@ class ClassifyResponse(BaseModel):
 async def root():
     return {
         "name": "TAS - Transmodal Anti-Spam API",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "description": "Commercial spam detection API for messengers, forums, and marketplaces.",
         "endpoints": {
             "classify": "/classify",
@@ -70,13 +70,13 @@ async def classify(request: ClassifyRequest, client_request: Request):
     
     rate_limiter.record_request(client_ip, "classify")
     
-        try:
-            result = await pipeline.classify(
-                request.text, 
-                request.lang or "en",
-                sender_id=request.sender_id,
-                message_id=request.message_id
-            )
+    try:
+        result = await pipeline.classify(
+            request.text, 
+            request.lang or "en",
+            sender_id=request.sender_id,
+            message_id=request.message_id
+        )
         # Simplify response
         spam_score = result.get("spam_score", 0.0)
         confidence = result.get("confidence", 0.0)
@@ -105,7 +105,7 @@ async def health():
     from app.pipeline import cache
     return {
         "status": "ok",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "ml_model": "disabled",
         "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback,
         "cache_size": cache.size()
