@@ -7,6 +7,7 @@ from app.pipeline import pipeline
 from app.regex_patterns import regex_patterns
 from app.config import settings
 from app.rate_limit import rate_limiter
+from app.ml_model import ml_model
 import logging
 
 logging.basicConfig(level=logging.INFO)
