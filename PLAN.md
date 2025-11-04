@@ -36,9 +36,9 @@ Final Decision (spam_score, confidence, reasons)
 ## Tasks
 
 1. ✅ Refactor to universal REST API
-   - Remove Telegram-specific code
    - Create FastAPI REST endpoints
    - Standard request/response format
+   - Universal text input support
 
 2. ✅ Add lightweight ML model
    - Integrate HuggingFace transformer (multilingual-toxic-xlm-roberta)
