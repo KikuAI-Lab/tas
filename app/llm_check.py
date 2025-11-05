@@ -3,23 +3,39 @@ from typing import Dict, Optional
 from app.config import settings
 import logging
 import json
+import hashlib
+from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
 
 class LLMCheck:
     def __init__(self):
-        self.enabled = bool(settings.openai_api_key)
+        api_key = settings.patas_openai_api_key or settings.openai_api_key
+        self.enabled = bool(api_key)
         if self.enabled:
-            self.client = AsyncOpenAI(api_key=settings.openai_api_key)
+            self.client = AsyncOpenAI(api_key=api_key)
         else:
             self.client = None
+        # Cache to avoid repeated LLM calls for same content
+        self.cache: TTLCache[str, Dict] = TTLCache(
+            maxsize=getattr(settings, "llm_cache_size", 5000),
+            ttl=getattr(settings, "llm_cache_ttl", 86400),
+        )
+
+    def _cache_key(self, text: str) -> str:
+        return hashlib.md5(text.strip().lower().encode()).hexdigest()
 
     async def check(self, text: str) -> Optional[Dict[str, float]]:
         if not self.enabled or not self.client:
             return None
 
         try:
+            key = self._cache_key(text)
+            cached = self.cache.get(key)
+            if cached is not None:
+                return cached
+
             prompt = f"""Analyze the following message for COMMERCIAL SPAM indicators. Focus ONLY on:
 - Buy/sell offers (куплю, продам, продаю, покупаю, обмен)
 - Job offers and work solicitations (работа, вакансия, заработок, job, work)
@@ -48,8 +64,8 @@ Respond with JSON: {{"is_spam": boolean, "confidence": 0.0-1.0, "reasons": ["rea
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.3,
-                max_tokens=200,
+                temperature=0.0,
+                max_tokens=120,
             )
 
             content = response.choices[0].message.content
@@ -62,11 +78,13 @@ Respond with JSON: {{"is_spam": boolean, "confidence": 0.0-1.0, "reasons": ["rea
                 json_str = content[json_start:json_end]
                 parsed = json.loads(json_str)
                 
-                return {
+                result = {
                     "spam": 1.0 if parsed.get("is_spam") else 0.0,
                     "confidence": max(0.0, min(1.0, parsed.get("confidence", 0.5))),
                     "reasons": parsed.get("reasons", []),
                 }
+                self.cache[key] = result
+                return result
             return None
         except Exception as e:
             logger.error(f"LLM check error: {e}")

@@ -88,7 +88,7 @@ async def classify(request: ClassifyRequest, client_request: Request):
             main_reason = f"{reasons[0]} and {len(reasons)-1} more"
         
         return {
-            "is_spam": spam_score >= 0.5,
+            "is_spam": spam_score >= settings.decision_threshold,
             "confidence": round(confidence, 3),
             "reason": main_reason
         }
@@ -107,7 +107,7 @@ async def health():
         "status": "ok",
         "version": "1.0.3",
         "ml_model": "disabled",
-        "llm_enabled": bool(settings.openai_api_key) and settings.llm_fallback,
+        "llm_enabled": bool(getattr(settings, "patas_openai_api_key", "") or settings.openai_api_key) and settings.llm_fallback,
         "cache_size": cache.size()
     }
 
