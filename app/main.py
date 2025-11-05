@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -156,6 +156,28 @@ async def v1_health():
     }
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
+
+@v1_router.get("/metrics")
+async def v1_metrics():
+    """Prometheus metrics endpoint (v1)."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
+
 @app.get("/version")
 async def version():
     """Get API version."""
@@ -305,6 +327,11 @@ async def submit_feedback(feedback: FeedbackRequest):
             lang=feedback.lang,
             metadata=feedback.metadata
         )
+        
+        # Record feedback in metrics
+        from app.metrics import metrics_collector
+        is_fp = feedback.predicted_spam and not feedback.actual_spam
+        metrics_collector.record_feedback(is_fp=is_fp)
         
         error_type = "FP" if (feedback.predicted_spam and not feedback.actual_spam) else "FN"
         

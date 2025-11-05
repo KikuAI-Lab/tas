@@ -1,6 +1,7 @@
 from openai import AsyncOpenAI
 from typing import Dict, Optional
 from app.config import settings
+from app.metrics import metrics_collector
 import logging
 import json
 import hashlib
@@ -112,6 +113,13 @@ class LLMCheck:
                 # Estimate tokens saved (prompt + response)
                 tokens_estimate = self.avg_prompt_tokens + self.avg_response_tokens
                 self.tokens_saved += tokens_estimate
+                # Record cache hit in metrics
+                metrics_collector.record_llm_request(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    model=self.model,
+                    cached=True
+                )
                 return cached
 
             # Truncate text to essential content (first 500 chars should be enough)
@@ -139,6 +147,10 @@ class LLMCheck:
             if not content:
                 return None
 
+            # Extract token usage from response
+            prompt_tokens = response.usage.prompt_tokens if response.usage else self.avg_prompt_tokens
+            completion_tokens = response.usage.completion_tokens if response.usage else self.avg_response_tokens
+
             # With response_format="json_object", content should be valid JSON
             try:
                 parsed = json.loads(content)
@@ -154,6 +166,15 @@ class LLMCheck:
                     "response": content[:100],  # Store first 100 chars of response
                 }
                 self.cache[key] = result
+                
+                # Record LLM request in metrics (with actual token usage)
+                metrics_collector.record_llm_request(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    model=self.model,
+                    cached=False
+                )
+                
                 return result
             except json.JSONDecodeError:
                 # Fallback: try to extract JSON if response_format didn't work
@@ -172,6 +193,17 @@ class LLMCheck:
                         "response": content[:100],
                     }
                     self.cache[key] = result
+                    
+                    # Record LLM request (estimate tokens if not available)
+                    prompt_tokens = response.usage.prompt_tokens if response.usage else self.avg_prompt_tokens
+                    completion_tokens = response.usage.completion_tokens if response.usage else self.avg_response_tokens
+                    metrics_collector.record_llm_request(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        model=self.model,
+                        cached=False
+                    )
+                    
                     return result
                 return None
         except Exception as e:

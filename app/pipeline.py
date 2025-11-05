@@ -8,7 +8,9 @@ from app.lur import lur
 from app.sig import sig
 from app.rol import rol
 from app.qzn import qzn
+from app.metrics import metrics_collector
 import hashlib
+import time
 
 cache = ClassificationCache(max_size=settings.cache_size, ttl=settings.cache_ttl)
 import logging
@@ -31,19 +33,26 @@ class MultiLayerPipeline:
                 logger.warning(f"Failed to load rules from PATAS: {e}")
 
     async def classify(self, text: str, lang: str = "en", sender_id: Optional[str] = None, message_id: Optional[str] = None) -> Dict:
+        start_time = time.time()
         text = text.strip()
         if not text:
-            return {
+            result = {
                 "spam_score": 0.0,
                 "confidence": 0.0,
                 "reasons": [],
                 "layers_used": [],
                 "version": self.version,
             }
+            latency = time.time() - start_time
+            metrics_collector.record_request(latency, False)
+            return result
         
         cached = cache.get(text, lang)
         if cached:
             cached["cached"] = True
+            latency = time.time() - start_time
+            is_spam = cached.get("spam_score", 0.0) >= settings.decision_threshold
+            metrics_collector.record_request(latency, is_spam)
             return cached
 
         await self._ensure_rules_loaded()
@@ -180,6 +189,9 @@ class MultiLayerPipeline:
             
             result = self._format_result(final_score, final_confidence, all_reasons, layers_used)
             cache.set(text, result, lang)
+            latency = time.time() - start_time
+            is_spam = final_score >= settings.decision_threshold
+            metrics_collector.record_request(latency, is_spam)
             return result
 
         layers_used.append("rules")
@@ -191,11 +203,15 @@ class MultiLayerPipeline:
             all_reasons.extend(rule_reasons)
             result = self._format_result(final_score, final_confidence, all_reasons, layers_used)
             cache.set(text, result, lang)
+            latency = time.time() - start_time
+            is_spam = final_score >= settings.decision_threshold
+            metrics_collector.record_request(latency, is_spam)
             return result
 
         if settings.llm_fallback and final_score < settings.rules_threshold:
             llm_result = await llm_check.check(text)
             if llm_result:
+                # LLM metrics are recorded in llm_check.check()
                 llm_spam = llm_result.get("spam", 0.0)
                 llm_confidence = llm_result.get("confidence", 0.0)
                 llm_reasons = llm_result.get("reasons", [])
@@ -217,6 +233,9 @@ class MultiLayerPipeline:
 
         result = self._format_result(final_score, final_confidence, all_reasons, layers_used)
         cache.set(text, result, lang)
+        latency = time.time() - start_time
+        is_spam = final_score >= settings.decision_threshold
+        metrics_collector.record_request(latency, is_spam)
         return result
 
     def _format_result(self, score: float, confidence: float, reasons: List[str], layers_used: List[str]) -> Dict:
