@@ -108,6 +108,45 @@ docker run -p 8000:8000 --env-file .env tas
 
 Live demo: https://kiku-jw.github.io/tas/
 
+## Nightly Evaluation
+
+Automated quality assessment runs nightly to track performance metrics and detect degradation.
+
+### Running Manually
+
+```bash
+poetry run python nightly_evaluator.py \
+    --sample 1000 \
+    --threshold 0.35 \
+    --file ../report.csv
+```
+
+### Automated Cron Setup
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add nightly run at 2 AM
+0 2 * * * /path/to/tas/scripts/run_nightly_evaluator.sh
+```
+
+### Reports
+
+Reports are saved to `reports/` directory:
+- `metrics_*.json` - Detailed metrics in JSON format
+- `metrics_latest.json` - Latest metrics (symlink)
+- `report_*.html` - HTML report for engineers
+- `report_latest.html` - Latest report (symlink)
+- `trends_*.png` - Trend plots (if matplotlib available)
+
+### Metrics Tracked
+
+- **Precision/Recall/F1** - Detection accuracy
+- **FPR/FNR** - False positive/negative rates
+- **Latency** - P50, P95, P99 percentiles
+- **Trends** - Historical comparison to detect degradation
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.

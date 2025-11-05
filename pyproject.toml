@@ -25,6 +25,7 @@ pytest-cov = "^4.1.0"
 httpx = "^0.25.0"
 ruff = "^0.1.6"
 mypy = "^1.7.0"
+matplotlib = "^3.8.0"
 
 [build-system]
 requires = ["poetry-core"]

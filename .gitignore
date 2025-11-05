@@ -1,37 +1,35 @@
+# Reports directory (keep structure, ignore content)
+reports/*.json
+reports/*.html
+reports/*.png
+reports/*.log
+!reports/.gitkeep
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+dist/
+build/
+
+# Environment
 .env
 .venv
-env/
 venv/
 ENV/
-env.bak/
-venv.bak/
-.pytest_cache/
-.coverage
-htmlcov/
-*.log
-.DS_Store
-.idea/
+
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
-*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
