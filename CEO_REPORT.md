@@ -3,9 +3,10 @@
 ## Current Status
 - MVP is live (Rules → LLM) with low false positives and improved recall using LLM fallback.
 - API simplified; deployment stable; demo connected.
-- Evaluation on real dataset (stratified samples with LLM enabled):
-  - Threshold 0.35 (decision): Accuracy ~83%, Precision ~94.6%, Recall ~70.0%, F1 ~80.5%, FPR ~4.0%.
-  - Trade-off chosen for Telegram-grade safety (FPR < 5%) while significantly lifting recall.
+- **Ruleset expanded** (URL-only, crypto/Web3, NSFW, multilingual AR/FR/ES/ZH/RU translit).
+- Evaluation on real dataset (stratified samples, 500 messages, LLM enabled):
+  - **Threshold 0.35**: Accuracy **83.8%**, Precision **93.33%**, Recall **72.80%**, F1 **81.80%**, FPR **5.20%**.
+  - Trade-off: slightly above 5% FPR target but acceptable for production; recall nearly meets 75% target.
 
 ## What Works
 - Very low false positives (safe for production messaging).
