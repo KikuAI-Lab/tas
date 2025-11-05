@@ -26,6 +26,30 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Warm-up connections and pre-initialize components on startup."""
+    from app.llm_check import llm_check
+    from app.pipeline import pipeline
+    
+    logger.info("Starting up TAS API...")
+    
+    # Warm-up LLM connection if enabled
+    if llm_check.enabled:
+        logger.info("Warming up LLM connection...")
+        await llm_check.warmup()
+    
+    # Pre-load rules if ROL is enabled
+    if settings.enable_rol:
+        try:
+            await pipeline._ensure_rules_loaded()
+            logger.info("Rules pre-loaded successfully")
+        except Exception as e:
+            logger.warning(f"Rules pre-load failed: {e}")
+    
+    logger.info("TAS API ready")
+
+
 class ClassifyRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=8192)
     lang: Optional[str] = Field(default="en", max_length=10)

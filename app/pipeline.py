@@ -53,35 +53,56 @@ class MultiLayerPipeline:
         all_reasons: List[str] = []
         module_scores = {}
 
-        # RRS: Reputation & Rate Sentinel
-        if settings.enable_rrs and sender_id:
-            rrs_result = rrs.check(sender_id, text)
+        # Parallel execution of independent modules for better latency
+        import asyncio
+        
+        async def check_rrs():
+            if settings.enable_rrs and sender_id:
+                return rrs.check(sender_id, text)
+            return None
+        
+        async def check_lur():
+            if settings.enable_lur:
+                return await lur.check(text)
+            return None
+        
+        async def check_sig():
+            if settings.enable_sig:
+                return sig.check(text)
+            return None
+        
+        # Run RRS, LUR, and SIG in parallel (SIG is fast, but included for consistency)
+        rrs_result, lur_result, sig_result = await asyncio.gather(
+            check_rrs(),
+            check_lur(),
+            check_sig(),
+            return_exceptions=True
+        )
+        
+        # Process RRS results
+        if rrs_result and not isinstance(rrs_result, Exception):
             layers_used.append("rrs")
             if rrs_result["combined_score"] > 0.3:
                 module_scores["rrs"] = rrs_result["combined_score"]
                 if rrs_result["is_burst"]:
                     all_reasons.append("Burst pattern detected")
-
-        # LUR: Link & URL Risk
-        if settings.enable_lur:
-            lur_result = await lur.check(text)
+        
+        # Process LUR results
+        if lur_result and not isinstance(lur_result, Exception):
             if lur_result["url_count"] > 0:
                 layers_used.append("lur")
             url_risk = lur_result["url_risk_score"]
             if url_risk > 0.3:
-                # Use URL risk score directly (already 0-1)
                 module_scores["lur"] = url_risk
                 if lur_result["has_risky_tld"]:
                     all_reasons.append("Risky TLD detected")
                 if lur_result["has_short_domain"]:
                     all_reasons.append("Short URL domain")
                 if lur_result.get("has_legitimate_domain") and url_risk < 0.5:
-                    # Legitimate domains with low risk - reduce impact
                     module_scores["lur"] = url_risk * 0.6
-
-        # SIG: Signatures (fast check, no async needed)
-        if settings.enable_sig:
-            sig_result = sig.check(text)
+        
+        # Process SIG results
+        if sig_result and not isinstance(sig_result, Exception):
             layers_used.append("sig")
             if sig_result.get("signature_score", 0.0) > 0.3:
                 module_scores["sig"] = sig_result["signature_score"]

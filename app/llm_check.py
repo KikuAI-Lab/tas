@@ -5,6 +5,7 @@ import logging
 import json
 import hashlib
 from cachetools import TTLCache
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +14,24 @@ class LLMCheck:
     def __init__(self):
         api_key = settings.patas_openai_api_key or settings.openai_api_key
         self.enabled = bool(api_key)
+        self._warmed_up = False
+        
         if self.enabled:
-            self.client = AsyncOpenAI(api_key=api_key)
+            # Configure HTTP client with persistent connections and keep-alive
+            http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=10,
+                    max_connections=20,
+                    keepalive_expiry=30.0
+                )
+            )
+            self.client = AsyncOpenAI(
+                api_key=api_key,
+                http_client=http_client,
+                max_retries=2,
+                timeout=10.0
+            )
         else:
             self.client = None
         
@@ -43,6 +60,29 @@ class LLMCheck:
         """Estimate token count (rough: ~4 chars per token)."""
         return len(text) // 4
     
+    async def warmup(self) -> bool:
+        """Warm-up connection: pre-auth + ping test."""
+        if not self.enabled or not self.client:
+            return False
+        
+        if self._warmed_up:
+            return True
+        
+        try:
+            # Lightweight test request to establish connection and verify auth
+            test_response = await self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=5,
+                temperature=0.0,
+            )
+            self._warmed_up = True
+            logger.info("LLM connection warmed up successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"LLM warm-up failed: {e}")
+            return False
+    
     def get_metrics(self) -> Dict:
         """Get cache metrics."""
         hit_rate = (self.cache_hits / self.total_requests * 100) if self.total_requests > 0 else 0.0
@@ -54,7 +94,8 @@ class LLMCheck:
             "tokens_saved": self.tokens_saved,
             "cache_size": len(self.cache),
             "cache_max_size": self.cache.maxsize,
-            "llm_request_rate": round((1 - hit_rate / 100) * 100, 2)  # % of requests that hit LLM
+            "llm_request_rate": round((1 - hit_rate / 100) * 100, 2),  # % of requests that hit LLM
+            "warmed_up": self._warmed_up
         }
 
     async def check(self, text: str) -> Optional[Dict[str, float]]:

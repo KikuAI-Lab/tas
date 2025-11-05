@@ -14,6 +14,16 @@ class LinkURLRisk:
         self.url_cache: TTLCache[str, Dict] = TTLCache(maxsize=max_size, ttl=ttl)
         self.redirect_cache: TTLCache[str, str] = TTLCache(maxsize=max_size, ttl=ttl)
         
+        # Reusable HTTP client with persistent connections
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=20.0
+            )
+        )
+        
         # Risky TLDs (high spam/fraud probability)
         self.risky_tlds = {
             ".tk", ".ml", ".ga", ".cf", ".gq", ".top", ".xyz", ".click", ".download",
@@ -65,13 +75,12 @@ class LinkURLRisk:
             return self.redirect_cache[url]
         
         try:
-            async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
-                response = await client.get(url, allow_redirects=False)
-                if response.status_code in (301, 302, 303, 307, 308):
-                    final_url = response.headers.get("Location")
-                    if final_url:
-                        self.redirect_cache[url] = final_url
-                        return final_url
+            response = await self.http_client.get(url, follow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308):
+                final_url = response.headers.get("Location")
+                if final_url:
+                    self.redirect_cache[url] = final_url
+                    return final_url
         except Exception as e:
             logger.debug(f"Error unpacking redirect for {url}: {e}")
         
