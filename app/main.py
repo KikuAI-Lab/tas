@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from app.pipeline import pipeline
 from app.config import settings
 from app.rate_limit import rate_limiter
@@ -74,6 +74,8 @@ async def root():
         "endpoints": {
             "classify": "/classify",
             "health": "/health",
+            "feedback": "/feedback",
+            "feedback_report": "/feedback/report",
             "docs": "/docs"
         }
     }
@@ -208,6 +210,154 @@ async def record_shadow_feedback(feedback: ShadowRuleFeedback):
         feedback.actual_spam
     )
     return {"status": "recorded", "rule_id": feedback.rule_id}
+
+
+class FeedbackRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=8192)
+    predicted_spam: bool = Field(..., description="What TAS predicted")
+    actual_spam: bool = Field(..., description="What it actually was")
+    sender_id: Optional[str] = Field(default=None, max_length=100)
+    message_id: Optional[str] = Field(default=None, max_length=100)
+    lang: Optional[str] = Field(default=None, max_length=10)
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Additional metadata")
+
+
+@app.post("/feedback")
+async def submit_feedback(feedback: FeedbackRequest):
+    """
+    Submit feedback for FP/FN examples from production.
+    
+    This endpoint allows production systems to report false positives (FP) or false negatives (FN).
+    Feedback is stored in a database and used to generate reports on rule performance.
+    """
+    from app.feedback_db import feedback_db
+    
+    try:
+        # Get the original classification result to extract reasons and matched rules
+        result = await pipeline.classify(
+            feedback.text,
+            feedback.lang or "en",
+            sender_id=feedback.sender_id,
+            message_id=feedback.message_id
+        )
+        
+        spam_score = result.get("spam_score", 0.0)
+        confidence = result.get("confidence", 0.0)
+        reasons = result.get("reasons", [])
+        
+        # Extract matched rule names from reasons
+        # Reasons format: "Reason name" or "Reason name and X more"
+        matched_rules = []
+        for reason in reasons:
+            # Clean up reason strings to extract rule names
+            rule_name = reason.split(" and ")[0].strip()
+            matched_rules.append(rule_name)
+        
+        # Add feedback to database
+        feedback_id = feedback_db.add_feedback(
+            text=feedback.text,
+            predicted_spam=feedback.predicted_spam,
+            actual_spam=feedback.actual_spam,
+            spam_score=spam_score,
+            confidence=confidence,
+            reasons=reasons,
+            matched_rules=matched_rules,
+            sender_id=feedback.sender_id,
+            message_id=feedback.message_id,
+            lang=feedback.lang,
+            metadata=feedback.metadata
+        )
+        
+        error_type = "FP" if (feedback.predicted_spam and not feedback.actual_spam) else "FN"
+        
+        return {
+            "status": "recorded",
+            "feedback_id": feedback_id,
+            "error_type": error_type,
+            "message": f"{error_type} feedback recorded successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error recording feedback: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to record feedback: {str(e)}")
+
+
+@app.get("/feedback/report")
+async def get_feedback_report(format: Optional[str] = Query("json", regex="^(json|html)$")):
+    """
+    Get feedback report showing FP/FN per rule.
+    
+    Formats:
+    - json: JSON API response
+    - html: Generate and save HTML report file
+    """
+    from app.feedback_db import feedback_db
+    from app.feedback_reporter import generate_html_report
+    
+    rule_stats = feedback_db.get_rule_stats()
+    summary = feedback_db.get_summary()
+    
+    if format == "html":
+        # Generate HTML report file
+        report_file = generate_html_report()
+        return {
+            "status": "generated",
+            "report_file": str(report_file),
+            "message": "HTML report generated successfully"
+        }
+    
+    # JSON response
+    return {
+        "summary": summary,
+        "per_rule": rule_stats,
+        "recommendations": _generate_recommendations(rule_stats)
+    }
+
+
+@app.get("/feedback/entries")
+async def get_feedback_entries(
+    error_type: Optional[str] = Query(None, regex="^(fp|fn)$"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """Get feedback entries (FP or FN examples)."""
+    from app.feedback_db import feedback_db
+    
+    entries = feedback_db.get_feedback(
+        error_type=error_type,
+        limit=limit,
+        offset=offset
+    )
+    
+    return {
+        "entries": entries,
+        "count": len(entries),
+        "limit": limit,
+        "offset": offset
+    }
+
+
+def _generate_recommendations(rule_stats: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Generate recommendations based on rule statistics."""
+    recommendations = []
+    
+    for rule_name, stats in rule_stats.items():
+        fpr = stats.get("false_positive_rate", 0.0)
+        fp_count = stats.get("false_positives", 0)
+        fn_count = stats.get("false_negatives", 0)
+        
+        if fpr > 0.10 and fp_count >= 5:
+            recommendations.append(
+                f"Rule '{rule_name}' has high FPR ({fpr:.1%}) with {fp_count} FPs. "
+                f"Consider refining the pattern or adding negative context checks."
+            )
+        
+        if fn_count >= 10:
+            recommendations.append(
+                f"Rule '{rule_name}' has {fn_count} false negatives. "
+                f"Consider expanding the pattern or lowering the score threshold."
+            )
+    
+    return recommendations[:10]  # Limit to top 10
 
 
 if __name__ == "__main__":

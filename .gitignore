@@ -33,3 +33,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Database
+*.db
+*.db-journal
+feedback.db

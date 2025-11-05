@@ -74,11 +74,24 @@ curl -X POST http://localhost:8000/classify \
 }
 ```
 
+## Feedback System
+
+TAS includes a production feedback loop for continuous improvement:
+
+- **POST `/feedback`** - Submit FP/FN examples from production
+- **GET `/feedback/report`** - Get detailed statistics per rule
+- **GET `/feedback/entries`** - Browse feedback entries
+
+Feedback is stored in SQLite database and used to generate reports showing which rules have high false positive/negative rates.
+
+See [FEEDBACK_SYSTEM.md](FEEDBACK_SYSTEM.md) for detailed documentation.
+
 ## Configuration
 
 Environment variables (`.env`):
 
 - `OPENAI_API_KEY` - OpenAI API key for LLM fallback (optional)
+- `PATAS_OPENAI_API_KEY` - PATAS-specific OpenAI API key (takes precedence)
 - `PATAS_URL` - PATAS API URL for rule import (default: `http://localhost:8000`)
 - `PATAS_API_KEY` - PATAS API key (optional)
 - `ENABLE_RRS` - Enable Reputation & Rate Sentinel (default: `true`)
