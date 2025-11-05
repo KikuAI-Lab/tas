@@ -103,12 +103,19 @@ async def classify(request: ClassifyRequest, client_request: Request):
 @app.get("/health")
 async def health():
     from app.pipeline import cache
+    from app.llm_check import llm_check
+    
+    llm_metrics = {}
+    if llm_check.enabled:
+        llm_metrics = llm_check.get_metrics()
+    
     return {
         "status": "ok",
         "version": "1.0.3",
         "ml_model": "disabled",
         "llm_enabled": bool(getattr(settings, "patas_openai_api_key", "") or settings.openai_api_key) and settings.llm_fallback,
-        "cache_size": cache.size()
+        "cache_size": cache.size(),
+        "llm_cache": llm_metrics
     }
 
 
