@@ -32,7 +32,16 @@ class MultiLayerPipeline:
             except Exception as e:
                 logger.warning(f"Failed to load rules from PATAS: {e}")
 
-    async def classify(self, text: str, lang: str = "en", sender_id: Optional[str] = None, message_id: Optional[str] = None) -> Dict:
+    async def classify(
+        self, 
+        text: str, 
+        lang: str = "en", 
+        sender_id: Optional[str] = None, 
+        message_id: Optional[str] = None,
+        llm_mode: str = "managed",
+        byo_provider: Optional[str] = None,
+        byo_api_key: Optional[str] = None
+    ) -> Dict:
         start_time = time.time()
         try:
             text = text.strip()
@@ -226,40 +235,59 @@ class MultiLayerPipeline:
             metrics_collector.record_request(latency, is_spam)
             return result
 
-        if settings.llm_fallback and final_score < settings.rules_threshold:
+        # LLM fallback based on mode
+        llm_mode_used = llm_mode
+        llm_result = None
+        
+        if llm_mode == "rules_only":
+            # Skip LLM entirely
+            pass
+        elif llm_mode == "byo" and byo_provider and byo_api_key:
+            # Use BYO credentials
+            try:
+                llm_result = await llm_check.check(text, byo_provider=byo_provider, byo_api_key=byo_api_key)
+            except Exception:
+                logger.exception("BYO LLM error, falling back to rules-only")
+                llm_result = None
+                llm_mode_used = "rules_only"
+        elif settings.llm_fallback and final_score < settings.rules_threshold:
+            # Managed mode (default)
             try:
                 llm_result = await llm_check.check(text)
             except Exception:
                 logger.exception("LLM fallback error")
                 llm_result = None
+        else:
+            llm_result = None
 
-            if llm_result:
-                # LLM metrics are recorded in llm_check.check()
-                llm_spam = llm_result.get("spam", 0.0)
-                llm_confidence = llm_result.get("confidence", 0.0)
-                llm_reasons = llm_result.get("reasons", [])
+        if llm_result:
+            # LLM metrics are recorded in llm_check.check()
+            llm_spam = llm_result.get("spam", 0.0)
+            llm_confidence = llm_result.get("confidence", 0.0)
+            llm_reasons = llm_result.get("reasons", [])
 
-                if llm_spam > 0.5:
-                    final_score = llm_spam
-                    final_confidence = llm_confidence
-                    all_reasons.extend(llm_reasons)
-                else:
-                    final_score = max(final_score, llm_spam * 0.3)
-                    final_confidence = (final_confidence + llm_confidence) / 2
-                    if llm_reasons:
-                        all_reasons.extend(llm_reasons[:2])
-
-                layers_used.append("llm")
+            if llm_spam > 0.5:
+                final_score = llm_spam
+                final_confidence = llm_confidence
+                all_reasons.extend(llm_reasons)
             else:
-                # LLM failed after retries - fallback to rules-only
-                logger.info("LLM unavailable after retries, using rules-only classification")
-                final_score = rule_score
-                final_confidence = rule_score
+                final_score = max(final_score, llm_spam * 0.3)
+                final_confidence = (final_confidence + llm_confidence) / 2
+                if llm_reasons:
+                    all_reasons.extend(llm_reasons[:2])
+
+            layers_used.append("llm")
+        elif llm_mode != "rules_only":
+            # LLM failed after retries - fallback to rules-only
+            logger.info("LLM unavailable after retries, using rules-only classification")
+            final_score = rule_score
+            final_confidence = rule_score
         else:
             final_score = rule_score
             final_confidence = rule_score
 
         result = self._format_result(final_score, final_confidence, all_reasons, layers_used)
+        result["llm_mode"] = llm_mode_used
         cache.set(text, result, lang)
         latency = time.time() - start_time
         is_spam = final_score >= settings.decision_threshold

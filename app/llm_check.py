@@ -133,9 +133,37 @@ class LLMCheck:
             }
         }
 
-    async def check(self, text: str) -> Optional[Dict[str, float]]:
-        if not self.enabled or not self.client:
+    async def check(
+        self, 
+        text: str, 
+        byo_provider: Optional[str] = None,
+        byo_api_key: Optional[str] = None
+    ) -> Optional[Dict[str, float]]:
+        # BYO mode: create temporary client
+        client_to_use = self.client
+        if byo_provider and byo_api_key:
+            if byo_provider.lower() == "openai":
+                http_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    limits=httpx.Limits(
+                        max_keepalive_connections=10,
+                        max_connections=20,
+                        keepalive_expiry=30.0
+                    )
+                )
+                client_to_use = AsyncOpenAI(
+                    api_key=byo_api_key,
+                    http_client=http_client,
+                    max_retries=2,
+                    timeout=10.0
+                )
+            else:
+                logger.warning(f"BYO provider {byo_provider} not yet supported, falling back to managed")
+                return None
+        elif not self.enabled or not self.client:
             return None
+        else:
+            client_to_use = self.client
 
         try:
             # Circuit breaker: short-circuit when provider is down
@@ -183,7 +211,7 @@ class LLMCheck:
             
             for attempt in range(max_retries):
                 try:
-                    response = await self.client.chat.completions.create(
+                    response = await client_to_use.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
                             {

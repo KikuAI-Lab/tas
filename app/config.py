@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     rules_threshold: float = 0.65
     decision_threshold: float = 0.35
     llm_fallback: bool = True
+    llm_mode: str = "managed"  # managed, byo, rules_only
     
     cache_size: int = 10000
     cache_ttl: int = 3600
@@ -23,6 +24,10 @@ class Settings(BaseSettings):
     enable_sig: bool = True
     enable_rol: bool = False
     enable_qzn: bool = False
+    
+    # PII and retention settings
+    pii_redaction_enabled: bool = True
+    data_retention_days: int = 7  # 0 for immediate deletion
     
     model_config = ConfigDict(
         env_file=".env",

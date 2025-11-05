@@ -109,12 +109,31 @@ async def v1_classify(request: ClassifyRequest, client_request: Request, http_re
     
     rate_limiter.record_request(client_ip, "classify")
     
+    # Determine LLM mode from header or config default
+    llm_mode = client_request.headers.get("X-LLM-Mode", settings.llm_mode).lower()
+    if llm_mode not in ["managed", "byo", "rules_only"]:
+        llm_mode = "managed"
+    
+    # Extract BYO credentials if provided
+    byo_provider = client_request.headers.get("X-LLM-Provider")
+    byo_api_key = client_request.headers.get("X-LLM-Key")
+    
+    # BYO mode requires provider and key
+    if llm_mode == "byo" and (not byo_provider or not byo_api_key):
+        raise HTTPException(
+            status_code=400,
+            detail="BYO mode requires X-LLM-Provider and X-LLM-Key headers"
+        )
+    
     try:
         result = await pipeline.classify(
             request.text, 
             request.lang or "en",
             sender_id=request.sender_id,
-            message_id=request.message_id
+            message_id=request.message_id,
+            llm_mode=llm_mode,
+            byo_provider=byo_provider,
+            byo_api_key=byo_api_key
         )
         # Dual-format response
         spam_score = result.get("spam_score", 0.0)
@@ -162,12 +181,16 @@ async def v1_classify(request: ClassifyRequest, client_request: Request, http_re
         http_response.headers["Link"] = "<https://kiku-jw.github.io/tas/#migration>; rel=\"deprecation\""
         http_response.headers["X-TAS-Request-ID"] = request_id
 
+        # Determine actual mode used (may differ from requested if BYO fails)
+        actual_mode = result.get("llm_mode", llm_mode)
+        
         return {
             # New schema
             "spam": spam_score >= settings.decision_threshold,
             "score": round(spam_score, 3),
             "reasons": reasons_enhanced,  # Enhanced with code and weight
             "path": path,
+            "mode": actual_mode,
             "request_id": request_id,
             # Legacy fields (back-compat)
             "is_spam": spam_score >= settings.decision_threshold,
