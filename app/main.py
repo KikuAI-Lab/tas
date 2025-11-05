@@ -11,28 +11,16 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="TAS - Transmodal Anti-Spam API",
-    description="Multi-layer transmodal spam detection: Rules → LLM. Processes text with unified scoring across layers.",
-    version="1.0.3",
-)
-
 # API versioning router
 from fastapi import APIRouter
+from contextlib import asynccontextmanager
+
 v1_router = APIRouter(prefix="/v1", tags=["v1"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Warm-up connections and pre-initialize components on startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
     from app.llm_check import llm_check
     from app.pipeline import pipeline
     
@@ -52,6 +40,26 @@ async def startup_event():
             logger.warning(f"Rules pre-load failed: {e}")
     
     logger.info("TAS API ready")
+    
+    yield
+    
+    logger.info("Shutting down TAS API...")
+
+
+app = FastAPI(
+    title="TAS - Transmodal Anti-Spam API",
+    description="Multi-layer transmodal spam detection: Rules → LLM. Processes text with unified scoring across layers.",
+    version="1.0.3",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ClassifyRequest(BaseModel):
@@ -347,7 +355,7 @@ async def submit_feedback(feedback: FeedbackRequest):
 
 
 @app.get("/feedback/report")
-async def get_feedback_report(format: Optional[str] = Query("json", regex="^(json|html)$")):
+async def get_feedback_report(format: Optional[str] = Query("json", pattern="^(json|html)$")):
     """
     Get feedback report showing FP/FN per rule.
     
@@ -380,7 +388,7 @@ async def get_feedback_report(format: Optional[str] = Query("json", regex="^(jso
 
 @app.get("/feedback/entries")
 async def get_feedback_entries(
-    error_type: Optional[str] = Query(None, regex="^(fp|fn)$"),
+    error_type: Optional[str] = Query(None, pattern="^(fp|fn)$"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0)
 ):

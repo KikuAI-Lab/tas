@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 
 class Settings(BaseSettings):
@@ -9,7 +10,7 @@ class Settings(BaseSettings):
     patas_api_key: str = ""
     
     rules_threshold: float = 0.65
-    decision_threshold: float = 0.5
+    decision_threshold: float = 0.35
     llm_fallback: bool = True
     
     cache_size: int = 10000
@@ -23,10 +24,11 @@ class Settings(BaseSettings):
     enable_rol: bool = False
     enable_qzn: bool = False
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        extra = "ignore"
+    model_config = ConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore"
+    )
 
 
 settings = Settings()
