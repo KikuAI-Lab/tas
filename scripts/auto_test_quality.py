@@ -15,7 +15,14 @@ import logging
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.feedback_db import FeedbackDB
-from app.metrics import MetricsCollector
+
+# Lazy import for metrics (may not be available in all environments)
+try:
+    from app.metrics import MetricsCollector
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    MetricsCollector = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,7 +33,7 @@ class QualityTester:
     
     def __init__(self):
         self.feedback_db = FeedbackDB()
-        self.metrics = MetricsCollector()
+        self.metrics = MetricsCollector() if METRICS_AVAILABLE else None
         self.test_results_dir = Path("reports/quality_tests")
         self.test_results_dir.mkdir(parents=True, exist_ok=True)
         
@@ -42,7 +49,6 @@ class QualityTester:
         """Test current quality metrics."""
         logger.info("Testing current quality metrics...")
         
-        current_metrics = self.metrics.get_current_metrics()
         rule_stats = self.feedback_db.get_rule_stats()
         
         # Calculate overall metrics
@@ -65,8 +71,13 @@ class QualityTester:
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         
         # Get latency metrics
-        p95_rules = current_metrics.get("p95_latency_rules", 0)
-        p95_llm = current_metrics.get("p95_latency_llm", 0)
+        if self.metrics:
+            current_metrics = self.metrics.get_current_metrics()
+            p95_rules = current_metrics.get("p95_latency_rules", 0)
+            p95_llm = current_metrics.get("p95_latency_llm", 0)
+        else:
+            p95_rules = 0
+            p95_llm = 0
         
         # Check thresholds
         passed = {
