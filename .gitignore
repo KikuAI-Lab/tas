@@ -33,6 +33,19 @@ Thumbs.db
 
 # Logs
 *.log
+reports/*.log
+
+# Process files
+*.pid
+reports/*.pid
+
+# Temporary files
+*.txt
+reports/*.txt
+evaluation_results.txt
+
+# Office documents
+*.docx
 
 # Database
 *.db
