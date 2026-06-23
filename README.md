@@ -4,7 +4,13 @@ TAS is a FastAPI service for classifying commercial spam with rules-first detect
 
 **[Run the local API](#quickstart)**
 
-[Hosted demo](https://kiku-jw.github.io/tas/) · [OpenAPI](openapi.yaml) · [LLM modes](docs/LLM_MODES.md)
+[Docs](openapi.yaml) · [Examples](#quickstart) · [LLM modes](docs/LLM_MODES.md)
+
+Sample response:
+
+```json
+{"spam": true, "score": 0.92, "path": "rules"}
+```
 
 Use TAS when you need to flag buy/sell offers, job solicitations, service ads, and similar commercial spam in chats, forums, marketplaces, or messaging products. It is not a toxicity, hate-speech, political-content, or general conversation classifier.
 
