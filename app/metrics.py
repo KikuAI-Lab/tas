@@ -2,7 +2,7 @@
 Prometheus metrics collection for TAS API.
 Tracks latency, FPR, recall, LLM hit rate, and costs.
 """
-from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from prometheus_client import Counter, Histogram, Gauge
 from typing import Dict, Optional, List, Any
 from collections import deque
 from datetime import datetime, timezone

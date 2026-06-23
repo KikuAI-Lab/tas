@@ -4,7 +4,6 @@ Feedback reporter - generates reports on FP/FN per rule.
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Any
 from app.feedback_db import feedback_db
 
 
@@ -217,9 +216,9 @@ def generate_html_report() -> Path:
         if fn_count >= 10:
             issues.append(f'<span class="issue-medium">High FN ({fn_count})</span>')
         if precision < 0.70:
-            issues.append(f'<span class="issue-medium">Low Precision</span>')
+            issues.append('<span class="issue-medium">Low Precision</span>')
         if recall < 0.50:
-            issues.append(f'<span class="issue-medium">Low Recall</span>')
+            issues.append('<span class="issue-medium">Low Recall</span>')
         
         precision_class = "good" if precision >= 0.85 else "warning" if precision >= 0.70 else "bad"
         recall_class = "good" if recall >= 0.70 else "warning" if recall >= 0.50 else "bad"

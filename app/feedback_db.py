@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
-from collections import defaultdict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -229,7 +228,6 @@ class FeedbackDB:
             fp = row["false_positives"]
             fn = row["false_negatives"]
             tn = row["true_negatives"]
-            total = tp + fp + fn + tn
             
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -280,4 +278,3 @@ class FeedbackDB:
 
 # Global instance
 feedback_db = FeedbackDB()
-

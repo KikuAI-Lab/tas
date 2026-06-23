@@ -78,7 +78,7 @@ class LLMCheck:
         
         try:
             # Lightweight test request to establish connection and verify auth
-            test_response = await self.client.chat.completions.create(
+            await self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "test"}],
                 max_tokens=5,
@@ -329,7 +329,7 @@ class LLMCheck:
                     metrics_collector.set_provider_health('llm', up=True, down_seconds_remaining=0.0, failures_consecutive=0)
                     return result
                 return None
-        except Exception as e:
+        except Exception:
             # Log full stacktrace but do not crash callers
             logger.exception("LLM check failed (unexpected error)")
             # Count as failure event and maybe trip breaker
@@ -345,4 +345,3 @@ class LLMCheck:
 
 
 llm_check = LLMCheck()
-
